@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-policy-2.schema.json",
+  "title": "fq-policy/2 — the recipe",
+  "description": "What a consumer asks for: one bit-width per expert per MoE layer. This single document drives both halves of the pipeline — fq_fetch turns it into the byte ranges to download, fq_assemble turns it into a checkpoint. bits_per_expert maps a decimal layer number (as a string) to a DENSE list of K values, one per expert, indexed by expert id; layers absent from the map are passed through unchanged by fq_assemble (dense/attention layers). The optional budget and manifest blocks record how the recipe was produced and which segment tree it was solved against; nothing consumes them at assembly time. Derived from the recipes in ~/fq-0c (policy-all-k3.json, policy-fruit-mixed-042.json).",
+  "type": "object",
+  "required": ["schema", "bits_per_expert"],
+  "properties": {
+    "schema": { "const": "fq-policy/2" },
+    "bits_per_expert": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[0-9]+$" },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "description": "K per expert, indexed by expert id; length must equal the layer's expert count"
+      }
+    },
+    "manifest": {
+      "$ref": "#/$defs/sha256",
+      "description": "digest of the fq-manifest.json this recipe was solved against, when it was solved against one"
+    },
+    "budget": {
+      "type": "object",
+      "description": "how the allocation was chosen — provenance for the recipe itself",
+      "properties": {
+        "mode": { "type": "string", "examples": ["fixed_cardinality", "uniform", "manual"] },
+        "n_k4_per_layer": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[0-9]+$" },
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "budget_frac": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "created_utc": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

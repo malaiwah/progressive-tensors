@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-segment-1.schema.json",
+  "title": "fq-segment/1 — segment file metadata",
+  "description": "The __metadata__ block of a Progressive Tensors segment file (layer-LLL.kK.safetensors). The segment itself is an ordinary safetensors file: its payload holds the routed-expert tensors of ONE MoE layer at ONE K, in canonical order (expert id, then projection, rank, component), so every expert's bytes are contiguous and range-readable. safetensors requires all __metadata__ values to be strings; numbers below are therefore decimal strings. Derived from files emitted by fq_repack, fq_prime and fq_fetch (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ, ~/fq-0c/fruit-segments, ~/fq-primed/segments-336).",
+  "type": "object",
+  "required": ["fq_schema", "predicate", "layer", "layout", "num_experts"],
+  "properties": {
+    "fq_schema": { "const": "fq-segment/1" },
+    "predicate": {
+      "description": "How these bytes came to be. repack-of: copied verbatim out of a published checkpoint. derived-from: computed from other segments by a declared, exact rule. encode-of: produced by running a quantizer on pinned inputs.",
+      "enum": ["repack-of", "derived-from", "encode-of"]
+    },
+    "layer": { "$ref": "#/$defs/uint_string", "description": "MoE layer index" },
+    "k": { "$ref": "#/$defs/uint_string", "description": "trellis bit-width of every expert in this file; absent for shared-profile files" },
+    "layout": {
+      "description": "rotation/tensor layout of the source checkpoint",
+      "type": "string",
+      "examples": ["rank_sliced_tp4", "shared_h_v1", "per_expert_v1"]
+    },
+    "num_experts": { "$ref": "#/$defs/uint_string", "description": "how many experts this file carries (a subset file carries fewer than the model has)" },
+    "source_file": { "type": "string", "description": "shard the bytes were taken from" },
+    "source_file_sha256": { "$ref": "#/$defs/sha256" },
+    "source_repo": { "type": "string" },
+    "source_revision": { "type": "string" },
+    "base_model": { "type": "string" },
+    "calibration_corpus_sha256": { "$ref": "#/$defs/sha256" },
+    "fq_fetch": { "const": "subset", "description": "set by fq_fetch: this file holds only the experts a recipe asked for" },
+    "fq_fetch_sources": { "type": "string", "description": "comma-separated repo@revision list the subset was assembled from" }
+  },
+  "additionalProperties": { "type": "string" },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "uint_string": { "type": "string", "pattern": "^[0-9]+$" }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-release-1.schema.json",
+  "title": "fq-release/1 — one signature over a whole release",
+  "description": "fq-release.json: a single signed document naming every file of a release with its sha256 and size, so a consumer verifies ONE signature (against a fingerprint pinned out of band) and then hashes bytes, instead of trusting N independent attestation lines and hoping the set is complete. Because index-kK.json and every attestations/*.jsonl are themselves covered, their contents — including per-expert digests — become trusted data under that one signature. Same envelope shape as fq-attestation/1. Emitted and checked by fq_release.py.",
+  "$ref": "#/$defs/envelope",
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "envelope": {
+      "type": "object",
+      "required": ["payload", "signature", "keyid"],
+      "properties": {
+        "payload": { "type": "string", "contentEncoding": "base64", "contentMediaType": "application/json" },
+        "signature": { "type": "string", "contentEncoding": "base64" },
+        "keyid": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": ["schema", "release", "created_utc", "counts", "files"],
+      "properties": {
+        "schema": { "const": "fq-release/1" },
+        "release": { "type": "string", "description": "human-readable release name, e.g. 'GLM-5.2-EXL3-FQ k3 base 0.1.0'" },
+        "created_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "repo": { "type": "string", "description": "artifact repo the release was published to, if any" },
+        "revision": { "type": "string" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256", "description": "digest of fq-manifest.json in this release, duplicated for convenience" },
+        "counts": {
+          "type": "object",
+          "required": ["files", "bytes"],
+          "properties": {
+            "files": { "type": "integer", "minimum": 1 },
+            "fragments": { "type": "integer", "minimum": 0 },
+            "bytes": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "path relative to the release root -> digest and size. The set is exhaustive: a file not listed here is not part of the release, and a consumer should treat unlisted files as uncovered by the signature.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["sha256", "size"],
+            "properties": {
+              "sha256": { "$ref": "#/$defs/sha256" },
+              "size": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

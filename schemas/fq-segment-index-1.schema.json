@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-segment-index-1.schema.json",
+  "title": "fq-segment/1 — tensor index (index-kK.json)",
+  "description": "Per-layer entry point into a K family: for each MoE layer, the segment file, its digest and size, the offset where the safetensors body starts, and every expert's [lo, hi) byte span RELATIVE TO THE BODY. Absolute file offsets are body_offset + lo .. body_offset + hi, which is exactly the HTTP Range a consumer asks for (see fq_fetch). Keys are decimal layer numbers as strings; expert keys likewise. Derived from index-k3.json / index-k4.json / index-k5.json as emitted by fq_repack, fq_prime and fq_fetch.",
+  "type": "object",
+  "propertyNames": { "pattern": "^[0-9]+$" },
+  "minProperties": 1,
+  "additionalProperties": { "$ref": "#/$defs/layer_entry" },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "layer_entry": {
+      "type": "object",
+      "required": ["file", "sha256", "size", "body_offset", "experts"],
+      "properties": {
+        "file": { "type": "string", "pattern": "^layer-[0-9]{3}\\.k[0-9]+\\.safetensors$" },
+        "sha256": { "$ref": "#/$defs/sha256", "description": "digest of the WHOLE segment file as published; a subset file fetched by fq_fetch has its own local digest here, which deliberately differs from the publisher's full-file digest" },
+        "size": { "type": "integer", "minimum": 1 },
+        "body_offset": { "type": "integer", "minimum": 8, "description": "8 + header length: where tensor payload starts" },
+        "experts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "pattern": "^[0-9]+$" },
+          "additionalProperties": {
+            "type": "array",
+            "prefixItems": [
+              { "type": "integer", "minimum": 0 },
+              { "type": "integer", "minimum": 1 }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "[lo, hi) body-relative byte span of one expert's tensors, contiguous by construction"
+          }
+        },
+        "sources": {
+          "type": "object",
+          "description": "fq_fetch only: which repo@revision each expert's bytes came from",
+          "propertyNames": { "pattern": "^[0-9]+$" },
+          "additionalProperties": { "type": "string" }
+        },
+        "range_requests": { "type": "integer", "minimum": 0, "description": "fq_prime bookkeeping" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

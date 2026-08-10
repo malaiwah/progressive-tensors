@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-manifest-1.schema.json",
+  "title": "fq-manifest/1 — segment tree manifest",
+  "description": "fq-manifest.json: what a directory of segments IS. Two shapes share the version. A FAMILY manifest describes one coherent set of segments (one base model, one layout, one predicate) and names its index file(s). A MULTI-SOURCE manifest (kind = multi-source) is a root pointing at several family directories, as fq_prime writes when it primes more than one upstream quant. signer_pubkey records which key signed the family's attestations — it is a convenience for locating the key, NOT the authority to trust it: authority comes from keys/FINGERPRINTS in the git repo (see TRUST.md). Derived from files emitted by fq_repack, fq_prime and fq_fetch (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ/fq-manifest.json, ~/fq-0c/fruit-segments/fq-manifest.json, ~/fq-primed/fq-manifest.json).",
+  "oneOf": [
+    { "$ref": "#/$defs/family" },
+    { "$ref": "#/$defs/multi_source" }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "index_name": { "type": "string", "pattern": "^index-k[0-9]+\\.json$" },
+    "family": {
+      "type": "object",
+      "required": ["schema", "predicate", "layout", "k_variants"],
+      "properties": {
+        "schema": { "const": "fq-manifest/1" },
+        "kind": {
+          "description": "family (default, may be omitted) or fetched-subset, written by fq_fetch for a tree holding only the experts a recipe needed",
+          "enum": ["family", "fetched-subset"]
+        },
+        "predicate": { "enum": ["repack-of", "derived-from", "encode-of"] },
+        "layout": { "type": "string", "examples": ["rank_sliced_tp4", "shared_h_v1"] },
+        "base_model": { "type": ["string", "null"] },
+        "revision": { "type": ["string", "null"], "description": "revision of the source the segments were made from" },
+        "source_revision": { "type": ["string", "null"] },
+        "sources": {
+          "type": "array",
+          "description": "where the bytes came from: repo ids, repo@revision, or local:<tag> for a local encode",
+          "items": { "type": "string" }
+        },
+        "k_variants": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 },
+        "moe_layers": {
+          "type": "array",
+          "description": "[first, last] MoE layer covered, inclusive",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 0,
+          "maxItems": 2
+        },
+        "num_experts": { "type": "integer", "minimum": 0 },
+        "hessian_id": { "type": ["string", "null"] },
+        "calibration_corpus_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "tensor_index": { "$ref": "#/$defs/index_name", "description": "single-K families" },
+        "tensor_indexes": {
+          "type": "object",
+          "description": "multi-K families: K (as a string) -> index file",
+          "propertyNames": { "pattern": "^[0-9]+$" },
+          "additionalProperties": { "$ref": "#/$defs/index_name" }
+        },
+        "signer_pubkey": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "fetched_utc": { "type": "string" }
+      },
+      "anyOf": [
+        { "required": ["tensor_index"] },
+        { "required": ["tensor_indexes"] }
+      ],
+      "additionalProperties": true
+    },
+    "multi_source": {
+      "type": "object",
+      "required": ["schema", "kind", "families"],
+      "properties": {
+        "schema": { "const": "fq-manifest/1" },
+        "kind": { "const": "multi-source" },
+        "updated_utc": { "type": "string" },
+        "families": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "predicate", "layout", "k_variants"],
+            "properties": {
+              "path": { "type": "string", "description": "family directory, relative to this manifest" },
+              "predicate": { "enum": ["repack-of", "derived-from", "encode-of"] },
+              "layout": { "type": "string" },
+              "k_variants": { "type": "array", "items": { "type": "integer" } },
+              "moe_layers": { "type": "array", "items": { "type": "integer" } },
+              "source": {
+                "type": "object",
+                "properties": {
+                  "repo": { "type": "string" },
+                  "revision": { "type": "string" }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
