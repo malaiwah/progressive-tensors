@@ -459,6 +459,9 @@ def repack_layer(
         "sha256": seg_sha.hexdigest(),
         "size": seg_path.stat().st_size,
         "body_offset": 8 + len(hj),
+        # digest of the 8-byte length prefix + header JSON, i.e. exactly the
+        # bytes a consumer must trust before planning ranged reads from it
+        "header_sha256": hashlib.sha256(prefix).hexdigest(),
         "experts": {str(e): rng for e, rng in sorted(per_expert.items())},
         "expert_sha256": {str(e): d.hexdigest() for e, d in sorted(digests.items())},
     }
@@ -601,7 +604,16 @@ def main(argv=None) -> int:
         payload = {
             "schema": ATTESTATION_SCHEMA,
             "predicate": "repack-of",
-            "fragment": {"file": seg_name, "sha256": info["sha256"], "size": info["size"]},
+            "fragment": {
+                "file": seg_name, "sha256": info["sha256"],
+                "size": info["size"],
+                # Signed header digest + body offset: lets a consumer
+                # authenticate the tensor layout it plans from with ONE
+                # ranged read, instead of pulling the whole fragment to
+                # re-derive it (fq_fetch --header-trust attested).
+                "header_sha256": info["header_sha256"],
+                "body_offset": info["body_offset"],
+            },
             "materials": {
                 "repo": args.source_repo,
                 "revision": args.revision,

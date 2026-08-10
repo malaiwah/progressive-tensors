@@ -31,6 +31,26 @@ KS = (3, 4)
 
 # ----------------------------------------------------------------- fixtures
 
+
+def drop_header_digests(repo: Path, signer_key: Path) -> None:
+    """Re-sign a repo's attestations WITHOUT fragment.header_sha256.
+
+    fq_repack publishes that digest now, so a publisher lacking it has to be
+    constructed on purpose — otherwise the "no digest" tests silently stop
+    testing anything.
+    """
+    import base64, json as _json, sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    import fq_repack
+    signer = fq_repack.Signer(signer_key)
+    for att in (repo / "attestations").glob("*.jsonl"):
+        out = []
+        for line in att.read_text().splitlines():
+            payload = _json.loads(base64.b64decode(_json.loads(line)["payload"]))
+            payload["fragment"].pop("header_sha256", None)
+            out.append(signer.sign_line(payload))
+        att.write_text("\n".join(out) + "\n")
+
 def build_source(tmp_path: Path, name: str, *, ks=KS, key: Path = None,
                  salt: str = "") -> tuple[Path, Path, str]:
     """A segment repo with one index/segment/attestation set per K.
@@ -583,14 +603,17 @@ def test_plan_records_which_authenticated_inputs_it_came_from(tmp_path, served):
     assert report["trust"]["plan_authenticated"] is True
     per_file = report["header_authentication"][f"layer-{LAYERS[0]:03d}.k3.safetensors"]
     prov = next(iter(per_file.values()))
-    assert prov["method"] == fq_fetch.AUTH_FULL_FRAGMENT
+    # fq_repack publishes fragment.header_sha256, so the cheap attested
+    # path applies; the full-fragment fallback is covered by the
+    # no-digest test above.
+    assert prov["method"] == fq_fetch.AUTH_HEADER_DIGEST
     assert prov["authenticated"] is True
     local = json.loads((out / "fq-manifest.json").read_text())["signer_pubkey"]
     att = out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
     payload = fq_trust.verify_signature(json.loads(att.read_text()), local,
                                         where=att.name)
     parent = payload["parents"][0]
-    assert parent["header_authentication"] == fq_fetch.AUTH_FULL_FRAGMENT
+    assert parent["header_authentication"] == fq_fetch.AUTH_HEADER_DIGEST
     assert parent["header_authenticated"] is True
     assert payload["verification"]["plan_inputs"]["plan_authenticated"] is True
     # the subset we produced publishes its own header digest, so a consumer
@@ -664,6 +687,7 @@ def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
                                                                    served,
                                                                    capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    drop_header_digests(repo, tmp_path / "pub.key")
     served["mount"]("test/pub", repo)
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"

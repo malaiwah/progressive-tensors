@@ -406,3 +406,22 @@ def test_recheck_detects_a_tampered_segment_on_resume(workspace, capsys):
         "--sign-key", str(key), "--recheck"]) == 0
     assert "--recheck" in capsys.readouterr().out
     _assert_index_sane(out, 3)
+
+
+def test_attestation_carries_a_usable_header_digest(workspace):
+    """A consumer must be able to authenticate the tensor layout it plans
+    from with ONE ranged read: the signed fragment.header_sha256 has to
+    match sha256(prefix||header) of the published segment, and
+    body_offset must point exactly past it."""
+    import base64
+    snap, out, key = workspace
+    run(snap, out, key)
+    for layer in LAYERS:
+        line = json.loads(
+            (out / "attestations" / f"layer-{layer:03d}.k3.jsonl").read_text())
+        frag = json.loads(base64.b64decode(line["payload"]))["fragment"]
+        raw = (out / frag["file"]).read_bytes()
+        body = frag["body_offset"]
+        assert hashlib.sha256(raw[:body]).hexdigest() == frag["header_sha256"]
+        n = struct.unpack("<Q", raw[:8])[0]
+        assert body == 8 + n, "body_offset must sit exactly past the header"
