@@ -397,14 +397,19 @@ def test_k_filter_per_expert_source(served):
 
 # --------------------------------------------------------------- spot-check
 
+def _signer_fp(family: Path) -> str:
+    return json.loads((family / "fq-manifest.json").read_text())["signer_pubkey"]
+
+
 def test_spot_check_pass_and_detect_corruption(served):
     tmp_path, calls = served
     build_repo(tmp_path / "repo", "shared_h_v1")
     assert prime(tmp_path, "segments-sh") == 0
     sh = tmp_path / "primed" / "segments-sh" / "shared-h"
     total = 2 * NEXP  # every (layer, expert)
+    pin = ["--trust-signer", _signer_fp(sh)]
     assert fq_prime.main(["spot-check", "--dir", str(sh), "--n", str(total),
-                          "--seed", "7", "--pace", "0"]) == 0
+                          "--seed", "7", "--pace", "0", *pin]) == 0
     # corrupt one byte inside expert payload of one segment
     seg = sh / "layer-003.k3.safetensors"
     idx = json.loads((sh / "index-k3.json").read_text())["3"]
@@ -413,7 +418,28 @@ def test_spot_check_pass_and_detect_corruption(served):
     raw[lo] ^= 0xFF
     seg.write_bytes(bytes(raw))
     assert fq_prime.main(["spot-check", "--dir", str(sh), "--n", str(total),
-                          "--seed", "7", "--pace", "0"]) == 1
+                          "--seed", "7", "--pace", "0", *pin]) == 1
+
+
+def test_spot_check_rejects_placeholder_signatures(served):
+    """Decoding is not verifying: a family whose attestation signatures are
+    replaced with padding must FAIL, not pass (TRUST.md 7)."""
+    import base64
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "shared_h_v1")
+    assert prime(tmp_path, "segments-sh") == 0
+    sh = tmp_path / "primed" / "segments-sh" / "shared-h"
+    pin = ["--trust-signer", _signer_fp(sh)]
+    for att in (sh / "attestations").glob("*.jsonl"):
+        out = []
+        for line in att.read_text().splitlines():
+            env = json.loads(line)
+            env["signature"] = base64.b64encode(b"\x00" * 64).decode()
+            out.append(json.dumps(env, separators=(",", ":")))
+        att.write_text("\n".join(out) + "\n")
+    with pytest.raises(Exception):
+        fq_prime.main(["spot-check", "--dir", str(sh), "--n", "2",
+                       "--seed", "7", "--pace", "0", *pin])
 
 
 # ------------------- FINDING 6: caches and resume are bound to the source

@@ -1022,6 +1022,22 @@ def _fam_name(layout: str) -> Path:
 
 # -------------------------------------------------------------- spot-check
 
+_VERIFIER_CACHE: dict = {}
+
+
+def _verifier(args, fam: Path):
+    """Trust verifier for this family (memoized): pins come from the CLI
+    (--trust-signer/--trust-file) or the family manifest's signer_pubkey."""
+    key = str(fam)
+    if key not in _VERIFIER_CACHE:
+        import fq_trust
+        manifest_path = fam / "fq-manifest.json"
+        manifest = (json.loads(manifest_path.read_text())
+                    if manifest_path.exists() else None)
+        _VERIFIER_CACHE[key] = fq_trust.Verifier.from_args(args, manifest=manifest)
+    return _VERIFIER_CACHE[key]
+
+
 def cmd_spot_check(args) -> int:
     """Transport spot-check: for N random experts of a primed family,
     independently re-fetch the source bytes (fresh header + payload range)
@@ -1080,7 +1096,11 @@ def cmd_spot_check(args) -> int:
         att_sha = None
         if att_path.exists():
             line = json.loads(att_path.read_text())
-            payload = json.loads(base64.b64decode(line["payload"]))
+            # Decoding is not verifying: a placeholder signature must not
+            # pass. verify_envelope raises unless the line is signed by a
+            # trusted key (fq_trust rungs; TRUST.md §7).
+            payload = _verifier(args, fam).verify_envelope(
+                line, where=f"{att_path.name}:{eid}")
             att_sha = payload.get("expert_sha256", {}).get(str(eid))
         ok = src_sha == seg_sha and (att_sha is None or att_sha == src_sha)
         failures += 0 if ok else 1
@@ -1125,6 +1145,8 @@ def main(argv=None) -> int:
     pr.set_defaults(fn=cmd_prime)
 
     sc = sub.add_parser("spot-check", help="re-fetch random experts, compare sha256")
+    import fq_trust
+    fq_trust.add_trust_arguments(sc)
     sc.add_argument("--dir", required=True, type=Path, help="family dir")
     sc.add_argument("--n", type=int, default=3)
     sc.add_argument("--seed", type=int, default=None)
