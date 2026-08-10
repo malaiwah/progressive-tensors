@@ -48,8 +48,17 @@ source header's TENSOR ORDER is kept (non-expert tensors stay byte-exact
 from the source shard) but the header is rebuilt with dtype/shape taken
 from the SEGMENT header for expert tensors and fresh data_offsets.
 
-Output integrity: the output dir must be empty (or --force, which purges it
-first — never merges), model.safetensors.index.json and MANIFEST.sha256 are
+Output safety: --out is resolved (symlinks refused) and checked before
+anything is read or written.  It may not be the filesystem root, your home
+directory, this checkout, a git working tree, an upstream model cache, or a
+path that overlaps --source/--segments/--policy in either direction.  The
+directory must be empty, or --force, which REPLACES it — and only ever a
+directory carrying the `.fq-assembly` marker this tool writes, so --force
+can never eat a checkpoint fq_assemble did not create.  Assembly happens in
+a sibling staging dir that is swapped in with two renames at the end, so an
+interrupted run leaves the previous output intact rather than half-purged.
+
+Output integrity: model.safetensors.index.json and MANIFEST.sha256 are
 ALWAYS recomputed from the bytes actually written, every loader-visible copy
 of the bit allocation (config.json hybrid_tr3_tail, quantization_config,
 tier_bitmap.json) is updated so they cannot contradict each other, and an
@@ -115,6 +124,11 @@ from fq_repack import (  # noqa: E402
 TOOL_VERSION = "fq_assemble/2"
 ATTESTATION_SCHEMA = "fq-attestation/2"
 ASSEMBLY_RECORD = "fq-assembly.json"
+# Written into every checkpoint this tool produces.  --force will only ever
+# delete a directory that carries it: it is the difference between "a previous
+# fq_assemble output" and "the model dir the user spent a week curating".
+SENTINEL = ".fq-assembly"
+SENTINEL_SCHEMA = "fq-assembly-sentinel/1"
 DEFAULT_ALLOWED_PREDICATES = ("repack-of", "encode-of", "derived-from")
 CHUNK = 1 << 24
 MAX_HEADER_BYTES = 1 << 26  # real segment headers are ~1 MB; refuse absurdity
@@ -803,28 +817,213 @@ def regenerate_manifest(out_dir: Path, known: dict[str, str] | None = None) -> d
     return shas
 
 
-def prepare_out_dir(out: Path, force: bool) -> None:
-    """The output must be a clean dir: merging into a previous assembly is how
-    shards from two different recipes end up in one checkpoint."""
-    if out.exists():
-        if not out.is_dir():
-            raise AssemblyError(f"{out} exists and is not a directory")
-        entries = sorted(p.name for p in out.iterdir())
-        if entries and not force:
+# ------------------------------------------------------------ output safety
+
+def _resolved(p: Path) -> Path:
+    """Absolute, symlink-free path — the only form the safety checks compare.
+
+    Computed with strict=False so a not-yet-created --out still resolves.
+    """
+    return Path(p).expanduser().resolve()
+
+
+def _is_parent_or_equal(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    """True when deleting `a` could delete part of `b`, or vice versa."""
+    return _is_parent_or_equal(a, b) or _is_parent_or_equal(b, a)
+
+
+def _repo_paths() -> list[Path]:
+    """This checkout: the tools dir and the git root above it, if any."""
+    here = Path(__file__).resolve().parent
+    out = [here]
+    for cand in [here, *here.parents]:
+        if (cand / ".git").exists():
+            out.append(cand)
+            break
+    else:
+        out.append(here.parent)
+    return out
+
+
+def _cache_paths() -> list[Path]:
+    """Upstream model caches — never a legal assembly target."""
+    out = []
+    for var in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE",
+                "TRANSFORMERS_CACHE", "XDG_CACHE_HOME"):
+        value = os.environ.get(var)
+        if value:
+            out.append(_resolved(Path(value)))
+    home = Path.home()
+    out += [_resolved(home / ".cache" / "huggingface"),
+            _resolved(home / ".cache")]
+    return out
+
+
+def check_out_dir(out: Path, *, source: Path | None = None,
+                  segments: Path | None = None,
+                  policy: Path | None = None) -> Path:
+    """Resolve --out and refuse every destination whose purge would be a loss.
+
+    `--force` deletes recursively, so the argument that reaches it has to be
+    proven safe BEFORE anything runs: a typo'd `--out .`, an `--out ~`, or an
+    `--out <the source checkpoint>` must be an error message, never a deleted
+    model.  Refusals here are absolute — no flag turns them off, because
+    there is no legitimate assembly whose target is your home directory.
+
+    Returns the resolved output path.  Raises AssemblyError with the reason.
+    """
+    given = Path(out).expanduser()
+    if given.is_symlink():
+        raise AssemblyError(
+            f"--out {given} is a symlink (-> {os.readlink(given)}): refusing. "
+            f"Purging through a symlink deletes the target's contents, which "
+            f"is never what the link was for. Pass the real path.")
+    real = _resolved(given)
+    home = _resolved(Path.home())
+
+    if real == Path(real.anchor):
+        raise AssemblyError(f"--out {real} is the filesystem root: refusing.")
+    if real == home:
+        raise AssemblyError(
+            f"--out {real} is your home directory: refusing. Assemble into a "
+            f"subdirectory (e.g. {home / 'my-checkpoint'}).")
+    if _is_parent_or_equal(real, home):
+        raise AssemblyError(
+            f"--out {real} contains your home directory ({home}): refusing.")
+    for repo in _repo_paths():
+        if _is_parent_or_equal(real, repo):
             raise AssemblyError(
-                f"{out} is not empty ({len(entries)} entries, e.g. "
-                f"{entries[:3]}): assembling here would merge this recipe into "
-                f"whatever is already there. Use a fresh --out, or --force to "
-                f"purge it first.")
-        for p in out.iterdir():
-            if p.is_dir() and not p.is_symlink():
-                shutil.rmtree(p)
-            else:
-                p.unlink()
-        if entries:
-            print(f"--force: purged {len(entries)} stale entries from {out}",
-                  flush=True)
-    out.mkdir(parents=True, exist_ok=True)
+                f"--out {real} is (or contains) the Progressive Tensors "
+                f"checkout at {repo}: refusing to assemble over the tools.")
+    if (real / ".git").exists():
+        raise AssemblyError(
+            f"--out {real} looks like a git checkout (it has a .git): "
+            f"refusing. Assemble into a directory that is not a repository.")
+    for cache in _cache_paths():
+        if _overlaps(real, cache):
+            raise AssemblyError(
+                f"--out {real} overlaps the upstream model cache {cache}: "
+                f"refusing. Assembling there would put a derived checkpoint "
+                f"inside the cache it was derived from — and --force would "
+                f"delete the cache.")
+    for flag, value in (("--source", source), ("--segments", segments)):
+        if value is None:
+            continue
+        other = _resolved(value)
+        if _overlaps(real, other):
+            raise AssemblyError(
+                f"--out {real} overlaps {flag} {other}: refusing. The output "
+                f"directory is replaced wholesale with --force and rebuilt "
+                f"from these inputs; it can never be the same tree as one of "
+                f"them, or contain it, or live inside it.")
+    if policy is not None:
+        # A recipe sitting next to the output dir is normal; a recipe INSIDE
+        # it would be deleted by the very --force that reads it.
+        pol = _resolved(policy)
+        if _is_parent_or_equal(real, pol):
+            raise AssemblyError(
+                f"--out {real} contains the policy file {pol}: refusing, "
+                f"--force would delete the recipe this run is reading.")
+    if real.exists() and not real.is_dir():
+        raise AssemblyError(f"{real} exists and is not a directory")
+    return real
+
+
+def write_sentinel(out: Path) -> None:
+    """Mark a directory as fq_assemble's own output (see SENTINEL)."""
+    (out / SENTINEL).write_text(json.dumps({
+        "schema": SENTINEL_SCHEMA,
+        "tool": TOOL_VERSION,
+        "created_utc": now_utc(),
+        "note": ("written by fq_assemble; --force will only purge a directory "
+                 "that carries this file"),
+    }, indent=1, sort_keys=True) + "\n")
+
+
+def _has_sentinel(out: Path) -> bool:
+    p = out / SENTINEL
+    if not p.is_file() or p.is_symlink():
+        return False
+    try:
+        return json.loads(p.read_text()).get("schema") == SENTINEL_SCHEMA
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return False
+
+
+class StagedOutput:
+    """Assemble into a sibling staging dir, then swap it into place.
+
+    Nothing is ever written into --out itself and nothing is deleted from it
+    until a complete checkpoint exists next to it.  The swap is two renames
+    (out -> trash, staging -> out), so the destination is always either the
+    previous complete checkpoint or the new one — an interrupt can leave a
+    stale `.<name>.fq-staging` dir behind, never a half-purged output.
+    """
+
+    def __init__(self, out: Path, force: bool):
+        self.out = out
+        self.force = force
+        self.staging = out.parent / f".{out.name}.fq-staging"
+        self.trash = out.parent / f".{out.name}.fq-trash"
+        self.committed = False
+        self.replaced = False
+
+    def begin(self) -> Path:
+        """Validate the destination, create the staging dir, return it."""
+        if self.out.exists():
+            entries = sorted(p.name for p in self.out.iterdir())
+            if entries and not self.force:
+                raise AssemblyError(
+                    f"{self.out} is not empty ({len(entries)} entries, e.g. "
+                    f"{entries[:3]}): assembling here would merge this recipe "
+                    f"into whatever is already there. Use a fresh --out, or "
+                    f"--force to replace it.")
+            if entries and not _has_sentinel(self.out):
+                raise AssemblyError(
+                    f"refusing --force on {self.out}: it holds {len(entries)} "
+                    f"entries (e.g. {entries[:3]}) but no {SENTINEL} marker, "
+                    f"so fq_assemble did not create it. --force deletes the "
+                    f"whole directory tree; it will only do that to its own "
+                    f"previous output. If you really mean to replace this "
+                    f"directory, move or delete it yourself first.")
+            self.replaced = bool(entries)
+        self.out.parent.mkdir(parents=True, exist_ok=True)
+        for leftover in (self.staging, self.trash):
+            if leftover.exists():
+                print(f"note: removing leftover {leftover} from an "
+                      f"interrupted run", flush=True)
+                shutil.rmtree(leftover)
+        self.staging.mkdir()
+        write_sentinel(self.staging)
+        return self.staging
+
+    def commit(self) -> None:
+        """Swap the staging dir into place; then drop the previous output."""
+        moved = False
+        if self.out.exists():
+            os.rename(self.out, self.trash)
+            moved = True
+        try:
+            os.rename(self.staging, self.out)
+        except OSError:
+            if moved:  # put the old checkpoint back before re-raising
+                os.rename(self.trash, self.out)
+            raise
+        self.committed = True
+        if moved:
+            shutil.rmtree(self.trash, ignore_errors=True)
+            if self.replaced:
+                print(f"--force: replaced the previous assembly in {self.out}",
+                      flush=True)
+
+    def abort(self) -> None:
+        """Drop the staging dir; the destination was never touched."""
+        if not self.committed and self.staging.exists():
+            shutil.rmtree(self.staging, ignore_errors=True)
 
 
 def build_assembly_record(*, policy_path: Path, policy: dict, segments: Path,
@@ -883,7 +1082,10 @@ def main(argv=None) -> int:
     p.add_argument("--layers", default=None)
     p.add_argument(
         "--force", action="store_true",
-        help="purge a non-empty output dir before assembling (never merges)")
+        help=f"replace a non-empty output dir (never merges).  Only a "
+             f"directory carrying the {SENTINEL} marker written by a previous "
+             f"fq_assemble run can be replaced; anything else is refused so a "
+             f"mistyped --out cannot delete your data.")
     p.add_argument(
         "--sign-key", type=Path, default=None,
         help="ed25519 seed used to also emit a signed assembly-of attestation "
@@ -924,6 +1126,12 @@ def main(argv=None) -> int:
              "fallback to read()+write() on EXDEV/EOPNOTSUPP/etc.); saves "
              "local disk space only — no effect on HF/remote.")
     args = p.parse_args(argv)
+
+    # Before anything is read, written or deleted: prove --out is a legal
+    # destination.  --force purges recursively, so this check is what stands
+    # between a mistyped path and somebody's model collection.
+    args.out = check_out_dir(args.out, source=args.source,
+                             segments=args.segments, policy=args.policy)
 
     policy = json.loads(args.policy.read_text())
     bpe = policy["bits_per_expert"]
@@ -974,6 +1182,7 @@ def main(argv=None) -> int:
     # open so the assembler copies exactly the bytes that were verified.
     readers: dict[tuple[int, int], SegmentReader] = {}
     total, seg_records = {}, []
+    staged = StagedOutput(args.out, args.force)
     try:
         for _src, layer, lb in jobs:
             for k in sorted(set(lb or ())):
@@ -992,51 +1201,62 @@ def main(argv=None) -> int:
             who = "signed by " + ", ".join(keyids) if keyids else "none needed"
         print(f"segments: {len(seg_records)} checked, {who}", flush=True)
 
-        prepare_out_dir(args.out, args.force)
+        # Everything below writes into the staging dir; --out is untouched
+        # until the final swap, so a crash here costs nothing but the staging
+        # dir.  (Note the destination is validated inside begin(), before a
+        # single byte moves.)
+        work = staged.begin()
         for src_shard, layer, lb in jobs:
             if lb is None:
                 # dense layer (or out-of-policy): copy through
-                shutil.copyfile(src_shard, args.out / src_shard.name)
+                shutil.copyfile(src_shard, work / src_shard.name)
                 continue
             counts = assemble_layer(
-                src_shard, args.out / src_shard.name, layer, lambda e: lb[e],
+                src_shard, work / src_shard.name, layer, lambda e: lb[e],
                 {k: readers[(layer, k)] for k in set(lb)}, reflink=args.reflink)
             total[layer] = counts
             print(f"layer {layer:3d}: {counts}", flush=True)
+
+        for r in readers.values():
+            r.close()
+        readers.clear()
+
+        for extra in args.source.iterdir():
+            if extra.is_file() and not extra.name.startswith("model-layer-"):
+                shutil.copyfile(extra, work / extra.name)
+        emit_mixed_metadata(work, bpe, args.source)
+
+        # integrity metadata is ALWAYS rebuilt from the bytes just written: a
+        # same-size payload change keeps every file size intact, so a manifest
+        # that is only refreshed "when something looks different" is a manifest
+        # that can lie.
+        regenerate_shard_index(work)
+        shas = hash_tree(work, skip=("MANIFEST.sha256", ASSEMBLY_RECORD))
+        record = build_assembly_record(
+            policy_path=args.policy, policy=policy, segments=args.segments,
+            source=args.source, seg_records=seg_records,
+            assembled_layers=list(total),
+            products={n: s for n, s in shas.items()
+                      if n.startswith("model-") and n.endswith(".safetensors")},
+            verification={
+                "mode": "INSECURE (unverified)" if args.insecure else "verified",
+                "trusted_signers": sorted(trusted),
+                "allowed_predicates": sorted(allowed),
+                "segments_verified": sum(1 for r in seg_records
+                                         if r.get("verified")),
+            })
+        atomic_write_json(work / ASSEMBLY_RECORD, record)
+        if args.sign_key:
+            att_dir = work / "attestations"
+            att_dir.mkdir(exist_ok=True)
+            (att_dir / "assembly-of.jsonl").write_text(
+                Signer(args.sign_key).sign_line(record) + "\n")
+        regenerate_manifest(work, known=shas)
+        staged.commit()
     finally:
         for r in readers.values():
             r.close()
-
-    for extra in args.source.iterdir():
-        if extra.is_file() and not extra.name.startswith("model-layer-"):
-            shutil.copyfile(extra, args.out / extra.name)
-    emit_mixed_metadata(args.out, bpe, args.source)
-
-    # integrity metadata is ALWAYS rebuilt from the bytes just written: a
-    # same-size payload change keeps every file size intact, so a manifest
-    # that is only refreshed "when something looks different" is a manifest
-    # that can lie.
-    regenerate_shard_index(args.out)
-    shas = hash_tree(args.out, skip=("MANIFEST.sha256", ASSEMBLY_RECORD))
-    record = build_assembly_record(
-        policy_path=args.policy, policy=policy, segments=args.segments,
-        source=args.source, seg_records=seg_records,
-        assembled_layers=list(total),
-        products={n: s for n, s in shas.items()
-                  if n.startswith("model-") and n.endswith(".safetensors")},
-        verification={
-            "mode": "INSECURE (unverified)" if args.insecure else "verified",
-            "trusted_signers": sorted(trusted),
-            "allowed_predicates": sorted(allowed),
-            "segments_verified": sum(1 for r in seg_records if r.get("verified")),
-        })
-    atomic_write_json(args.out / ASSEMBLY_RECORD, record)
-    if args.sign_key:
-        att_dir = args.out / "attestations"
-        att_dir.mkdir(exist_ok=True)
-        (att_dir / "assembly-of.jsonl").write_text(
-            Signer(args.sign_key).sign_line(record) + "\n")
-    regenerate_manifest(args.out, known=shas)
+        staged.abort()
     print(f"assembled {len(total)} MoE layers -> {args.out} "
           f"({record['verification']['mode']}, "
           f"{len(seg_records)} segments)", flush=True)

@@ -676,10 +676,197 @@ def test_out_dir_must_be_empty_or_force(repacked):
     with pytest.raises(fq_assemble.AssemblyError, match="not empty"):
         assemble(segments, snap, ppath, out)
     assert stale.exists(), "a refused run must not delete anything"
+    # --force alone is not enough: this dir was not made by fq_assemble
+    with pytest.raises(fq_assemble.AssemblyError, match="no .fq-assembly"):
+        assemble(segments, snap, ppath, out, "--force")
+    assert stale.exists(), "a refused --force must not delete anything"
+    # marked as a previous assembly, --force replaces it
+    fq_assemble.write_sentinel(out)
     assert assemble(segments, snap, ppath, out, "--force") == 0
-    assert not stale.exists(), "--force must purge, not merge"
+    assert not stale.exists(), "--force must replace, not merge"
     index = json.loads((out / "model.safetensors.index.json").read_text())
     assert not any(v == stale.name for v in index["weight_map"].values())
+
+
+# --------------------------------------------------- destructive --out (P1-5)
+
+def _dirty(path: Path) -> Path:
+    """A non-empty directory standing in for the user's data."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "precious.safetensors").write_bytes(b"the user's model")
+    return path
+
+
+def test_assembly_writes_the_sentinel_it_later_requires(repacked):
+    """Every output carries the marker that authorizes its own replacement."""
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    out = tmp / "asm-sentinel"
+    assert assemble(segments, snap, ppath, out) == 0
+    marker = json.loads((out / fq_assemble.SENTINEL).read_text())
+    assert marker["schema"] == fq_assemble.SENTINEL_SCHEMA
+    # ... and it is covered by the checkpoint's own MANIFEST.sha256
+    manifest = dict(line.split()[::-1] for line in
+                    (out / "MANIFEST.sha256").read_text().splitlines())
+    assert fq_assemble.SENTINEL in manifest
+    # a second --force run over our own output is allowed
+    assert assemble(segments, snap, ppath, out, "--force") == 0
+
+
+def test_out_refuses_the_filesystem_root(repacked):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.AssemblyError, match="filesystem root"):
+        assemble(segments, snap, ppath, Path("/"), "--force")
+
+
+def test_out_refuses_the_home_directory(repacked, monkeypatch):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    home = _dirty(tmp / "home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(fq_assemble.AssemblyError, match="home directory"):
+        assemble(segments, snap, ppath, home, "--force")
+    assert (home / "precious.safetensors").exists()
+
+
+def test_out_refuses_a_parent_of_the_home_directory(repacked, monkeypatch):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    home = _dirty(tmp / "houses" / "home")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(fq_assemble.AssemblyError, match="contains your home"):
+        assemble(segments, snap, ppath, tmp / "houses", "--force")
+    assert (home / "precious.safetensors").exists()
+
+
+def test_out_refuses_this_checkout(repacked):
+    """--out <the tools repo> would assemble over fq_assemble itself."""
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    checkout = Path(fq_assemble.__file__).resolve().parent
+    with pytest.raises(fq_assemble.AssemblyError, match="checkout"):
+        assemble(segments, snap, ppath, checkout, "--force")
+    assert Path(fq_assemble.__file__).exists()
+
+
+def test_out_refuses_a_git_working_tree(repacked):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    repo = _dirty(tmp / "someones-repo")
+    (repo / ".git").mkdir()
+    with pytest.raises(fq_assemble.AssemblyError, match="git checkout"):
+        assemble(segments, snap, ppath, repo, "--force")
+    assert (repo / "precious.safetensors").exists()
+
+
+def test_out_refuses_a_symlink(repacked):
+    """Purging through a symlink empties whatever it points at."""
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    target = _dirty(tmp / "real-model")
+    link = tmp / "link-to-model"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(fq_assemble.AssemblyError, match="symlink"):
+        assemble(segments, snap, ppath, link, "--force")
+    assert (target / "precious.safetensors").exists()
+
+
+def test_out_refuses_the_source_checkpoint(repacked):
+    """The review's headline case: --out <the source> with --force."""
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.AssemblyError, match="overlaps --source"):
+        assemble(segments, snap, ppath, snap, "--force")
+    assert sorted(snap.glob("model-layer-*.safetensors")), "source untouched"
+
+
+def test_out_refuses_a_parent_of_the_source(repacked):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.AssemblyError, match="overlaps --source"):
+        assemble(segments, snap, ppath, snap.parent, "--force")
+    assert sorted(snap.glob("model-layer-*.safetensors"))
+
+
+def test_out_refuses_a_dir_inside_the_segments(repacked):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.AssemblyError, match="overlaps --segments"):
+        assemble(segments, snap, ppath, segments / "nested", "--force")
+    assert sorted(segments.glob("*.safetensors"))
+
+
+def test_out_refuses_to_swallow_the_policy_file(repacked):
+    snap, segments, tmp = repacked
+    recipes = tmp / "recipes"
+    recipes.mkdir()
+    ppath = policy_file(recipes, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.AssemblyError, match="policy file"):
+        assemble(segments, snap, ppath, recipes, "--force")
+    assert ppath.exists()
+
+
+def test_out_refuses_the_upstream_cache(repacked, monkeypatch):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    cache = _dirty(tmp / "hf-cache")
+    monkeypatch.setenv("HF_HOME", str(cache))
+    with pytest.raises(fq_assemble.AssemblyError, match="model cache"):
+        assemble(segments, snap, ppath, cache / "hub", "--force")
+    assert (cache / "precious.safetensors").exists()
+
+
+def test_out_next_to_the_policy_is_fine(repacked):
+    """The refusals must not ban the ordinary layout (recipe beside output)."""
+    snap, segments, tmp = repacked
+    recipes = tmp / "work"
+    recipes.mkdir()
+    ppath = policy_file(recipes, {str(l): [3] * E for l in LAYERS})
+    assert assemble(segments, snap, ppath, recipes / "out") == 0
+    assert ppath.exists()
+
+
+def test_failed_assembly_leaves_the_previous_output_intact(repacked, monkeypatch):
+    """Staging + rename: an interrupted run can never half-purge --out."""
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    out = tmp / "asm-staged"
+    assert assemble(segments, snap, ppath, out) == 0
+    before = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert before
+
+    boom = [0]
+
+    def explode(*a, **kw):
+        boom[0] += 1
+        raise KeyboardInterrupt("simulated interrupt mid-assembly")
+
+    monkeypatch.setattr(fq_assemble, "assemble_layer", explode)
+    with pytest.raises(KeyboardInterrupt):
+        assemble(segments, snap, ppath, out, "--force")
+    assert boom[0] == 1
+    after = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert after == before, "the previous checkpoint must survive a failed run"
+    leftovers = [p.name for p in tmp.iterdir() if ".fq-staging" in p.name
+                 or ".fq-trash" in p.name]
+    assert not leftovers, f"staging dirs must be cleaned up: {leftovers}"
+
+
+def test_failed_first_assembly_creates_no_output_dir(repacked, monkeypatch):
+    snap, segments, tmp = repacked
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    out = tmp / "asm-never"
+
+    def explode(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(fq_assemble, "assemble_layer", explode)
+    with pytest.raises(OSError, match="disk full"):
+        assemble(segments, snap, ppath, out)
+    assert not out.exists(), "a failed run must not leave a partial --out"
+    assert not list(tmp.glob(".*fq-staging*"))
 
 
 def test_index_and_manifest_always_regenerated(repacked):
