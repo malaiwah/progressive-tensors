@@ -28,7 +28,20 @@ from test_fq_fetch import (REV, build_source, served, trust_root,  # noqa: E402,
                            write_policy)
 from test_fq_repack import LAYERS  # noqa: E402
 
-SCHEMAS = Path(__file__).parent.parent / "schemas"
+
+
+def _schemas_dir() -> Path | None:
+    """Nearest ancestor holding schemas/ (see test_fq_trust._repo_root: the
+    research-branch mirror carries the tools without the schema files)."""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "schemas" / "fq-manifest-1.schema.json").exists():
+            return parent / "schemas"
+    return None
+
+
+SCHEMAS = _schemas_dir()
+if SCHEMAS is None:
+    pytest.skip("schemas/ is not in this checkout", allow_module_level=True)
 REAL_TREES = [Path.home() / "fq-segments" / "GLM-5.2-EXL3-FQ",
               Path.home() / "fq-0c" / "fruit-segments",
               Path.home() / "fq-primed" / "segments-336"]

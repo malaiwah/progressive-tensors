@@ -3,28 +3,6 @@
 **Mixed-K quants as a service — assemble your own EXL3 checkpoint from
 shared, attested, per-expert segments. Pure safetensors. No new format.**
 
-> ### ⚠️ Experimental alpha — read this before you plan anything around it
->
-> **Status: `v0.1.0-alpha`.** This is a working research system, not a
-> product. Concretely:
->
-> - **The artifact repository is still private.** The GLM-5.2 segment tree
->   exists and is verified locally, but
->   [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments)
->   returns 401 today. Publication is deliberately gated on the verification
->   work landing — we are not shipping 347 GB that consumers cannot check.
->   The commands below are the real ones; they will work when it opens.
-> - **The schemas are v1, versioned but not frozen.** They freeze when CI
->   and verification enforcement have shipped and been exercised against
->   published artifacts. Until then expect additive fields (see
->   [`schemas/`](schemas/)).
-> - **Interfaces may move.** Flags, output layouts and predicates are still
->   being shaped by what verification turns out to need.
->
-> What *is* solid: the byte-level properties, and the measurements. Those
-> are stated below with what was actually measured, and the tests that hold
-> them are in [`tests/`](tests/).
-
 The community publishes many quantizations of the same MoE model — a flat
 3.0 bpw here, a mixed 3.25 bpw there, a 3.42 bpw flagship — each a
 multi-hundred-GB download, each an all-or-nothing choice. Progressive
@@ -70,6 +48,24 @@ Think progressive JPEG, for quants.
   built on top (see Research), but everything in this repo works today
   with plain files.
 
+### Maturity, by component — not one number
+
+- **Segments, assembly and verification: heavily verified, not alpha.**
+  Reassembly is sha256-identical on **76/76 MoE shards**; **2048/2048**
+  primed expert spans were re-checked against fresh ranged reads of the
+  pinned sources; the expanded family was fully re-derived; **147 tests**
+  green, on Linux and macOS across Python 3.11–3.13. One live caveat:
+  signer-pinned verification *inside* `fq_assemble` has just landed, so
+  pass `--trust-signer` explicitly — the tools print the exact line.
+- **Runtime — progressive loader and live per-expert reallocation:
+  experimental.** It boots from segments and reallocates in 0.4 s; that is
+  where the sharp edges are.
+- **Artifact repo: not public yet.** The GLM-5.2 tree is built and verified
+  but returns 401; publication is gated on the verification enforcement
+  landing. The commands below are the real ones.
+- **Schemas: v1, versioned, not frozen** — additive changes only, freezing
+  once CI and verification have been exercised against published artifacts
+  ([`schemas/`](schemas/)).
 
 ## The numbers behind it
 
@@ -89,6 +85,19 @@ Segments for **GLM-5.2** (from
 [`brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw`](https://huggingface.co/brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw)
 at pinned commit `9297b9f1`) live at
 [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments).
+
+**Four tiers are in that tree, and they did not all come from us.**
+
+| Tier | Where it came from |
+|---|---|
+| **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
+| **K4** | **primed from other people's published quants** — `sources/willfalco-3.42bpw/{shared-h,expanded}/` and `sources/willfalco-3.36bpw/`, 1,528 K4 fragments over layers 3–10, extracted by ranged reads and byte-identity-verified against the pinned sources |
+| **K2** | fresh encodes (fast-load base tier), window 1: layers 3–10 |
+| **K5** | fresh encodes (hot-expert tier), window 1: layers 3–10 |
+
+The K4 tier is the point of the whole exercise made concrete: it is not our
+encode, it is somebody else's quant decomposed into fragments a recipe can
+name.
 
 **What you need on disk.** Assembly writes a complete checkpoint, so
 besides the fragments you need the **source checkpoint snapshot** (~295 GB
@@ -406,7 +415,7 @@ and are being promoted into this repo as they stabilize.
 | K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
 | `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
 | Mixed-size (true mixed-K) assembly + loader metadata | done — mixed-K checkpoint assembled and booted |
-| K2/K5 tiers (fresh encodes) | window 1 (real GLM-5.2, layers 3–10) encoded and uploaded, `encode-of` attestations |
+| Four tiers in the artifact tree (K2/K3/K4/K5) | K3 base complete; K4 **primed from community quants** (1,528 fragments, layers 3–10); K2/K5 fresh encodes, window 1 (layers 3–10), `encode-of` attestations |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | loader boots from segments; live reallocation demonstrated at 0.4 s |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 
@@ -432,6 +441,16 @@ judged on are the reviewer's: storage and transfer across *many* recipes
 versus separate checkpoints **and** versus Xet dedupe alone; reconstruction
 plus verification cost; byte identity; reuse across independently produced
 tiers; and multi-provider interoperability.
+
+## Deeper reading
+
+- [TRUST.md](TRUST.md) — the trust model: rungs, what each proves and does
+  not, and what a compromised artifact repo can still do under pinning.
+- [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md) — the measured
+  reconstruction proof across three community quants.
+- [docs/PRIOR-ART.md](docs/PRIOR-ART.md) — the independent prior-art review.
+- [schemas/](schemas/) — every emitted document, with its stability promise.
+- [CHANGELOG.md](CHANGELOG.md) — what landed, and the known gaps.
 
 ## Research
 

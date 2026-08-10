@@ -59,8 +59,13 @@ measured, what is implemented, and what is not.
   is no longer treated as checked: wrong key id, malformed base64, a
   signature that is not 64 bytes, or a bad signature are all hard failures.
   (`AA==` as a signature is now a regression test.)
-- **README honesty pass** — an experimental-alpha banner; the artifact repo
-  described as prepared and private rather than published; `fq-segment/1`
+- **README honesty pass** — maturity stated per component instead of one
+  blanket label (segments/assembly/verification: heavily verified, with the
+  evidence; runtime loader and live reallocation: experimental; artifact
+  repo: not public yet; schemas: v1, not frozen), with the TLDR and
+  quickstart kept above the fold and depth pushed into `docs/`; the four
+  tiers named, including that K4 comes from *primed community fragments*
+  rather than our own encodes; `fq-segment/1`
   described as schema v1, versioned and frozen once CI and verification
   ship, rather than a "stable API"; the shard-count contradiction reconciled
   against the measurement (all 76 MoE shards rebuilt from segments — 278.5 GB
