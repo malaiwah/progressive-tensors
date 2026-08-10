@@ -63,7 +63,7 @@ from who signed them:
 |---|---|---|---|
 | **fragment digest** | `expert_sha256` in an attestation vs the bytes you fetched | The bytes you received are the bytes the signer committed to. | That those bytes came from the upstream quant they claim. |
 | **materials pin** | `materials.repo` + `revision` + `file_sha256` | Which upstream file the signer says these bytes were copied from — checkable by anyone with a ranged read of that repo. | That the signer actually did the copy, until someone re-does the ranged read and compares (this is what `fq_verify --identity` automates). |
-| **release completeness** | one `fq-release/1` signature over every file's digest | *Which set of files is the release*, so nothing can be added, dropped, or rolled back silently. | That the release is a good release. |
+| **release completeness** | one `fq-release/1` signature over every file's digest | *Which set of files is the release*, so nothing can be added, dropped, or rolled back silently — **at the commit the release names**. | That the release is a good release, or that the branch head is still that commit. See §3.1. |
 
 Three things nothing here establishes, ever, and no amount of signing will:
 
@@ -132,6 +132,39 @@ publisher (or whoever holds their token) can change the bytes under you
 between runs; the signature still verifies because they re-sign. Pin the
 revision *and* the signer. `fq_fetch` warns when you do not.
 
+### 3.1 The release manifest describes one commit, not a branch
+
+`fq-release/1` says "these 353 files, these digests, are the release". That
+statement is scoped to **one commit**, and two things follow that are easy
+to get wrong.
+
+**Publication has to be atomic or the statement is not true of anything.**
+A publisher that uploads file-by-file — the default of every hub client —
+walks the repository through hundreds of intermediate states, none of which
+any signature describes, and lets a second writer land commits in the
+middle. `fq_release.py publish` therefore reads the remote HEAD, builds and
+signs from the *local* tree, and pushes the whole coherent set in one
+`create_commit` with `parent_commit=<that HEAD>`. A concurrent writer makes
+the push fail, not interleave; the tool re-reads, rebuilds and retries
+within a bounded budget. A rejected push is the mechanism working.
+
+**A branch head is not a release.** Our own GLM-5.2 campaign supervisor
+publishes *incrementally*: it uploads each encode window as it finishes, and
+a release manifest is built afterwards. So on that repository `main` is
+usually **ahead of** the last `fq-release.json`, and the extra segments are
+real, individually attested, and *not covered by the release signature*.
+`fq_release.py verify --complete` against `main` will correctly report them
+as unlisted and exit non-zero. That is not a failure of the artifacts; it is
+the completeness check telling you that "the branch" and "the release" are
+different things. Pin `--revision` to a release commit (or its tag) if you
+want `--complete` to mean something.
+
+What `fq-release/1` still does not give you, in either mode, is
+**freshness**: a replayed older release verifies perfectly and is simply
+stale. Compare `release`, `created_utc` and `parent_revision` inside the
+document against what you expected. Transparency-log inclusion proofs are
+the real fix and are not implemented (§6).
+
 ## 4. The chain, end to end
 
 ```
@@ -186,7 +219,11 @@ prefix of ≥16 and refuse shorter ones rather than matching loosely.
 
 **Re-check what you already have.** `fq_release.py verify --dir ./segments
 --trust-signer <fp>` re-hashes a tree you downloaded weeks ago. It is
-cheap and it is the only way to notice bit-rot or a swapped file.
+cheap and it is the only way to notice bit-rot or a swapped file. Add
+`--complete` when you pulled the whole release: it then exits non-zero both
+on a listed file that is absent and on a local file the signature does not
+cover, so "nothing was dropped and nothing was added" is something a script
+can gate on rather than a line of output somebody has to read.
 
 **When a key rotates**, the old line in `keys/FINGERPRINTS` becomes
 `retired` (signatures made before retirement stay valid — tools warn) and
@@ -239,7 +276,16 @@ somewhere the artifacts cannot reach.
   (it reads this repo's `keys/FINGERPRINTS` format directly) and refuses to
   assemble anything it cannot verify;
 - real ed25519 verification with the failure modes enumerated above;
-- `fq-release/1` build and verify, including partial trees;
+- `fq-release/1` build and verify, including partial trees, and
+  `--complete` as a strict rung where a listed-but-absent file *and* an
+  unlisted-but-present file are both non-zero exits;
+- `fq-release/1` **atomic publication** — one `create_commit` pinned to the
+  parent HEAD, a bounded rebuild-and-retry when a concurrent writer wins the
+  race, and a refusal to publish while the remote holds release-eligible
+  files the release does not cover (§3.1);
+- signature verification in `fq_prime spot-check`: every attestation line is
+  verified against the pinned key before its `expert_sha256` is used, and a
+  missing, unreadable or silent attestation is a failure rather than a pass;
 - per-expert digest checking on every fetched byte range;
 - local `derived-from` re-attestation of fetched subsets, so a
   range-fetched tree assembles under a pinned signer instead of needing
@@ -248,21 +294,9 @@ somewhere the artifacts cannot reach.
 **Not yet:**
 
 - per-source pinning in a multi-provider fetch (see §5);
-- **`fq_prime spot-check` does not verify signatures.** It base64-decodes
-  the attestation payload, reads `expert_sha256` out of it, and compares
-  re-fetched bytes against that digest. The digest comparison is real; the
-  *provenance* check is not — replace every signature in the file with a
-  placeholder and the spot-check still reports success, because no
-  signature is ever checked. Treat its output as "these bytes match this
-  file's own claim", not "these bytes are what the project published",
-  until it grows the trust flags. The fix is three lines against the shared
-  module: `fq_trust.add_trust_arguments(subparser)`,
-  `verifier = fq_trust.Verifier.from_args(args, manifest=manifest)`,
-  `payload = verifier.verify_envelope(json.loads(line), where=...)` —
-  `verify_envelope` raises rather than returning an unverified payload, so
-  the decode-only path cannot survive the edit. (`fq_assemble` already
-  verifies every fragment it consumes and fails closed without a pin;
-  `fq_fetch` and `fq_release` use the module.)
+- **release freshness.** Nothing here detects a replayed older release;
+  transparency-log inclusion proofs are the answer and are not built.
+  Until then, compare `created_utc` / `parent_revision` yourself (§3.1);
 - DSSE/in-toto envelopes and transparency-log inclusion proofs (§6);
 - countersignatures — a second party attesting "I re-derived this fragment
   and got the same bytes". The attestation files are JSON Lines precisely

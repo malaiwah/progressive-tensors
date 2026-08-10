@@ -53,16 +53,19 @@ Think progressive JPEG, for quants.
 - **Segments, assembly and verification: heavily verified, not alpha.**
   Reassembly is sha256-identical on **76/76 MoE shards**; **2048/2048**
   primed expert spans were re-checked against fresh ranged reads of the
-  pinned sources; the expanded family was fully re-derived; **147 tests**
+  pinned sources; the expanded family was fully re-derived; **184 tests**
   green, on Linux and macOS across Python 3.11–3.13. One live caveat:
   signer-pinned verification *inside* `fq_assemble` has just landed, so
   pass `--trust-signer` explicitly — the tools print the exact line.
 - **Runtime — progressive loader and live per-expert reallocation:
   experimental.** It boots from segments and reallocates in 0.4 s; that is
   where the sharp edges are.
-- **Artifact repo: not public yet.** The GLM-5.2 tree is built and verified
-  but returns 401; publication is gated on the verification enforcement
-  landing. The commands below are the real ones.
+- **Artifact repo: public, and still growing.**
+  [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments)
+  is live. An unattended encode campaign publishes new K2/K5 windows to it,
+  so `main` moves: **pin `--revision`/`@<commit>`**, and read layer coverage
+  out of `fq-manifest.json` (`per_k[K].layers`) rather than out of any
+  document that can go stale — including this one.
 - **Schemas: v1, versioned, not frozen** — additive changes only, freezing
   once CI and verification have been exercised against published artifacts
   ([`schemas/`](schemas/)).
@@ -92,12 +95,18 @@ at pinned commit `9297b9f1`) live at
 |---|---|
 | **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
 | **K4** | **primed from other people's published quants** — `sources/willfalco-3.42bpw/{shared-h,expanded}/` and `sources/willfalco-3.36bpw/`, 1,528 K4 fragments over layers 3–10, extracted by ranged reads and byte-identity-verified against the pinned sources |
-| **K2** | fresh encodes (fast-load base tier), window 1: layers 3–10 |
-| **K5** | fresh encodes (hot-expert tier), window 1: layers 3–10 |
+| **K2** | fresh encodes (fast-load base tier) — **coverage grows window by window**; `fq-manifest.json` `per_k["2"]` is the authority |
+| **K5** | fresh encodes (hot-expert tier) — same, `per_k["5"]` |
 
 The K4 tier is the point of the whole exercise made concrete: it is not our
 encode, it is somebody else's quant decomposed into fragments a recipe can
 name.
+
+**Do not `hf download` that repository whole.** It is ~481 GB and no recipe
+needs all of it; the model card carries commit-pinned, per-recipe
+`--include` patterns and the disk cost of each (all-K3 is ~279 GB, the K2
+tier on its own ~74 GB). `fq_fetch --policy` is smaller still, because it
+range-reads only the experts a recipe names.
 
 **What you need on disk.** Assembly writes a complete checkpoint, so
 besides the fragments you need the **source checkpoint snapshot** (~295 GB
@@ -369,11 +378,64 @@ and the attestation files. Verify one signature, then hash:
 ```bash
 uv run tools/fq_release.py verify --dir ./segments \
   --trust-signer a58b7bb79ba58457
+
+# strict rung, for a tree you pulled whole: non-zero if any listed file is
+# absent, and non-zero if any local file is NOT covered by the signature
+uv run tools/fq_release.py verify --dir ./segments --complete \
+  --trust-signer a58b7bb79ba58457
 ```
 
 That closes the gap N per-fragment signatures leave open — they each prove
 a fragment's origin, but nothing says *which set of fragments is the
 release*, so files could be added, dropped or rolled back silently.
+`--complete` is what makes "nothing was added" actionable: unlisted files
+are a **failure**, not a warning, so it can gate a deploy.
+
+### Publishing a release atomically
+
+Signing a local tree is only half of it. Uploading it file-by-file — what
+every hub client does by default — walks the *published* repository through
+a long succession of states that no signature describes, and lets a second
+writer interleave commits into the middle of your release.
+`fq_release.py publish` does the whole thing as one commit:
+
+```bash
+uv run tools/fq_release.py publish \
+  --dir ~/fq-segments/GLM-5.2-EXL3-FQ \
+  --repo malaiwah/GLM-5.2-EXL3-FQ-segments \
+  --release "GLM-5.2-EXL3-FQ 0.1.0" \
+  --cache ~/.cache/fq-release-digests.json
+```
+
+1. read the remote HEAD and its full file list;
+2. hash and sign the release **from the local tree** — the local tree is
+   the source of truth, never the host's metadata;
+3. push every changed file, every deletion, and `fq-release.json` in ONE
+   `create_commit` with `parent_commit=<the HEAD read in step 1>`.
+
+If anyone commits between (1) and (3) the push is **rejected**, not merged:
+the tool re-reads, rebuilds and retries within a bounded budget. Only files
+whose bytes the remote does not already hold are uploaded, so re-publishing
+an unchanged tree costs one small file rather than the repository —
+`--cache` keeps a rebuild after a lost race down to a stat() per file.
+
+`publish` also **refuses** when the remote holds release-eligible files the
+local tree does not: leaving them would put unsigned files inside a
+published release. `--prune` removes them in the same commit;
+`--allow-remote-extra` publishes anyway and prints every one.
+
+**What `fq-release.json` does not promise.** It describes *one commit*. A
+publisher that ships incrementally — as our own GLM-5.2 campaign supervisor
+does, uploading each encode window as it finishes — leaves the branch head
+ahead of the last release manifest most of the time. At the release commit
+the file list is exact; at `main` there will usually be published segments
+newer than, and therefore not covered by, the release manifest, and
+`verify --complete` will correctly report them as unlisted. Nor does it say
+anything about freshness: a replayed older release verifies perfectly and
+is simply stale, which is why the document carries `release`, `created_utc`
+and `parent_revision` for you to compare against what you expected. Pin
+`--revision` to a release commit if you want completeness to mean
+something.
 
 [**TRUST.md**](TRUST.md) is the full model: the four signature rungs and
 three content proofs, what each one does **not** establish, and exactly
@@ -412,11 +474,12 @@ and are being promoted into this repo as they stabilize.
 | `fq_repack` (checkpoint → segments) / `fq_assemble` (segments+recipe → checkpoint) | working, tested |
 | `fq_fetch` (recipe + sources → range-fetched segment tree) | working, tested; multi-source, content-hash selection, resumable |
 | Trust root (`keys/FINGERPRINTS`, `--trust-signer`, `fq-release/1`) | working, tested; per-source pinning and DSSE/in-toto envelopes still to come ([TRUST.md](TRUST.md)) |
-| GLM-5.2 K3 base segments on HF | **prepared, publication gated on verification enforcement** — repo still private (401); reassembly **sha256-verified 76/76 MoE shards** |
+| Release publication (`fq_release publish`) | atomic: one `create_commit` pinned to the parent HEAD, so a concurrent writer is rejected rather than interleaved; bounded rebuild+retry |
+| GLM-5.2 K3 base segments on HF | **published** at [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments), with `LICENSE`, `NOTICE` and a signed `fq-release.json`; reassembly **sha256-verified 76/76 MoE shards** |
 | K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
 | `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
 | Mixed-size (true mixed-K) assembly + loader metadata | done — mixed-K checkpoint assembled and booted |
-| Four tiers in the artifact tree (K2/K3/K4/K5) | K3 base complete; K4 **primed from community quants** (1,528 fragments, layers 3–10); K2/K5 fresh encodes, window 1 (layers 3–10), `encode-of` attestations |
+| Four tiers in the artifact tree (K2/K3/K4/K5) | K3 base complete (layers 3–78); K4 **primed from community quants** (1,528 fragments, layers 3–10); K2/K5 fresh encodes with `encode-of` attestations, **published window by window — read `fq-manifest.json` `per_k` for today's coverage** |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | loader boots from segments; live reallocation demonstrated at 0.4 s |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 

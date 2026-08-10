@@ -38,6 +38,23 @@ measured, what is implemented, and what is not.
   indexes and the attestation files. A consumer verifies one signature and
   then hashes, instead of trusting N independent attestation lines with no
   statement of completeness. Partial (range-fetched) trees are first-class.
+  `verify --complete` is the strict rung: a listed file that is absent and a
+  present file the signature does not cover are both non-zero exits, so "no
+  silent additions" is something CI can gate on.
+- **`fq_release publish`** — release publication that is atomic and
+  remote-state-safe. Uploading a release file-by-file, which is what every
+  hub client does by default, walks the *published* repository through
+  hundreds of states no signature describes and lets a second writer
+  interleave commits into the middle of it. `publish` reads the remote HEAD,
+  builds and signs the release from the local tree, and pushes every changed
+  file plus `fq-release.json` in ONE `create_commit` with
+  `parent_commit=<that HEAD>`: a concurrent writer causes a rejected push,
+  and the tool re-reads, rebuilds and retries within a bounded budget. Only
+  bytes the remote does not already hold are uploaded (LFS pointers compare
+  by sha256, git blobs by object name), an opt-in digest cache keeps a
+  rebuild after a lost race to a stat() per file, and publishing refuses
+  outright when the remote holds release-eligible files the local release
+  does not cover — `--prune` deletes them in the same commit.
 - **[TRUST.md](TRUST.md)** — the trust model: what each rung proves, what it
   does *not*, and what an attacker with full control of the artifact
   repository can and cannot do under fingerprint pinning.
@@ -84,6 +101,33 @@ measured, what is implemented, and what is not.
 
 ### Fixed
 
+- **A base install shipped a broken command.** The wheel declares `fq-eps`,
+  but `fq_eps` imported NumPy at module scope while NumPy lives in the
+  `[numeric]` extra, so `pip install progressive-tensors` produced a command
+  that died with `ModuleNotFoundError` the first time it ran. NumPy is now
+  imported on demand inside the functions that need it; a base install gets
+  working `--help` and a diagnostic naming the extra (exit 2). CI was hiding
+  this by installing the wheel and NumPy in one step — it now builds a bare
+  wheel, asserts NumPy is absent, and runs every console entry point.
+- **GitHub Actions were pinned to mutable major tags** (`actions/checkout@v4`,
+  `astral-sh/setup-uv@v5`, `actions/upload-artifact@v4`). A tag is a pointer
+  its owner can move, and this workflow checks out the repository and runs
+  beside release artifacts on `v*` tags. All three are pinned to commit
+  SHAs, with the release recorded in a comment; `permissions: contents: read`
+  added.
+- **The published artifact repository had MIT metadata and no licence
+  text.** `LICENSE` (scoped to our contribution) and `NOTICE` (the full
+  attribution chain — GLM-5.2/Zhipu AI, the brandonmusic and willfalco
+  source quants, exllamav3, safetensors, each pinned by revision) are now
+  published with the segments, and the model card links both.
+- **The model card told arriving users to `hf download` the whole 481 GB
+  repository.** Replaced with a commit-pinned release tag plus per-recipe
+  `--include` patterns and the measured disk cost of each (all-K3 279 GB,
+  fast-load K2 269 GB, hot-K5 298 GB, primed-K4 294 GB, the K2 tier alone
+  74 GB), and a correction of the K2 coverage claim, which was a fixed layer
+  range in a card while the campaign kept extending it — coverage now points
+  at `fq-manifest.json` `per_k`, which is rebuilt from the published
+  inventory.
 - Tracked `__pycache__/*.pyc` build artifacts removed from the index; the
   ignore list widened to cover packaging, venv and test-cache paths.
 
@@ -91,17 +135,14 @@ measured, what is implemented, and what is not.
 
 Stated rather than shipped:
 
-- The GLM-5.2 artifact repository is private; publication is gated on
-  verification enforcement landing.
+- `fq-release/1` describes **one commit**, and the GLM-5.2 campaign
+  supervisor publishes incrementally, so `main` on that repository is
+  normally ahead of the last release manifest. `verify --complete` against
+  `main` will report the newer segments as unlisted; pin `--revision` to a
+  release commit or its tag for completeness to mean anything. Freshness is
+  still unaddressed — a replayed older release verifies perfectly.
 - One `--trust-signer` applies to a whole `fq_fetch` run: per-source
   pinning for multi-provider fetches is designed but not implemented.
-- `fq_prime spot-check` still only *decodes* attestation payloads — it
-  compares re-fetched bytes against the digest it finds there, but never
-  checks the ed25519 signature, so a file full of placeholder signatures
-  passes. Its output means "matches this file's own claim", not "matches
-  what the project published". Wiring it to `fq_trust` is a three-line
-  change (see TRUST.md §7). `fq_assemble` verifies and fails closed as of
-  this release; `fq_fetch` and `fq_release` use the module.
 - Attestation envelopes are ad-hoc `{payload, signature, keyid}`; migration
   to DSSE/in-toto and OpenSSF Model Signing compatibility is the intended
   direction, and transparency-log inclusion proofs are what would close the
