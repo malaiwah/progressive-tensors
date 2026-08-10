@@ -6,7 +6,7 @@ alpha, **minor versions may break interfaces**; the schema version strings
 inside documents (`fq-segment/1`, `fq-policy/2`, …) are the compatibility
 contract that does not, and they are versioned separately.
 
-## v0.1.0-alpha — unreleased
+## v0.1.0-alpha — tag-ready (2026-08-10), not yet tagged
 
 First tagged state. A working research system: honest about what is
 measured, what is implemented, and what is not.
