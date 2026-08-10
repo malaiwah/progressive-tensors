@@ -382,8 +382,9 @@ under pinning.
 
 ## Contribute segments (encode-and-share)
 
-Fragments the community hasn't produced yet (K2 fast-load base, K5
-hot-expert tier, K4 for less-hot experts) can be encoded by anyone with
+Fragments nobody has published yet — a K2 fast-load base, a K5 hot-expert
+tier, K4 for experts no existing quant covers at that width — can be
+encoded by anyone with
 the model's BF16 weights and a captured calibration statistic, then
 published with `encode-of` provenance: the attestation pins the base model,
 the calibration capture, the encoder revision and the effective quant
