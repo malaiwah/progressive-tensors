@@ -65,6 +65,28 @@ sha256sum ./my-checkpoint/model-layer-030.safetensors
 #  -> identical to the original shard. That's the point.
 ```
 
+### Disk-saving assembly (`--reflink`)
+
+If segments and output live on a reflink-capable filesystem (XFS with
+`reflink=1`, btrfs), add `--reflink` to `fq_assemble.py`: expert-tensor
+bytes are then written with `copy_file_range`, letting the kernel share
+extents between the segment files and the assembled shards instead of
+storing the same bytes twice. Honest caveats:
+
+- **Sharing is the kernel's call.** `copy_file_range` may silently perform
+  a plain copy; extent sharing only happens when the filesystem chooses to
+  reflink.
+- **Savings depend on 4K-block alignment** of identical regions at *both*
+  the source and destination offsets. MB-scale fragments usually share
+  most interior blocks, but alignment is not guaranteed.
+- **Output bytes are always identical** to a non-`--reflink` run — the
+  mode changes how bytes move, never what they are. Every region falls
+  back automatically to the ordinary copy when `copy_file_range` is
+  unavailable or fails (cross-filesystem `EXDEV`, `EOPNOTSUPP`, ...), so
+  it is always safe to pass.
+- **Local disk space only.** It has no effect on HF/remote transfer or
+  storage (Xet chunk-dedupe covers that side).
+
 ### Verify provenance without downloading anything big
 
 Each `attestations/layer-LLL.kK.jsonl` line is an ed25519-signed payload:

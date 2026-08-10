@@ -19,6 +19,27 @@ source header's TENSOR ORDER is kept (non-expert tensors stay byte-exact
 from the source shard) but the header is rebuilt with dtype/shape taken
 from the SEGMENT header for expert tensors and fresh data_offsets.
 
+Reflink mode (--reflink): expert-tensor regions are written with
+os.copy_file_range from the segment file's fd instead of read()+write().
+On reflink-capable filesystems (XFS with reflink=1, btrfs) the kernel can
+then share extents between the segment files and the assembled shards
+instead of storing the same bytes twice.  Honest caveats: (1) extent
+sharing only actually happens when the kernel/filesystem chooses to
+reflink — copy_file_range may silently perform a plain (server-side)
+copy; (2) real savings depend on 4K-block alignment of identical regions
+at BOTH the source and destination offsets — MB-scale fragments usually
+share most interior blocks, but alignment is not guaranteed; (3) output
+byte-identity is ALWAYS preserved regardless — the mode changes how bytes
+move, never what they are: every region falls back automatically to the
+ordinary copy path when copy_file_range is unavailable or fails (EXDEV,
+EOPNOTSUPP, ENOSYS, cross-filesystem, partial copy, ...); (4) this is a
+local-disk-space optimization only — it has no effect on HF/remote
+transfer or storage.  Implementation choice: only expert tensors (whose
+bytes come from segment files) use copy_file_range; the safetensors
+header, non-expert tensors, and dense pass-through shards keep the
+ordinary mmap/read+write path since they come from the source shard, not
+the segment files.
+
 Mixed metadata (GG loader contract, exl3.py _configure_rank_sliced /
 _load_rank_sliced_bitrates): config.json hybrid_tr3_tail must carry
 bits="mixed", k_values=[3,4,...], and bits_per_expert as a
@@ -60,9 +81,47 @@ class SegmentReader:
         a, b = self.hdr[name]["data_offsets"]
         return self.mm[self.body + a: self.body + b]
 
+    def tensor_range(self, name: str) -> tuple[int, int, int]:
+        """(fd, absolute_file_offset, length) of one tensor's bytes — the
+        fd-level view of tensor_bytes, for os.copy_file_range."""
+        a, b = self.hdr[name]["data_offsets"]
+        return self.f.fileno(), self.body + a, b - a
+
     def close(self):
         self.mm.close()
         self.f.close()
+
+
+def _copy_file_range_region(out, src_fd: int, src_off: int, length: int) -> bool:
+    """Write length bytes from src_fd[src_off:] at out's current position
+    via os.copy_file_range (server-side copy; XFS/btrfs may share extents).
+
+    Returns True when the whole region was copied and out's position was
+    advanced past it.  Returns False — with out's position restored to the
+    start of the region — when the syscall is unavailable, refused (EXDEV,
+    EOPNOTSUPP, ENOSYS, EINVAL, ...), or stalls, including after partial
+    progress; the caller then rewrites the SAME region through the ordinary
+    read()+write() path, so the output bytes are identical either way.
+    """
+    cfr = getattr(os, "copy_file_range", None)
+    if cfr is None:
+        return False
+    out.flush()
+    dst_fd = out.fileno()
+    dst_off = out.tell()
+    done = 0
+    while done < length:
+        try:
+            n = cfr(src_fd, dst_fd, length - done,
+                    src_off + done, dst_off + done)
+        except OSError:
+            n = 0
+        if n <= 0:  # error or unexpected EOF: caller rewrites the region
+            out.seek(dst_off)
+            return False
+        done += n
+    out.seek(dst_off + length)
+    return True
 
 
 def _needs_reindex(hdr: dict, bits_for_expert, readers: dict[int, SegmentReader]) -> bool:
@@ -87,6 +146,7 @@ def assemble_layer(
     layer: int,
     bits_for_expert,           # callable expert_id -> K
     readers: dict[int, SegmentReader],
+    reflink: bool = False,
 ) -> dict:
     """Write one output shard.
 
@@ -96,6 +156,12 @@ def assemble_layer(
     same tensor ORDER as the source, but the header is rebuilt with
     dtype/shape from the segment headers for expert tensors and fresh
     contiguous data_offsets.
+
+    reflink=True: expert-tensor regions go through os.copy_file_range with
+    per-region fallback to the ordinary path (see module docstring); the
+    returned counts dict then carries "reflinked"/"copied" region tallies
+    alongside the per-K tensor counts.  Output bytes are identical either
+    way.
     """
     hdr, body_off = read_header(src_shard)
     meta = hdr.pop("__metadata__", None)
@@ -129,17 +195,26 @@ def assemble_layer(
             out.write(struct.pack("<Q", len(hj)))
             out.write(hj)
             for name, t in ordered:
+                want = t["data_offsets"][1] - t["data_offsets"][0]
                 m = EXPERT_RE.match(name)
                 if m:
                     expert = int(m.group(2))
                     k = bits_for_expert(expert)
-                    data = readers[k].tensor_bytes(name)
                     counts[k] = counts.get(k, 0) + 1
+                    if reflink:
+                        src_fd, src_off, size = readers[k].tensor_range(name)
+                        if size != want:
+                            raise AssertionError(
+                                f"{name}: got {size} bytes, header slot {want}")
+                        if _copy_file_range_region(out, src_fd, src_off, size):
+                            counts["reflinked"] = counts.get("reflinked", 0) + 1
+                            continue
+                        counts["copied"] = counts.get("copied", 0) + 1
+                    data = readers[k].tensor_bytes(name)
                 else:
                     src_t = hdr[name]
                     a, b = src_t["data_offsets"]
                     data = mm[body_off + a: body_off + b]
-                want = t["data_offsets"][1] - t["data_offsets"][0]
                 if len(data) != want:
                     raise AssertionError(
                         f"{name}: got {len(data)} bytes, header slot {want}")
@@ -235,6 +310,20 @@ def main(argv=None) -> int:
     p.add_argument("--policy", required=True, type=Path, help="fq-policy JSON (bits_per_expert)")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--layers", default=None)
+    p.add_argument(
+        "--reflink", action="store_true",
+        help="write expert-tensor bytes from segment files with "
+             "os.copy_file_range so reflink-capable filesystems (XFS with "
+             "reflink=1, btrfs) can share extents with the segments instead "
+             "of storing the bytes twice. Caveats: the kernel/filesystem "
+             "decides whether extents are actually shared — copy_file_range "
+             "may silently do a plain copy; savings depend on 4K-block "
+             "alignment of identical regions at both source and destination "
+             "offsets (MB-scale fragments usually share most interior "
+             "blocks, but alignment is not guaranteed); output bytes are "
+             "ALWAYS identical to the normal path (automatic per-region "
+             "fallback to read()+write() on EXDEV/EOPNOTSUPP/etc.); saves "
+             "local disk space only — no effect on HF/remote.")
     args = p.parse_args(argv)
 
     policy = json.loads(args.policy.read_text())
@@ -274,7 +363,7 @@ def main(argv=None) -> int:
         out_shard = args.out / src_shard.name
         counts = assemble_layer(
             src_shard, out_shard, layer,
-            lambda e: lb[e], readers)
+            lambda e: lb[e], readers, reflink=args.reflink)
         for r in readers.values():
             r.close()
         resized |= out_shard.stat().st_size != src_shard.stat().st_size

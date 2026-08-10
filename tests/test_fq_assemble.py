@@ -1,7 +1,10 @@
 """Tests for fq_assemble: byte-identity round trip through repack + assemble."""
+import errno
 import hashlib
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -12,9 +15,9 @@ import fq_assemble  # noqa: E402
 from test_fq_repack import LAYERS, E, write_shard, tensor_bytes  # noqa: E402
 
 
-@pytest.fixture()
-def repacked(tmp_path):
-    snap = tmp_path / "snap"
+def _build_k3_workspace(root: Path) -> tuple[Path, Path]:
+    """Synthetic K3 snapshot + repacked segments under root: (snap, segments)."""
+    snap = root / "snap"
     snap.mkdir()
     for i, layer in enumerate(LAYERS):
         write_shard(snap / f"model-layer-{layer:03d}.safetensors", layer, scramble=bool(i))
@@ -25,13 +28,19 @@ def repacked(tmp_path):
         for l in LAYERS
     ]
     (snap / "MANIFEST.sha256").write_text("\n".join(lines) + "\n")
-    out = tmp_path / "segments"
+    out = root / "segments"
     fq_repack.main([
         "--snapshot", str(snap),
         "--source-repo", "test/src", "--revision", "r0",
         "--base-model", "test/base", "--out", str(out),
-        "--sign-key", str(tmp_path / "k.key"),
+        "--sign-key", str(root / "k.key"),
     ])
+    return snap, out
+
+
+@pytest.fixture()
+def repacked(tmp_path):
+    snap, out = _build_k3_workspace(tmp_path)
     return snap, out, tmp_path
 
 
@@ -245,3 +254,159 @@ def test_missing_segment_fails_loudly(repacked):
             "--segments", str(segments), "--source", str(snap),
             "--policy", str(ppath), "--out", str(tmp / "x"),
         ])
+
+
+# ---------------------------------------------------------------- reflink
+
+def _k3_policy_file(root: Path) -> Path:
+    ppath = root / "policy-k3-reflink.json"
+    ppath.write_text(json.dumps({
+        "schema": "fq-policy/2",
+        "bits_per_expert": {str(l): [3] * E for l in LAYERS},
+    }))
+    return ppath
+
+
+def _assemble(segments, snap, ppath, out, *extra):
+    assert fq_assemble.main([
+        "--segments", str(segments), "--source", str(snap),
+        "--policy", str(ppath), "--out", str(out), *extra,
+    ]) == 0
+
+
+def test_reflink_output_byte_identical(repacked):
+    """--reflink output == plain output == source shards (the invariant).
+
+    pytest's tmp_path typically lives on tmpfs/overlayfs where extent
+    sharing cannot happen: copy_file_range either plain-copies in kernel or
+    the assembler falls back per region.  Either way byte identity must
+    hold — that IS the mode's contract (it changes how bytes move, never
+    what they are), so this test asserts nothing about extent sharing."""
+    snap, segments, tmp = repacked
+    ppath = _k3_policy_file(tmp)
+    plain, refl = tmp / "asm-plain", tmp / "asm-reflink"
+    _assemble(segments, snap, ppath, plain)
+    _assemble(segments, snap, ppath, refl, "--reflink")
+    for layer in LAYERS:
+        name = f"model-layer-{layer:03d}.safetensors"
+        src = (snap / name).read_bytes()
+        assert (plain / name).read_bytes() == src, name
+        assert (refl / name).read_bytes() == src, name
+
+
+def test_reflink_mixed_policy_byte_identical(repacked_multi_k):
+    """--reflink through the mixed-K reindex path: identical to plain."""
+    snap, segments, tmp = repacked_multi_k
+    bits = {str(LAYERS[0]): [3, 4, 4, 3], str(LAYERS[1]): [3] * E}
+    ppath = tmp / "policy-mixed-reflink.json"
+    ppath.write_text(json.dumps({"schema": "fq-policy/2",
+                                 "bits_per_expert": bits}))
+    plain, refl = tmp / "asm-mixed-plain", tmp / "asm-mixed-reflink"
+    _assemble(segments, snap, ppath, plain)
+    _assemble(segments, snap, ppath, refl, "--reflink")
+    for layer in LAYERS:
+        name = f"model-layer-{layer:03d}.safetensors"
+        assert (refl / name).read_bytes() == (plain / name).read_bytes(), name
+
+
+def test_reflink_falls_back_when_copy_file_range_fails(repacked, monkeypatch):
+    """copy_file_range raising (EXDEV: cross-filesystem) per call must leave
+    a byte-identical output via the ordinary per-region fallback."""
+    snap, segments, tmp = repacked
+    calls = []
+
+    def exdev(*a, **kw):
+        calls.append(a)
+        raise OSError(errno.EXDEV, "cross-device link (simulated)")
+
+    monkeypatch.setattr(os, "copy_file_range", exdev)
+    ppath = _k3_policy_file(tmp)
+    out = tmp / "asm-exdev"
+    _assemble(segments, snap, ppath, out, "--reflink")
+    assert calls, "reflink path never attempted copy_file_range"
+    for layer in LAYERS:
+        name = f"model-layer-{layer:03d}.safetensors"
+        assert (out / name).read_bytes() == (snap / name).read_bytes(), name
+
+
+def test_reflink_fallback_after_partial_copy(repacked, monkeypatch):
+    """A copy_file_range that reports partial progress — even progress that
+    wrote WRONG bytes — then fails mid-region must not corrupt the output:
+    the assembler rewinds and rewrites the whole region."""
+    snap, segments, tmp = repacked
+    state = {"armed": True}
+
+    def flaky(src_fd, dst_fd, count, offset_src=0, offset_dst=0):
+        if state["armed"]:
+            state["armed"] = False
+            n = min(count, 7)
+            os.pwrite(dst_fd, b"\xff" * n, offset_dst)  # garbage progress
+            return n
+        raise OSError(errno.EIO, "flaky (simulated)")
+
+    monkeypatch.setattr(os, "copy_file_range", flaky)
+    ppath = _k3_policy_file(tmp)
+    out = tmp / "asm-flaky"
+    _assemble(segments, snap, ppath, out, "--reflink")
+    for layer in LAYERS:
+        name = f"model-layer-{layer:03d}.safetensors"
+        assert (out / name).read_bytes() == (snap / name).read_bytes(), name
+
+
+def test_reflink_when_copy_file_range_absent(repacked, monkeypatch):
+    """No os.copy_file_range at all (pre-3.8 / exotic platform): --reflink
+    degrades to the ordinary copy path, byte-identically."""
+    snap, segments, tmp = repacked
+    monkeypatch.delattr(os, "copy_file_range")
+    ppath = _k3_policy_file(tmp)
+    out = tmp / "asm-nocfr"
+    _assemble(segments, snap, ppath, out, "--reflink")
+    for layer in LAYERS:
+        name = f"model-layer-{layer:03d}.safetensors"
+        assert (out / name).read_bytes() == (snap / name).read_bytes(), name
+
+
+def test_reflink_on_local_filesystem(monkeypatch):
+    """Integration: source, segments, and output all on the filesystem that
+    hosts this repo (XFS with reflink=1 on the dev box), asserting byte
+    identity AND that copy_file_range was actually used (no fallback).
+
+    Deliberately does NOT assert actual extent sharing: whether the kernel
+    reflinks or plain-copies is filesystem policy (caveat 1 of the mode)
+    and there is no portable userspace way to verify it — FIEMAP/filefrag
+    output is neither universally available nor stable across filesystems.
+    Skips where the local filesystem refuses copy_file_range."""
+    if not hasattr(os, "copy_file_range"):
+        pytest.skip("os.copy_file_range unavailable on this platform")
+    here = Path(__file__).resolve().parent
+    try:
+        tdctx = tempfile.TemporaryDirectory(dir=here, prefix=".reflink-it-")
+    except OSError as e:
+        pytest.skip(f"cannot create temp dir beside the tests: {e}")
+    with tdctx as td:
+        root = Path(td)
+        # probe: does this filesystem accept copy_file_range at all?
+        probe_src, probe_dst = root / "p.src", root / "p.dst"
+        probe_src.write_bytes(b"x" * 4096)
+        with open(probe_src, "rb") as s, open(probe_dst, "wb") as d:
+            try:
+                os.copy_file_range(s.fileno(), d.fileno(), 4096, 0, 0)
+            except OSError as e:
+                pytest.skip(f"filesystem refuses copy_file_range: {e}")
+        snap, segments = _build_k3_workspace(root)
+        real = os.copy_file_range
+        used = []
+
+        def recording(*a, **kw):
+            n = real(*a, **kw)
+            used.append(n)
+            return n
+
+        monkeypatch.setattr(os, "copy_file_range", recording)
+        ppath = _k3_policy_file(root)
+        out = root / "asm-local"
+        _assemble(segments, snap, ppath, out, "--reflink")
+        assert used, "copy_file_range was never used on a supporting fs"
+        for layer in LAYERS:
+            name = f"model-layer-{layer:03d}.safetensors"
+            assert (out / name).read_bytes() == (snap / name).read_bytes(), name
