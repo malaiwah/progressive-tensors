@@ -95,8 +95,13 @@ Stated rather than shipped:
   verification enforcement landing.
 - One `--trust-signer` applies to a whole `fq_fetch` run: per-source
   pinning for multi-provider fetches is designed but not implemented.
-- `--trust-signer` is not yet wired into `fq_prime` (`fq_assemble` verifies
-  and fails closed as of this release).
+- `fq_prime spot-check` still only *decodes* attestation payloads — it
+  compares re-fetched bytes against the digest it finds there, but never
+  checks the ed25519 signature, so a file full of placeholder signatures
+  passes. Its output means "matches this file's own claim", not "matches
+  what the project published". Wiring it to `fq_trust` is a three-line
+  change (see TRUST.md §7). `fq_assemble` verifies and fails closed as of
+  this release; `fq_fetch` and `fq_release` use the module.
 - Attestation envelopes are ad-hoc `{payload, signature, keyid}`; migration
   to DSSE/in-toto and OpenSSF Model Signing compatibility is the intended
   direction, and transparency-log inclusion proofs are what would close the

@@ -248,8 +248,21 @@ somewhere the artifacts cannot reach.
 **Not yet:**
 
 - per-source pinning in a multi-provider fetch (see §5);
-- `--trust-signer` on `fq_prime` (`fq_assemble` verifies every fragment it
-  consumes and fails closed without a pin);
+- **`fq_prime spot-check` does not verify signatures.** It base64-decodes
+  the attestation payload, reads `expert_sha256` out of it, and compares
+  re-fetched bytes against that digest. The digest comparison is real; the
+  *provenance* check is not — replace every signature in the file with a
+  placeholder and the spot-check still reports success, because no
+  signature is ever checked. Treat its output as "these bytes match this
+  file's own claim", not "these bytes are what the project published",
+  until it grows the trust flags. The fix is three lines against the shared
+  module: `fq_trust.add_trust_arguments(subparser)`,
+  `verifier = fq_trust.Verifier.from_args(args, manifest=manifest)`,
+  `payload = verifier.verify_envelope(json.loads(line), where=...)` —
+  `verify_envelope` raises rather than returning an unverified payload, so
+  the decode-only path cannot survive the edit. (`fq_assemble` already
+  verifies every fragment it consumes and fails closed without a pin;
+  `fq_fetch` and `fq_release` use the module.)
 - DSSE/in-toto envelopes and transparency-log inclusion proofs (§6);
 - countersignatures — a second party attesting "I re-derived this fragment
   and got the same bytes". The attestation files are JSON Lines precisely
