@@ -10,7 +10,26 @@ attestation line and a per-expert byte-range index.
 v1 layout keeps the source's rank-sliced granularity verbatim
 (layout=rank_sliced_tp4); unsharding is a later, T4-verified upgrade.
 
-Resumable per layer via <out>/state.json; optional incremental HF publish.
+Multi-K safety (fq-repack-state/2)
+----------------------------------
+One output dir holds many Ks — a K3 run, then a K4 run, then a K3 rerun, all
+into the same segments dir.  State is therefore keyed by
+{source fingerprint, K, layer}, never by layer alone: a K4 run can never see a
+K3 layer as "done" (the v1 bug that made index-k4.json point at K3 bytes), and
+every index-kK.json is rebuilt from the state entries belonging to THAT K —
+one K's run never rewrites another K's index.  fq-manifest.json is likewise
+merged, not overwritten: `k_variants` lists every K present and `per_k[K]`
+carries that K's index file, layer coverage, segment count and provenance.
+An output dir whose manifest describes a different base_model/layout is
+refused outright; re-repacking a K from a different source repo/revision
+needs --allow-provenance-change.
+
+Source binding: the source shard's sha256 is COMPUTED here (never taken on
+faith from the source repo's MANIFEST.sha256); when that manifest exists its
+value is cross-checked and any disagreement is a hard failure.
+
+Resumable per {source, K, layer} via <out>/state.json; optional incremental
+HF publish.
 """
 from __future__ import annotations
 
@@ -34,6 +53,14 @@ EXPERT_RE = re.compile(
 SEGMENT_SCHEMA = "fq-segment/1"
 ATTESTATION_SCHEMA = "fq-attestation/1"
 MANIFEST_SCHEMA = "fq-manifest/1"
+STATE_SCHEMA = "fq-repack-state/2"
+TOOL_VERSION = "fq_repack/2"
+DEFAULT_LAYOUT = "rank_sliced_tp4"
+SEG_NAME_RE = re.compile(r"^layer-(\d+)\.k(\d+)\.safetensors$")
+
+
+class ProvenanceError(RuntimeError):
+    """Refusal to mix incompatible provenance in one output family."""
 
 
 def read_header(path: Path) -> tuple[dict, int]:
@@ -56,6 +83,10 @@ def expert_key(name: str):
 
 def canonical_json(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def now_utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class Signer:
@@ -91,7 +122,11 @@ class Signer:
 
 
 def load_source_shas(snapshot: Path) -> dict[str, str]:
-    """Parse the source repo's MANIFEST.sha256 (sha256sum format) if present."""
+    """Parse the source repo's MANIFEST.sha256 (sha256sum format) if present.
+
+    Advisory only: every shard this tool reads is hashed locally and the two
+    values are cross-checked (see verify_source_shard).
+    """
     out = {}
     mf = snapshot / "MANIFEST.sha256"
     if mf.exists():
@@ -108,6 +143,247 @@ def sha256_file(path: Path, chunk=1 << 24) -> str:
         for block in iter(lambda: f.read(chunk), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def verify_source_shard(shard: Path, declared: str | None) -> str:
+    """Hash the source shard locally; cross-check any declared digest.
+
+    The source repo's MANIFEST.sha256 is untrusted metadata that ships next to
+    the bytes it describes — a shard swapped after the manifest was written
+    (or a manifest edited after the shard) must not be silently attested as
+    the pinned source.  Disagreement is fatal.
+    """
+    computed = sha256_file(shard)
+    if declared and declared != computed:
+        raise ProvenanceError(
+            f"{shard.name}: source MANIFEST.sha256 declares {declared} but the "
+            f"local file hashes {computed} — refusing to attest a source whose "
+            f"bytes disagree with its manifest")
+    return computed
+
+
+# --------------------------------------------------------------- state (v2)
+
+def source_fingerprint(repo: str, revision: str, base_model: str,
+                       layout: str = DEFAULT_LAYOUT) -> str:
+    """Stable short id of one source identity: repo@revision for one
+    base_model in one layout.  State keys start with this so segments from
+    two different sources can share an output dir without colliding."""
+    return hashlib.sha256(canonical_json({
+        "base_model": base_model, "layout": layout,
+        "repo": repo, "revision": revision})).hexdigest()[:16]
+
+
+def new_state() -> dict:
+    return {"schema": STATE_SCHEMA, "sources": {}}
+
+
+def migrate_state_v1(raw: dict, legacy: dict) -> dict:
+    """Lift a layer-keyed fq-repack-state/1 file into the {source, K, layer}
+    shape.  Each v1 entry names the segment file it produced, so its K is
+    recoverable from the file name; entries whose file name is unusable are
+    dropped (the layer is simply repacked again)."""
+    state = new_state()
+    src = state["sources"].setdefault(legacy["fp"], {
+        "repo": legacy["repo"], "revision": legacy["revision"],
+        "base_model": legacy["base_model"], "layout": legacy["layout"], "k": {}})
+    for layer_s, done in (raw.get("layers") or {}).items():
+        entry = dict(done)
+        m = SEG_NAME_RE.match((entry.get("index") or {}).get("file", ""))
+        if not m:
+            continue
+        entry["migrated_from"] = "fq-repack-state/1"
+        src["k"].setdefault(str(int(m.group(2))), {"layers": {}})[
+            "layers"][str(int(layer_s))] = entry
+    state["migrated_from"] = "fq-repack-state/1"
+    return state
+
+
+def load_state(path: Path, legacy: dict) -> dict:
+    if not path.exists():
+        return new_state()
+    raw = json.loads(path.read_text())
+    if raw.get("schema") == STATE_SCHEMA:
+        raw.setdefault("sources", {})
+        return raw
+    if "layers" in raw:
+        return migrate_state_v1(raw, legacy)
+    raise ProvenanceError(
+        f"{path}: unrecognised state schema {raw.get('schema')!r}")
+
+
+def state_source(state: dict, fp: str, meta: dict) -> dict:
+    src = state["sources"].setdefault(fp, {**meta, "k": {}})
+    src.update(meta)  # keep the human-readable fields fresh
+    src.setdefault("k", {})
+    return src
+
+
+def get_entry(state: dict, fp: str, k: int, layer: int) -> dict | None:
+    return (state.get("sources", {}).get(fp, {}).get("k", {})
+            .get(str(k), {}).get("layers", {}).get(str(layer)))
+
+
+def put_entry(state: dict, fp: str, k: int, layer: int, entry: dict,
+              meta: dict) -> None:
+    """Record one {source, K, layer} result and drop any entry for the same
+    (K, layer) under a DIFFERENT source: the segment file it described has
+    just been overwritten, so keeping it would publish a stale digest."""
+    src = state_source(state, fp, meta)
+    src["k"].setdefault(str(k), {"layers": {}})["layers"][str(layer)] = entry
+    for other_fp, other in state["sources"].items():
+        if other_fp == fp:
+            continue
+        layers = other.get("k", {}).get(str(k), {}).get("layers", {})
+        if layers.pop(str(layer), None) is not None:
+            print(f"  note: dropped stale K{k} layer {layer} entry from source "
+                  f"{other_fp} (its segment file was just replaced)", flush=True)
+
+
+def iter_entries(state: dict):
+    """(fp, source_meta, k, layer, entry) for every done entry in the state."""
+    for fp, src in sorted(state.get("sources", {}).items()):
+        for k_s, kd in sorted(src.get("k", {}).items(), key=lambda kv: int(kv[0])):
+            for layer_s, entry in sorted(kd.get("layers", {}).items(),
+                                         key=lambda kv: int(kv[0])):
+                if entry.get("status") == "done":
+                    yield fp, src, int(k_s), int(layer_s), entry
+
+
+def index_for_k(state: dict, k: int) -> dict:
+    """Rebuild index-kK.json purely from the K's own state entries."""
+    merged = {}
+    for _fp, _src, kk, layer, entry in iter_entries(state):
+        if kk != k:
+            continue
+        info = entry.get("index") or {}
+        if not SEG_NAME_RE.match(info.get("file", "")) or \
+                not info["file"].endswith(f".k{k}.safetensors"):
+            raise ProvenanceError(
+                f"state corruption: K{k} layer {layer} points at "
+                f"{info.get('file')!r}")
+        merged[str(layer)] = info
+    return dict(sorted(merged.items(), key=lambda kv: int(kv[0])))
+
+
+def build_manifest(state: dict, existing: dict, *, base_model: str, layout: str,
+                   revision: str, signer_pubkey: str, out: Path) -> dict:
+    """Merge a MULTI-K manifest from the state (never last-writer-wins).
+
+    per_k[K] carries that K's index file, layer coverage, segment count and
+    provenance; k_variants lists every K present.  Entries for Ks that are not
+    in the state but whose index file still exists are preserved verbatim.
+    """
+    per_k: dict[str, dict] = {}
+    signers, sources, all_layers = set(), set(), []
+    num_experts = 0
+    for _fp, src, k, layer, entry in iter_entries(state):
+        info = entry.get("index") or {}
+        ent = per_k.setdefault(str(k), {
+            "index": f"index-k{k}.json", "predicate": "repack-of",
+            "layers": [layer, layer], "segment_count": 0, "num_experts": 0,
+            "sources": [], "signers": []})
+        ent["layers"] = [min(ent["layers"][0], layer), max(ent["layers"][1], layer)]
+        ent["segment_count"] += 1
+        ent["num_experts"] = max(ent["num_experts"], len(info.get("experts", {})))
+        who = {"repo": src.get("repo"), "revision": src.get("revision")}
+        if who not in ent["sources"]:
+            ent["sources"].append(who)
+        pub = entry.get("signer_pubkey")
+        if pub and pub not in ent["signers"]:
+            ent["signers"].append(pub)
+        if pub:
+            signers.add(pub)
+        if src.get("repo"):
+            sources.add(src["repo"])
+        all_layers.append(layer)
+        num_experts = max(num_experts, len(info.get("experts", {})))
+    for ent in per_k.values():
+        ent["provenance"] = "; ".join(
+            f"repack-of {s['repo']}@{(s['revision'] or '')[:8]}"
+            for s in ent["sources"])
+        if len(ent["sources"]) == 1:
+            ent["source_repo"] = ent["sources"][0]["repo"]
+            ent["source_revision"] = ent["sources"][0]["revision"]
+    for k_s, ent in (existing.get("per_k") or {}).items():
+        if k_s not in per_k and (out / f"index-k{k_s}.json").exists():
+            per_k[k_s] = ent  # a K this run knows nothing about: keep as-is
+            if ent.get("source_repo"):
+                sources.add(ent["source_repo"])
+    ks = sorted(int(k) for k in per_k)
+    manifest = {
+        "schema": MANIFEST_SCHEMA,
+        "base_model": base_model,
+        "revision": revision,
+        "k_variants": ks,
+        "per_k": {str(k): per_k[str(k)] for k in ks},
+        "hessian_id": None,
+        "predicate": "repack-of",
+        "layout": layout,
+        "sources": sorted(sources),
+        "moe_layers": [min(all_layers), max(all_layers)] if all_layers else [],
+        "num_experts": num_experts,
+        "tensor_indexes": {str(k): f"index-k{k}.json" for k in ks},
+        "signer_pubkey": signer_pubkey,
+        "signers": sorted(signers),
+        "note": ("Multi-K manifest: per_k[K] holds that K's index, coverage and "
+                 "provenance; a run for one K never rewrites another K's index "
+                 "or entry. Top-level revision is the most recent run's source "
+                 "revision — per_k[K].source_revision is authoritative."),
+    }
+    return manifest
+
+
+def check_output_family(out: Path, *, base_model: str, layout: str, repo: str,
+                        revision: str, k: int, allow_change: bool) -> dict:
+    """Refuse an output dir that already describes a different family.
+
+    base_model / layout mismatches are fatal (use a fresh dir).  Re-repacking
+    a K that is already present from a DIFFERENT source repo/revision
+    overwrites that K's segments, so it needs --allow-provenance-change.
+    Returns the existing manifest ({} when there is none).
+    """
+    mpath = out / "fq-manifest.json"
+    if not mpath.exists():
+        return {}
+    existing = json.loads(mpath.read_text())
+    for field, want in (("base_model", base_model), ("layout", layout)):
+        have = existing.get(field)
+        if have is not None and have != want:
+            raise ProvenanceError(
+                f"{out}: existing family declares {field}={have!r} but this run "
+                f"is {want!r} — refusing to mix families in one output dir")
+    prev = (existing.get("per_k") or {}).get(str(k)) or {}
+    prev_src = (prev.get("source_repo"), prev.get("source_revision"))
+    if all(prev_src) and prev_src != (repo, revision) and not allow_change:
+        raise ProvenanceError(
+            f"{out}: K{k} here was repacked from {prev_src[0]}@{prev_src[1]}, "
+            f"this run is {repo}@{revision} — rerunning overwrites that K's "
+            f"segments; pass --allow-provenance-change to accept")
+    return existing
+
+
+def resumable(entry: dict | None, seg_path: Path, seg_name: str, *,
+              signer_pubkey: str, declared_source_sha: str | None,
+              recheck: bool) -> tuple[bool, str]:
+    """(ok, reason) — is this {source, K, layer} entry safe to skip?"""
+    if not entry or entry.get("status") != "done":
+        return False, "not done"
+    info = entry.get("index") or {}
+    if info.get("file") != seg_name:
+        return False, f"index names {info.get('file')!r}"
+    if not seg_path.exists():
+        return False, "segment file missing"
+    if info.get("size") and seg_path.stat().st_size != info["size"]:
+        return False, "segment size changed"
+    if entry.get("signer_pubkey") and entry["signer_pubkey"] != signer_pubkey:
+        return False, "signed by a different key"
+    if (declared_source_sha and entry.get("source_file_sha256")
+            and declared_source_sha != entry["source_file_sha256"]):
+        return False, "source shard changed"
+    if recheck and sha256_file(seg_path) != info.get("sha256"):
+        return False, "segment sha256 mismatch (--recheck)"
+    return True, "done"
 
 
 def repack_layer(
@@ -152,7 +428,7 @@ def repack_layer(
         "predicate": "repack-of",
         "k": str(k),
         "layer": str(layer),
-        "layout": "rank_sliced_tp4",
+        "layout": DEFAULT_LAYOUT,
         "num_experts": str(len(per_expert)),
         "source_file": shard_path.name,
         **{kx: str(v) for kx, v in meta_common.items()},
@@ -215,6 +491,13 @@ class Publisher:
             )
 
 
+def write_if_changed(path: Path, obj) -> bool:
+    """atomic_write_json, reporting whether the file's bytes actually moved."""
+    before = path.read_bytes() if path.exists() else None
+    atomic_write_json(path, obj)
+    return path.read_bytes() != before
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--snapshot", required=True, type=Path)
@@ -228,12 +511,40 @@ def main(argv=None) -> int:
     p.add_argument("--publish", default=None, help="HF repo id for incremental upload")
     p.add_argument("--private", action="store_true", default=True)
     p.add_argument("--public", dest="private", action="store_false")
+    p.add_argument(
+        "--allow-provenance-change", action="store_true",
+        help="accept re-repacking a K already present in this dir from a "
+             "different source repo/revision (overwrites that K's segments)")
+    p.add_argument(
+        "--recheck", action="store_true",
+        help="re-hash already-done segments before skipping them on resume")
     args = p.parse_args(argv)
 
-    out, k = args.out, args.k
+    out, k, layout = args.out, args.k, DEFAULT_LAYOUT
     (out / "attestations").mkdir(parents=True, exist_ok=True)
+    existing = check_output_family(
+        out, base_model=args.base_model, layout=layout, repo=args.source_repo,
+        revision=args.revision, k=k, allow_change=args.allow_provenance_change)
+
+    fp = source_fingerprint(args.source_repo, args.revision, args.base_model, layout)
+    src_meta = {"repo": args.source_repo, "revision": args.revision,
+                "base_model": args.base_model, "layout": layout}
+    legacy = dict(src_meta)
+    if existing:
+        # a v1 state in this dir belongs to whatever the existing manifest
+        # describes, not necessarily to this run's source
+        legacy = {
+            "repo": (existing.get("sources") or [args.source_repo])[0],
+            "revision": existing.get("revision") or args.revision,
+            "base_model": existing.get("base_model") or args.base_model,
+            "layout": existing.get("layout") or layout,
+        }
+    legacy["fp"] = source_fingerprint(
+        legacy["repo"], legacy["revision"], legacy["base_model"], legacy["layout"])
+
     state_path = out / "state.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else {"layers": {}}
+    state = load_state(state_path, legacy)
+    state_source(state, fp, src_meta)
     signer = Signer(args.sign_key)
     source_shas = load_source_shas(args.snapshot)
     publisher = Publisher(args.publish, args.private)
@@ -254,7 +565,6 @@ def main(argv=None) -> int:
         "source_repo": args.source_repo,
         "source_revision": args.revision,
     }
-    index, moe_layers = {}, []
     for shard in shards:
         layer = int(shard.stem.split("-")[-1])
         if wanted is not None and layer not in wanted:
@@ -262,26 +572,31 @@ def main(argv=None) -> int:
         seg_name = f"layer-{layer:03d}.k{k}.safetensors"
         seg_path = out / seg_name
         att_path = out / "attestations" / f"layer-{layer:03d}.k{k}.jsonl"
-        done = state["layers"].get(str(layer), {})
-        if done.get("status") == "done" and seg_path.exists():
-            index[str(layer)] = done["index"]
-            moe_layers.append(layer)
-            print(f"layer {layer:3d}: skip (done, {done['index']['sha256'][:12]})", flush=True)
+        prior = get_entry(state, fp, k, layer)
+        ok, why = resumable(prior, seg_path, seg_name,
+                            signer_pubkey=signer.pub_hex,
+                            declared_source_sha=source_shas.get(shard.name),
+                            recheck=args.recheck)
+        if ok:
+            print(f"layer {layer:3d}: skip (done, k{k}, "
+                  f"{prior['index']['sha256'][:12]})", flush=True)
             continue
+        if prior:
+            print(f"layer {layer:3d}: redoing k{k} ({why})", flush=True)
 
         t0 = time.time()
+        source_sha = verify_source_shard(shard, source_shas.get(shard.name))
         info = repack_layer(
             shard,
             seg_path,
             k=k,
             layer=layer,
             meta_common=meta_common,
-            source_file_sha256=source_shas.get(shard.name),
+            source_file_sha256=source_sha,
         )
         if not info:
             print(f"layer {layer:3d}: no expert tensors, skipped", flush=True)
             continue
-        moe_layers.append(layer)
 
         payload = {
             "schema": ATTESTATION_SCHEMA,
@@ -291,24 +606,39 @@ def main(argv=None) -> int:
                 "repo": args.source_repo,
                 "revision": args.revision,
                 "file": shard.name,
-                "file_sha256": source_shas.get(shard.name),
+                "file_sha256": source_sha,
+                "file_sha256_source": ("computed+manifest"
+                                       if source_shas.get(shard.name) else "computed"),
             },
+            "layer": layer,
+            "k": k,
+            "layout": layout,
+            "base_model": args.base_model,
+            "num_experts": len(info["expert_sha256"]),
             "expert_sha256": info["expert_sha256"],
-            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tool": {"name": "fq_repack", "version": TOOL_VERSION},
+            "created_utc": now_utc(),
         }
         att_path.write_text(signer.sign_line(payload) + "\n")
 
         entry = {
-            "file": seg_name,
-            "sha256": info["sha256"],
-            "size": info["size"],
-            "body_offset": info["body_offset"],
-            "experts": info["experts"],
+            "status": "done",
+            "index": {
+                "file": seg_name,
+                "sha256": info["sha256"],
+                "size": info["size"],
+                "body_offset": info["body_offset"],
+                "experts": info["experts"],
+            },
+            "source_file": shard.name,
+            "source_file_sha256": source_sha,
+            "signer_pubkey": signer.pub_hex,
+            "tool_version": TOOL_VERSION,
+            "created_utc": payload["created_utc"],
         }
-        index[str(layer)] = entry
         publisher.upload(seg_path, seg_name)
         publisher.upload(att_path, f"attestations/{att_path.name}")
-        state["layers"][str(layer)] = {"status": "done", "index": entry}
+        put_entry(state, fp, k, layer, entry, src_meta)
         atomic_write_json(state_path, state)
         print(
             f"layer {layer:3d}: {info['size']/1e9:.2f} GB sha {info['sha256'][:12]} "
@@ -316,27 +646,19 @@ def main(argv=None) -> int:
             flush=True,
         )
 
-    atomic_write_json(out / f"index-k{k}.json", index)
-    manifest = {
-        "schema": MANIFEST_SCHEMA,
-        "base_model": args.base_model,
-        "revision": args.revision,
-        "k_variants": [k],
-        "hessian_id": None,
-        "predicate": "repack-of",
-        "layout": "rank_sliced_tp4",
-        "sources": [args.source_repo],
-        "moe_layers": [min(moe_layers), max(moe_layers)] if moe_layers else [],
-        "num_experts": max(
-            (len(v["experts"]) for v in index.values()), default=0
-        ),
-        "tensor_index": f"index-k{k}.json",
-        "signer_pubkey": signer.pub_hex,
-    }
-    atomic_write_json(out / "fq-manifest.json", manifest)
-    publisher.upload(out / f"index-k{k}.json", f"index-k{k}.json")
-    publisher.upload(out / "fq-manifest.json", "fq-manifest.json")
-    print(f"done: {len(index)} layers -> {out}", flush=True)
+    ks_present = sorted({kk for _f, _s, kk, _l, _e in iter_entries(state)})
+    for kk in ks_present:
+        idx_path = out / f"index-k{kk}.json"
+        if write_if_changed(idx_path, index_for_k(state, kk)):
+            publisher.upload(idx_path, idx_path.name)
+    manifest = build_manifest(
+        state, existing, base_model=args.base_model, layout=layout,
+        revision=args.revision, signer_pubkey=signer.pub_hex, out=out)
+    mpath = out / "fq-manifest.json"
+    if write_if_changed(mpath, manifest):
+        publisher.upload(mpath, mpath.name)
+    total = sum(len(index_for_k(state, kk)) for kk in ks_present)
+    print(f"done: {total} segments across K{ks_present} -> {out}", flush=True)
     return 0
 
 

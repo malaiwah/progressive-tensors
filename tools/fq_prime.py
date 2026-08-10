@@ -39,6 +39,19 @@ family directly under out/, layout rank_sliced_tp4, predicate repack-of.
 Signing reuses fq_repack's Signer (ed25519 seed at ~/.fq_keys); segments are
 readable by fq_assemble.SegmentReader and consumable by fq_assemble's
 mixed-size reindex path.  No uploads: this tool never publishes.
+
+Provenance binding (fq-prime-state/2)
+-------------------------------------
+Everything cached or resumed is bound to the exact source it came from.
+Small files and shard headers are cached under <out>/source-meta/<repo>@<rev>/
+and re-validated on read, so a second commit of the same repo can never be
+primed through the first commit's cached headers (byte ranges from the wrong
+header silently produce mislabelled fragments).  <out>/state.json records the
+full provenance tuple — repo, revision, base_model, layout, signer pubkey,
+tool version — and priming refuses to resume across a mismatch: a changed
+source discards the primed layers (they belong to the old source), a changed
+signer/tool is recorded in provenance_history; both need
+--allow-provenance-change.
 """
 from __future__ import annotations
 
@@ -65,6 +78,7 @@ from fq_repack import (  # noqa: E402
     MANIFEST_SCHEMA,
     PROJ_ORDER,
     SEGMENT_SCHEMA,
+    ProvenanceError,
     Signer,
     atomic_write_json,
     expert_key,
@@ -75,6 +89,14 @@ SHARED_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.shared_h\.(\w+_proj)\.rank(\d+)\.(suh|svh)$"
 )
 DERIVED_RULE = "shared_h_expand_v1"
+TOOL_VERSION = "fq_prime/2"
+STATE_SCHEMA = "fq-prime-state/2"
+# provenance fields that identify the SOURCE: a change means the already
+# primed segments belong to a different thing and must be re-primed
+SOURCE_FIELDS = ("repo", "revision", "base_model", "layout")
+# ... and the ones that identify the PRODUCER: a change is recorded, the
+# existing (correctly signed) segments stay valid
+PRODUCER_FIELDS = ("signer_pubkey", "tool_version")
 # segment-file layout tag per detected source rotation layout: per-expert
 # sources keep the brandonmusic-family tag rank_sliced_tp4 (fq_repack v1)
 SEGMENT_LAYOUT = {"shared_h_v1": "shared_h_v1", "per_expert_v1": "rank_sliced_tp4"}
@@ -212,8 +234,13 @@ class Source:
                  transport: Transport, cache_dir: Path):
         self.repo, self.revision, self.base_model = repo, revision, base_model
         self.t = transport
-        self.cache = cache_dir
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        # cache keys include repo@revision.  Caching by bare file name means a
+        # second commit of the same repo (or a different repo primed into the
+        # same tree) is served the FIRST one's headers and small files, and
+        # every byte range computed from them is then attributed to a revision
+        # it never came from.
+        self.cache = Path(cache_dir) / f"{repo.replace('/', '__')}@{revision}"
+        self.cache.mkdir(parents=True, exist_ok=True)
         self.file_shas: dict[str, str] = {}
         self.config: dict = {}
         self.tier_bitmap: dict = {}
@@ -253,19 +280,30 @@ class Source:
         return f"model-layer-{layer:03d}.safetensors"
 
     def shard_header(self, layer: int):
-        """(header, body_offset, total_size, url) — cached under source-meta."""
+        """(header, body_offset, total_size, url) — cached per repo@revision.
+
+        The cache entry re-states which repo/revision/file it describes and is
+        ignored unless all three match: the directory key is the primary
+        binding, this is the belt-and-braces one for caches that get copied
+        or renamed.
+        """
         name = self.shard_name(layer)
         url = self.url(name)
         cache = self.cache / f"hdr-{name}.json"
         if cache.exists():
             obj = json.loads(cache.read_text())
-            return obj["header"], obj["body_offset"], obj["total_size"], url
+            if (obj.get("repo"), obj.get("revision"), obj.get("file")) == (
+                    self.repo, self.revision, name):
+                return obj["header"], obj["body_offset"], obj["total_size"], url
+            print(f"  source: ignoring cached header for {name} (it describes "
+                  f"{obj.get('repo')}@{obj.get('revision')})", flush=True)
         d, total = self.t.get_range(url, 0, 8)
         hlen = struct.unpack("<Q", d)[0]
         hj, _ = self.t.get_range(url, 8, 8 + hlen)
         hdr = json.loads(hj)
         cache.write_text(json.dumps(
-            {"header": hdr, "body_offset": 8 + hlen, "total_size": total}))
+            {"repo": self.repo, "revision": self.revision, "file": name,
+             "header": hdr, "body_offset": 8 + hlen, "total_size": total}))
         return hdr, 8 + hlen, total, url
 
     def config_provenance(self) -> dict:
@@ -523,6 +561,7 @@ def prime_layer(source: Source, fam_dir: Path, layer: int, wanted_ks: list[int],
         return None, layout
 
     entry: dict = {"status": "done", "ks": ks, "layout": layout,
+                   "source": {"repo": source.repo, "revision": source.revision},
                    "shard_size": total_size, "k_counts": {str(k): counts[k] for k in ks_present},
                    "index": {}}
     att_dir = fam_dir / "attestations"
@@ -733,11 +772,23 @@ def write_family_outputs(fam_dir: Path, layers_state: dict, *, which: str,
     family from the accumulated state.  which: 'index' or 'expanded'."""
     ks = sorted({int(k) for st in layers_state.values()
                  for k in st.get(which, {})})
+    per_k = {}
     for k in ks:
         idx = {L: st[which][str(k)] for L, st in sorted(
             layers_state.items(), key=lambda kv: int(kv[0]))
             if str(k) in st.get(which, {})}
         atomic_write_json(fam_dir / f"index-k{k}.json", idx)
+        covered = sorted(int(L) for L in idx)
+        per_k[str(k)] = {
+            "index": f"index-k{k}.json",
+            "layers": [min(covered), max(covered)] if covered else [],
+            "segment_count": len(idx),
+            "num_experts": max((len(e["experts"]) for e in idx.values()), default=0),
+            "predicate": predicate,
+            "source_repo": source.repo,
+            "source_revision": source.revision,
+            "provenance": f"{predicate} {source.repo}@{source.revision[:8]}",
+        }
     deps = {}
     if which == "index":
         deps = {L: {"file": st["profile"]["file"], "sha256": st["profile"]["sha256"]}
@@ -754,6 +805,7 @@ def write_family_outputs(fam_dir: Path, layers_state: dict, *, which: str,
         "base_model": source.base_model,
         "revision": source.revision,
         "k_variants": ks,
+        "per_k": per_k,
         "hessian_id": None,
         "predicate": predicate,
         "layout": layout,
@@ -791,6 +843,48 @@ def update_root_manifest(root: Path, entry: dict) -> None:
 
 # ------------------------------------------------------------------ prime
 
+def provenance_of(source: Source, signer: Signer, layout: str | None = None) -> dict:
+    return {"repo": source.repo, "revision": source.revision,
+            "base_model": source.base_model, "layout": layout,
+            "signer_pubkey": signer.pub_hex, "tool_version": TOOL_VERSION}
+
+
+def check_state_provenance(state_path: Path, state: dict, current: dict,
+                           allow_change: bool) -> bool:
+    """Refuse to resume a family primed from a different provenance.
+
+    Returns True when the caller must DISCARD the recorded layers: the source
+    identity changed, so the segments already on disk describe something else.
+    A producer-only change (new signing key, new tool version) keeps them —
+    they are still correctly signed by the old key — and is recorded in
+    provenance_history.
+    """
+    prev = state.get("provenance")
+    if not prev:
+        return False
+    diffs = [(f, prev.get(f), current.get(f))
+             for f in SOURCE_FIELDS + PRODUCER_FIELDS
+             if prev.get(f) is not None and current.get(f) is not None
+             and prev[f] != current[f]]
+    if not diffs:
+        return False
+    detail = "; ".join(f"{f} {a!r} -> {b!r}" for f, a, b in diffs)
+    if not allow_change:
+        raise ProvenanceError(
+            f"{state_path}: this family was primed with a different provenance "
+            f"({detail}). Resuming would attribute already-primed segments to "
+            f"the new provenance. Prime into a fresh --out, or pass "
+            f"--allow-provenance-change (a source change re-primes every "
+            f"layer; a signer/tool change keeps them and is recorded).")
+    source_changed = any(f in SOURCE_FIELDS for f, _a, _b in diffs)
+    state.setdefault("provenance_history", []).append(
+        {**prev, "superseded_utc": now_utc(),
+         "layers_discarded": source_changed})
+    print(f"--allow-provenance-change: {detail}"
+          + (" — discarding primed layers" if source_changed else ""), flush=True)
+    return source_changed
+
+
 def cmd_prime(args) -> int:
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -804,12 +898,23 @@ def cmd_prime(args) -> int:
 
     state_path = out / "state.json"
     state = (json.loads(state_path.read_text()) if state_path.exists()
-             else {"layers": {}, "transport": {"requests": 0, "bytes": 0}})
-    layout_seen: str | None = None
+             else {"schema": STATE_SCHEMA, "layers": {},
+                   "transport": {"requests": 0, "bytes": 0}})
+    provenance = provenance_of(source, signer)
+    if check_state_provenance(state_path, state, provenance,
+                              args.allow_provenance_change):
+        state["layers"] = {}
+    state["schema"] = STATE_SCHEMA
+    state["provenance"] = {**state.get("provenance", {}), **provenance}
+    layout_seen: str | None = state.get("provenance", {}).get("layout")
 
     for layer in layers:
         st = state["layers"].get(str(layer), {})
+        # a layer entry is only resumable when it was primed from THIS source
+        same_source = st.get("source") in (
+            None, {"repo": source.repo, "revision": source.revision})
         done = (st.get("status") == "done" and st.get("ks") == wanted_ks
+                and same_source
                 and all((out / _fam_name(st["layout"]) / e["file"]).exists()
                         for e in st.get("index", {}).values()))
         need_expand = args.expand and st.get("layout") == "shared_h_v1"
@@ -865,6 +970,8 @@ def cmd_prime(args) -> int:
         return 0
 
     layout = layout_seen
+    state["provenance"]["layout"] = layout
+    atomic_write_json(state_path, state)
     tag = SEGMENT_LAYOUT[layout]
     fam_dir = out / _fam_name(layout)
     predicate = "repack-of"
@@ -1005,6 +1112,11 @@ def main(argv=None) -> int:
                     default=Path.home() / ".fq_keys/fq_signing.key")
     pr.add_argument("--expand", action="store_true",
                     help="also emit the per-expert expanded family (shared-h sources)")
+    pr.add_argument("--allow-provenance-change", action="store_true",
+                    help="accept resuming a family primed from a different "
+                         "repo/revision/base-model/signer/tool version; a "
+                         "SOURCE change discards the primed layers and "
+                         "re-primes them, a producer change keeps them")
     pr.add_argument("--pace", type=float, default=1.0,
                     help="min seconds between HTTP request starts")
     pr.add_argument("--chunk-mb", type=int, default=128,

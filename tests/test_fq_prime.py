@@ -25,6 +25,7 @@ IN_TILES, OUT_TILES = 2, 1
 K_MAP = {3: {0: 3, 1: 3, 2: 4, 3: 3, 4: 4, 5: 3},
          4: {0: 4, 1: 3, 2: 3, 3: 4, 4: 4, 5: 3}}
 REPO, REV = "test/mini-quant", "cafebabe"
+REV2 = "f00dface"  # a second commit of the same repo
 
 
 def tbytes(layer, owner, proj, rank, comp, k=3) -> bytes:
@@ -72,12 +73,17 @@ def shared_tensors(layer):
     return out
 
 
-def write_shard(path: Path, layer: int, layout: str) -> None:
+def write_shard(path: Path, layer: int, layout: str, pad: int = 0) -> None:
     """Mimic the real shards: non-expert tensor first, experts contiguous in
     LEXICOGRAPHIC id order with ALPHABETICAL within-expert tensor order,
-    shared block (if any) last."""
+    shared block (if any) last.  pad>0 prepends an extra dense tensor, which
+    shifts every expert's byte range — how a second commit of the same repo
+    differs from the first."""
     entries = [(f"model.layers.{layer}.self_attn.o_proj.weight",
                 b"\x07" * 64, "BF16", [32])]
+    if pad:
+        entries.insert(0, (f"model.layers.{layer}.self_attn.qkv_pad.weight",
+                           b"\x09" * pad, "BF16", [pad // 2]))
     for e in sorted(range(NEXP), key=str):
         unit = expert_tensors(layer, e, K_MAP[layer][e], layout)
         unit.sort(key=lambda t: t[0])
@@ -100,10 +106,10 @@ def write_shard(path: Path, layer: int, layout: str) -> None:
             f.write(b)
 
 
-def build_repo(root: Path, layout: str) -> Path:
+def build_repo(root: Path, layout: str, pad: int = 0) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     for layer in LAYERS:
-        write_shard(root / f"model-layer-{layer:03d}.safetensors", layer, layout)
+        write_shard(root / f"model-layer-{layer:03d}.safetensors", layer, layout, pad)
     lines = [
         f"{hashlib.sha256((root / f'model-layer-{L:03d}.safetensors').read_bytes()).hexdigest()}"
         f"  model-layer-{L:03d}.safetensors" for L in LAYERS]
@@ -125,8 +131,9 @@ def served(tmp_path, monkeypatch):
         assert url.startswith("https://huggingface.co/")
         repo_rev_file = url.split("https://huggingface.co/", 1)[1]
         parts = repo_rev_file.split("/")
-        assert parts[2] == "resolve" and parts[3] == REV
-        return tmp_path / "repo" / "/".join(parts[4:])
+        assert parts[2] == "resolve"
+        root = "repo" if parts[3] == REV else f"repo@{parts[3]}"
+        return tmp_path / root / "/".join(parts[4:])
 
     def fake_range(url, start, end, timeout=0):
         calls["n"] += 1
@@ -147,11 +154,11 @@ def served(tmp_path, monkeypatch):
     return tmp_path, calls
 
 
-def prime(tmp_path, out_name="segments-t", extra=()):
+def prime(tmp_path, out_name="segments-t", extra=(), rev=REV, key="sign.key"):
     return fq_prime.main([
-        "prime", "--repo", REPO, "--revision", REV, "--layers", "3-4",
+        "prime", "--repo", REPO, "--revision", rev, "--layers", "3-4",
         "--out", str(tmp_path / "primed" / out_name),
-        "--base-model", "test/base", "--sign-key", str(tmp_path / "sign.key"),
+        "--base-model", "test/base", "--sign-key", str(tmp_path / key),
         "--pace", "0", *extra])
 
 
@@ -407,6 +414,121 @@ def test_spot_check_pass_and_detect_corruption(served):
     seg.write_bytes(bytes(raw))
     assert fq_prime.main(["spot-check", "--dir", str(sh), "--n", str(total),
                           "--seed", "7", "--pace", "0"]) == 1
+
+
+# ------------------- FINDING 6: caches and resume are bound to the source
+
+def test_shard_header_cache_is_scoped_to_repo_at_revision(served):
+    """Two commits of one repo must not share a header cache entry.
+
+    Caching by bare file name served the FIRST commit's header for the
+    second — and every byte range computed from it then points at the wrong
+    offsets in the new shard."""
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    build_repo(tmp_path / f"repo@{REV2}", "per_expert_v1", pad=512)
+    cache = tmp_path / "source-meta"
+    t = fq_prime.Transport(pace=0)
+    h1, b1, size1, _ = fq_prime.Source(
+        REPO, REV, "test/base", t, cache).shard_header(3)
+    h2, b2, size2, _ = fq_prime.Source(
+        REPO, REV2, "test/base", t, cache).shard_header(3)
+    assert (b1, size1) != (b2, size2), "the two commits really do differ"
+    assert h2 != h1, "revision 2 was served revision 1's cached header"
+    name = "model.layers.3.mlp.experts.0.gate_proj.rank0.trellis"
+    assert h2[name]["data_offsets"] != h1[name]["data_offsets"]
+    assert sorted(p.name for p in cache.iterdir()) == [
+        f"test__mini-quant@{REV}", f"test__mini-quant@{REV2}"]
+
+
+def test_cached_header_for_another_revision_is_ignored(served):
+    """Even inside one cache dir, an entry that names another revision is
+    refetched rather than trusted (caches get copied and renamed)."""
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    cache = tmp_path / "source-meta"
+    src = fq_prime.Source(REPO, REV, "test/base", fq_prime.Transport(pace=0),
+                          cache)
+    good, _b, _s, _u = src.shard_header(3)
+    entry = src.cache / "hdr-model-layer-003.safetensors.json"
+    obj = json.loads(entry.read_text())
+    obj["revision"] = "0000000"
+    obj["header"] = {"bogus": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}
+    entry.write_text(json.dumps(obj))
+    again, _b, _s, _u = src.shard_header(3)
+    assert again == good
+
+
+def test_state_records_the_full_provenance_tuple(served):
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    assert prime(tmp_path, "segments-prov", ["--k", "4"]) == 0
+    state = json.loads(
+        (tmp_path / "primed" / "segments-prov" / "state.json").read_text())
+    assert state["schema"] == "fq-prime-state/2"
+    prov = state["provenance"]
+    assert prov["repo"] == REPO and prov["revision"] == REV
+    assert prov["base_model"] == "test/base"
+    assert prov["layout"] == "per_expert_v1"
+    assert prov["tool_version"] == fq_prime.TOOL_VERSION
+    assert len(prov["signer_pubkey"]) == 64
+    for st in state["layers"].values():
+        assert st["source"] == {"repo": REPO, "revision": REV}
+
+
+def test_resume_refuses_a_changed_revision(served):
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    build_repo(tmp_path / f"repo@{REV2}", "per_expert_v1", pad=512)
+    assert prime(tmp_path, "segments-rev", ["--k", "4"]) == 0
+    with pytest.raises(fq_prime.ProvenanceError, match="different provenance"):
+        prime(tmp_path, "segments-rev", ["--k", "4"], rev=REV2)
+
+
+def test_resume_refuses_a_changed_signer(served):
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    assert prime(tmp_path, "segments-key", ["--k", "4"]) == 0
+    with pytest.raises(fq_prime.ProvenanceError, match="signer_pubkey"):
+        prime(tmp_path, "segments-key", ["--k", "4"], key="other.key")
+    # opting in keeps the already-primed layers and records the old producer
+    assert prime(tmp_path, "segments-key",
+                 ["--k", "4", "--allow-provenance-change"], key="other.key") == 0
+    state = json.loads(
+        (tmp_path / "primed" / "segments-key" / "state.json").read_text())
+    assert state["provenance_history"][0]["layers_discarded"] is False
+    assert sorted(int(L) for L in state["layers"]) == LAYERS
+
+
+def test_allowed_source_change_reprimes_from_the_new_revision(served):
+    """The end-to-end shape of the bug: a new commit, one output dir."""
+    tmp_path, calls = served
+    build_repo(tmp_path / "repo", "per_expert_v1")
+    assert prime(tmp_path, "segments-move", ["--k", "4"]) == 0
+    build_repo(tmp_path / f"repo@{REV2}", "per_expert_v1", pad=512)
+    assert prime(tmp_path, "segments-move",
+                 ["--k", "4", "--allow-provenance-change"], rev=REV2) == 0
+
+    out = tmp_path / "primed" / "segments-move"
+    state = json.loads((out / "state.json").read_text())
+    assert state["provenance"]["revision"] == REV2
+    assert state["provenance_history"][0]["layers_discarded"] is True
+    for st in state["layers"].values():
+        assert st["source"]["revision"] == REV2
+    # bytes come from the NEW shard layout, not from the old cached header
+    for layer in LAYERS:
+        seg = out / f"layer-{layer:03d}.k4.safetensors"
+        hdr, body = fq_repack.read_header(seg)
+        assert hdr.pop("__metadata__")["source_revision"] == REV2
+        raw = seg.read_bytes()[body:]
+        for name, t in hdr.items():
+            L, e, proj, rank, comp = fq_repack.EXPERT_RE.match(name).groups()
+            a, b = t["data_offsets"]
+            assert raw[a:b] == tbytes(int(L), int(e), proj, int(rank), comp, 4), name
+    man = json.loads((out / "fq-manifest.json").read_text())
+    assert man["per_k"]["4"]["source_revision"] == REV2
+    assert man["per_k"]["4"]["segment_count"] == len(LAYERS)
+    assert man["per_k"]["4"]["index"] == "index-k4.json"
 
 
 def test_dry_run_writes_nothing(served):
