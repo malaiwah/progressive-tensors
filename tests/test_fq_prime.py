@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_prime  # noqa: E402
 import fq_repack  # noqa: E402
+import fq_trust  # noqa: E402
 
 LAYERS = [3, 4]
 NEXP, RANKS = 6, 2
@@ -424,12 +425,8 @@ def test_spot_check_pass_and_detect_corruption(served):
 def test_spot_check_rejects_placeholder_signatures(served):
     """Decoding is not verifying: a family whose attestation signatures are
     replaced with padding must FAIL, not pass (TRUST.md 7)."""
-    import base64
     tmp_path, calls = served
-    build_repo(tmp_path / "repo", "shared_h_v1")
-    assert prime(tmp_path, "segments-sh") == 0
-    sh = tmp_path / "primed" / "segments-sh" / "shared-h"
-    pin = ["--trust-signer", _signer_fp(sh)]
+    sh = _primed_family(tmp_path)
     for att in (sh / "attestations").glob("*.jsonl"):
         out = []
         for line in att.read_text().splitlines():
@@ -437,9 +434,98 @@ def test_spot_check_rejects_placeholder_signatures(served):
             env["signature"] = base64.b64encode(b"\x00" * 64).decode()
             out.append(json.dumps(env, separators=(",", ":")))
         att.write_text("\n".join(out) + "\n")
-    with pytest.raises(Exception):
-        fq_prime.main(["spot-check", "--dir", str(sh), "--n", "2",
-                       "--seed", "7", "--pace", "0", *pin])
+    with pytest.raises(fq_trust.TrustError):
+        _spot_check(sh)
+
+
+# ------------------------------------ spot-check: absent evidence (P1-4b)
+
+def _primed_family(tmp_path) -> Path:
+    build_repo(tmp_path / "repo", "shared_h_v1")
+    assert prime(tmp_path, "segments-sh") == 0
+    return tmp_path / "primed" / "segments-sh" / "shared-h"
+
+
+def _spot_check(family: Path, *extra, n=2, seed=7):
+    return fq_prime.main(["spot-check", "--dir", str(family), "--n", str(n),
+                          "--seed", str(seed), "--pace", "0",
+                          "--trust-signer", _signer_fp(family), *extra])
+
+
+def _resign(path: Path, key: Path, mutate) -> None:
+    """Re-sign an attestation line after changing what it claims."""
+    payload = json.loads(base64.b64decode(
+        json.loads(path.read_text().splitlines()[0])["payload"]))
+    mutate(payload)
+    path.write_text(fq_repack.Signer(key).sign_line(payload) + "\n")
+
+
+def test_spot_check_fails_when_the_attestation_is_missing(served):
+    """A sampled expert with no signed digest has not been spot-checked."""
+    tmp_path, calls = served
+    sh = _primed_family(tmp_path)
+    for att in (sh / "attestations").glob("layer-*.k*.jsonl"):
+        att.unlink()
+    with pytest.raises(fq_trust.TrustError, match="missing"):
+        _spot_check(sh, n=2 * NEXP)
+
+
+def test_spot_check_fails_when_the_expert_digest_is_absent(served):
+    """A validly signed line that simply omits the sampled expert."""
+    tmp_path, calls = served
+    sh = _primed_family(tmp_path)
+    key = tmp_path / "sign.key"
+    for att in sorted((sh / "attestations").glob("layer-*.k*.jsonl")):
+        _resign(att, key, lambda p: p.__setitem__("expert_sha256", {}))
+    with pytest.raises(fq_trust.TrustError, match="unattested"):
+        _spot_check(sh, n=2 * NEXP)
+
+
+def test_spot_check_fails_on_an_empty_attestation_file(served):
+    tmp_path, calls = served
+    sh = _primed_family(tmp_path)
+    for att in (sh / "attestations").glob("layer-*.k*.jsonl"):
+        att.write_text("")
+    with pytest.raises(fq_trust.TrustError, match="no trusted attestation"):
+        _spot_check(sh, n=2 * NEXP)
+
+
+def test_spot_check_reads_every_jsonl_line(served):
+    """JSON Lines, not one JSON document: a leading line signed by a
+    stranger must neither crash the tool nor hide the trusted line."""
+    tmp_path, calls = served
+    sh = _primed_family(tmp_path)
+    stranger = fq_repack.Signer(tmp_path / "stranger.key")
+    for att in sorted((sh / "attestations").glob("layer-*.k*.jsonl")):
+        good = att.read_text().splitlines()[0]
+        payload = json.loads(base64.b64decode(json.loads(good)["payload"]))
+        att.write_text(stranger.sign_line(payload) + "\n" + good + "\n")
+    assert _spot_check(sh, n=2 * NEXP) == 0
+
+
+def test_spot_check_detects_a_tampered_expert_digest(served):
+    """A re-signed line that claims the wrong digest for a real expert."""
+    tmp_path, calls = served
+    sh = _primed_family(tmp_path)
+    key = tmp_path / "sign.key"
+    for att in sorted((sh / "attestations").glob("layer-*.k*.jsonl")):
+        _resign(att, key, lambda p: p["expert_sha256"].update(
+            {e: "0" * 64 for e in p["expert_sha256"]}))
+    assert _spot_check(sh, n=2 * NEXP) == 1
+
+
+def test_spot_check_requires_a_pin_or_a_trust_root(served, tmp_path):
+    """No pin, and a trust root that lists nobody: the family's own
+    signer_pubkey is not authority."""
+    srv_tmp, calls = served
+    sh = _primed_family(srv_tmp)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "FINGERPRINTS").write_text("# nobody\n")
+    with pytest.raises(fq_trust.TrustError):
+        fq_prime.main(["spot-check", "--dir", str(sh), "--n", "1",
+                       "--seed", "7", "--pace", "0",
+                       "--trust-root", str(root)])
 
 
 # ------------------- FINDING 6: caches and resume are bound to the source

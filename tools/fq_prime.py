@@ -1022,27 +1022,74 @@ def _fam_name(layout: str) -> Path:
 
 # -------------------------------------------------------------- spot-check
 
-_VERIFIER_CACHE: dict = {}
-
-
 def _verifier(args, fam: Path):
-    """Trust verifier for this family (memoized): pins come from the CLI
-    (--trust-signer/--trust-file) or the family manifest's signer_pubkey."""
-    key = str(fam)
-    if key not in _VERIFIER_CACHE:
-        import fq_trust
-        manifest_path = fam / "fq-manifest.json"
-        manifest = (json.loads(manifest_path.read_text())
-                    if manifest_path.exists() else None)
-        _VERIFIER_CACHE[key] = fq_trust.Verifier.from_args(args, manifest=manifest)
-    return _VERIFIER_CACHE[key]
+    """Trust verifier for this family: the pin comes from the CLI
+    (--trust-signer / --trust-root), never from the family being checked.
+    fq_trust fails closed when nothing authorizes the claimed key."""
+    import fq_trust
+    manifest_path = fam / "fq-manifest.json"
+    manifest = (json.loads(manifest_path.read_text())
+                if manifest_path.exists() else None)
+    return fq_trust.Verifier.from_args(args, manifest=manifest)
+
+
+def attested_expert_sha(verifier, att_path: Path, fragment_file: str,
+                        eid: int) -> str:
+    """The sha256 a TRUSTED attestation line claims for one expert.
+
+    A spot-check whose attestation is absent, unreadable, signed by the
+    wrong key, or simply silent about the expert it sampled has checked
+    nothing — so every one of those is an exception, not a None that the
+    caller shrugs off.  The file is JSON Lines: each line is verified
+    independently and the first trusted line that names this fragment and
+    carries this expert wins, so a leading junk or third-party line cannot
+    hide the real one.
+    """
+    import fq_trust
+
+    if not att_path.exists():
+        raise fq_trust.TrustError(
+            f"{att_path.name} is missing: expert {eid} has no signed digest "
+            f"to check the re-fetched bytes against — refusing to call that "
+            f"a pass")
+    reasons: list[str] = []
+    seen_fragment = False
+    for n, raw in enumerate(att_path.read_text().splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            payload = verifier.verify_envelope(json.loads(raw),
+                                               where=f"{att_path.name}:{n}")
+        except (fq_trust.TrustError, json.JSONDecodeError, TypeError) as e:
+            reasons.append(f"line {n}: {e}")
+            continue
+        frag = (payload.get("fragment") or {}).get("file")
+        if frag not in (None, fragment_file):
+            continue
+        seen_fragment = True
+        digest = (payload.get("expert_sha256") or {}).get(str(eid))
+        if digest:
+            return digest
+    if seen_fragment:
+        raise fq_trust.TrustError(
+            f"{att_path.name}: no trusted line carries a digest for expert "
+            f"{eid} of {fragment_file} — that expert is unattested")
+    raise fq_trust.TrustError(
+        f"{att_path.name}: no trusted attestation line for {fragment_file}"
+        + (f" ({'; '.join(reasons)})" if reasons else ""))
 
 
 def cmd_spot_check(args) -> int:
     """Transport spot-check: for N random experts of a primed family,
     independently re-fetch the source bytes (fresh header + payload range)
     and compare sha256 of the canonical-order concatenation against the
-    segment content and the signed attestation."""
+    segment content AND the signed attestation.
+
+    All three must agree.  There is no two-out-of-three pass: an expert
+    whose attestation is missing, unsigned, signed by an untrusted key, or
+    silent about that expert fails the check (TrustError), because the
+    whole point of the exercise is that the bytes were vouched for.
+    """
     fam: Path = args.dir
     transport = Transport(pace=args.pace)
     rng = random.Random(args.seed)
@@ -1057,6 +1104,7 @@ def cmd_spot_check(args) -> int:
         print(f"no indexed experts under {fam}")
         return 1
     picks = rng.sample(samples, min(args.n, len(samples)))
+    verifier = _verifier(args, fam)
     failures = 0
     for layer, k, eid, entry in picks:
         seg_path = fam / entry["file"]
@@ -1092,24 +1140,20 @@ def cmd_spot_check(args) -> int:
             seg_sha = hashlib.sha256(
                 mm[entry["body_offset"] + slo:entry["body_offset"] + shi]).hexdigest()
             mm.close()
+        # Decoding is not verifying, and a silent attestation is not an
+        # excuse: attested_expert_sha raises unless a trusted line actually
+        # says what this expert's bytes should hash to.
         att_path = fam / "attestations" / f"layer-{layer:03d}.k{k}.jsonl"
-        att_sha = None
-        if att_path.exists():
-            line = json.loads(att_path.read_text())
-            # Decoding is not verifying: a placeholder signature must not
-            # pass. verify_envelope raises unless the line is signed by a
-            # trusted key (fq_trust rungs; TRUST.md §7).
-            payload = _verifier(args, fam).verify_envelope(
-                line, where=f"{att_path.name}:{eid}")
-            att_sha = payload.get("expert_sha256", {}).get(str(eid))
-        ok = src_sha == seg_sha and (att_sha is None or att_sha == src_sha)
+        att_sha = attested_expert_sha(verifier, att_path, entry["file"], eid)
+        ok = src_sha == seg_sha == att_sha
         failures += 0 if ok else 1
         print(f"layer {layer:3d} k{k} expert {eid:3d}: "
               f"{'OK' if ok else 'MISMATCH'} source={src_sha[:16]} "
-              f"segment={seg_sha[:16]} attestation={(att_sha or '-')[:16]}",
+              f"segment={seg_sha[:16]} attestation={att_sha[:16]}",
               flush=True)
     print(f"spot-check: {len(picks) - failures}/{len(picks)} OK "
-          f"({transport.bytes / 1e6:.1f}MB re-fetched)", flush=True)
+          f"({transport.bytes / 1e6:.1f}MB re-fetched); {verifier.summary()}",
+          flush=True)
     return 1 if failures else 0
 
 
