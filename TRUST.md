@@ -156,6 +156,18 @@ git history  ──►  keys/FINGERPRINTS  ──►  --trust-signer <fingerprin
                                       the upstream quant (fq_verify)
 ```
 
+One hop the diagram compresses: **a range-fetched subset is re-attested
+locally.** The experts inside it are verbatim and were hashed against the
+publisher's signed digests as they arrived, but the *file* is new — fewer
+experts, different offsets, a digest no publisher ever signed. So `fq_fetch`
+signs what it actually produced with a local key (`--sign-key`), as a
+`derived-from` attestation naming the publisher fragments as parents and
+pinning them by digest; `fq_assemble --trust-signer <your fingerprint>` then
+verifies that. The publishers' own lines are kept under
+`attestations/<source>/` so the upstream hops stay checkable offline. Your
+key is the honest signer for that last hop: nobody else can truthfully
+attest a file only your machine assembled.
+
 Two paths into the same place. The release manifest is the cheap one: one
 signature, then hashing. The per-fragment attestations are the granular
 one: they carry the per-expert digests a ranged read needs, and they
@@ -223,15 +235,21 @@ somewhere the artifacts cannot reach.
 - `keys/FINGERPRINTS` as the trust root, with a CI guard on its shape;
 - `--trust-signer` / `--trust-root` / `--allow-unpinned-signer` /
   `--insecure-skip-signatures` in `fq_fetch` and `fq_release`, with the
-  rung printed;
+  rung printed; `fq_assemble` pins with `--trust-signer` / `--trust-file`
+  (it reads this repo's `keys/FINGERPRINTS` format directly) and refuses to
+  assemble anything it cannot verify;
 - real ed25519 verification with the failure modes enumerated above;
 - `fq-release/1` build and verify, including partial trees;
-- per-expert digest checking on every fetched byte range.
+- per-expert digest checking on every fetched byte range;
+- local `derived-from` re-attestation of fetched subsets, so a
+  range-fetched tree assembles under a pinned signer instead of needing
+  `fq_assemble --insecure`.
 
 **Not yet:**
 
 - per-source pinning in a multi-provider fetch (see §5);
-- `--trust-signer` on `fq_assemble` and `fq_prime` (in progress, separately);
+- `--trust-signer` on `fq_prime` (`fq_assemble` verifies every fragment it
+  consumes and fails closed without a pin);
 - DSSE/in-toto envelopes and transparency-log inclusion proofs (§6);
 - countersignatures — a second party attesting "I re-derived this fragment
   and got the same bytes". The attestation files are JSON Lines precisely

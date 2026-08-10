@@ -146,7 +146,15 @@ def write_policy(path: Path, mapping: dict) -> Path:
 
 
 def run(argv, expect=0):
-    rc = fq_fetch.main([str(a) for a in argv])
+    """Invoke fq_fetch, keeping its local signing key inside tmp_path.
+
+    (Without --sign-key the tool would create ~/.fq_keys/fq_fetch.key, which
+    is right for a user and wrong for a test.)"""
+    argv = [str(a) for a in argv]
+    if "--sign-key" not in argv and "--no-attest" not in argv:
+        out = Path(argv[argv.index("--out") + 1])
+        argv += ["--sign-key", str(out.parent / "local.key")]
+    rc = fq_fetch.main(argv)
     assert rc == expect, f"fq_fetch returned {rc}, expected {expect}"
     return rc
 
@@ -177,7 +185,8 @@ def _fetch_all(tmp_path, served, extra=()):
                           {LAYERS[0]: [3, 4, 3, 4], LAYERS[1]: [4, 4, 3, 3]})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub), *extra])
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--sign-key", tmp_path / "local.key", *extra])
     return repo, snap, out, policy, pub
 
 
@@ -185,13 +194,22 @@ def test_fetched_subset_assembles_byte_identically(tmp_path, served):
     """The property the whole tool exists for: assembling from a range-fetched
     subset gives exactly the checkpoint you would have got from the full
     download."""
-    repo, snap, out, policy, _ = _fetch_all(tmp_path, served)
+    repo, snap, out, policy, pub = _fetch_all(tmp_path, served)
     full_out = tmp_path / "asm-full"
     sub_out = tmp_path / "asm-subset"
-    for segments, dest in ((repo, full_out), (out, sub_out)):
+    # fq_assemble verifies every segment against a PINNED signer and fails
+    # closed without one.  The published family is signed by the publisher;
+    # the fetched subset consists of new files, so fq_fetch re-attests them
+    # (derived-from, parents pinned by digest) under the local key whose
+    # fingerprint it printed.  Both halves are verified — neither uses
+    # --insecure — and both must produce the same checkpoint.
+    local = json.loads((out / "fq-manifest.json").read_text())["signer_pubkey"]
+    assert local and local != pub, "the subset must be signed by the local key"
+    for segments, dest, pin in ((repo, full_out, pub), (out, sub_out, local)):
         assert fq_assemble.main([
             "--segments", str(segments), "--source", str(snap),
-            "--policy", str(policy), "--out", str(dest)]) == 0
+            "--policy", str(policy), "--out", str(dest),
+            "--trust-signer", pin]) == 0
     for shard in sorted(full_out.glob("model-layer-*.safetensors")):
         assert shard.read_bytes() == (sub_out / shard.name).read_bytes(), shard.name
 
@@ -218,7 +236,12 @@ def test_local_tree_is_self_describing(tmp_path, served):
     manifest = json.loads((out / "fq-manifest.json").read_text())
     assert manifest["schema"] == "fq-manifest/1"
     assert manifest["kind"] == "fetched-subset"
-    assert manifest["signer_pubkey"] == pub
+    # signer_pubkey names whoever signed THIS tree — the local key, because
+    # the subset files are new files — and the upstream key that was checked
+    # while fetching is recorded separately rather than conflated with it.
+    assert manifest["signer_pubkey"] != pub
+    assert manifest["upstream_signer"] == pub
+    assert manifest["upstream_trust_rung"] == fq_trust.RUNG_PINNED
     assert sorted(manifest["k_variants"]) == list(KS)
     report = json.loads((out / "fq-fetch-report.json").read_text())
     assert report["trust"]["rung"] == fq_trust.RUNG_PINNED
@@ -338,6 +361,7 @@ def test_resume_after_interruption_refetches_only_the_rest(tmp_path, served,
     argv = ["--policy", str(policy), "--out", str(out), "--source",
             f"test/pub@{REV}", "--trust-signer", pub,
             "--trust-root", str(trust_root(tmp_path, pub)),
+            "--sign-key", str(tmp_path / "local.key"),
             "--max-gap-mb", "0", "--chunk-mb", "0.001"]
     assert fq_fetch.main(argv) == 130
     partial = json.loads((out / "state.json").read_text())
@@ -374,6 +398,7 @@ def test_resumed_bytes_are_rehashed_before_being_trusted(tmp_path, served,
     argv = ["--policy", str(policy), "--out", str(out), "--source",
             f"test/pub@{REV}", "--trust-signer", pub,
             "--trust-root", str(trust_root(tmp_path, pub)),
+            "--sign-key", str(tmp_path / "local.key"),
             "--max-gap-mb", "0", "--chunk-mb", "0.001"]
     monkeypatch.setattr(fq_fetch, "http_get_range", flaky)
     assert fq_fetch.main(argv) == 130
@@ -394,7 +419,8 @@ def test_changed_recipe_discards_the_stale_partial(tmp_path, served):
     served["mount"]("test/pub", repo)
     out = tmp_path / "fetched"
     base = ["--out", str(out), "--source", f"test/pub@{REV}",
-            "--trust-signer", pub, "--trust-root", str(trust_root(tmp_path, pub))]
+            "--trust-signer", pub, "--trust-root", str(trust_root(tmp_path, pub)),
+            "--sign-key", str(tmp_path / "local.key")]
     p1 = write_policy(tmp_path / "r1.json", {LAYERS[0]: [3, 3, 3, 3]})
     assert fq_fetch.main(["--policy", str(p1), *base]) == 0
     first = json.loads((out / "index-k3.json").read_text())[str(LAYERS[0])]
@@ -471,3 +497,45 @@ def test_coalescing_never_merges_across_a_wide_gap():
     assert [(c[0], c[1]) for c in chunks] == [(0, 200), (10_000, 10_100)]
     tight = fq_fetch.coalesce(pieces, max_chunk=150, max_gap=1024)
     assert len(tight) == 3
+
+
+def test_subset_is_attested_as_derived_from_its_parents(tmp_path, served):
+    """A subset file is a new file, so no publisher signature can cover it.
+    fq_fetch signs what it produced, naming the parents by digest."""
+    import base64
+
+    repo, snap, out, policy, pub = _fetch_all(tmp_path, served)
+    local = json.loads((out / "fq-manifest.json").read_text())["signer_pubkey"]
+    att = out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    envelope = json.loads(att.read_text())
+    payload = fq_trust.verify_signature(envelope, local, where=att.name)
+    assert payload["predicate"] == "derived-from"
+    assert payload["derivation"]["rule"] == "range_subset_v1"
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    assert payload["fragment"]["sha256"] == hashlib.sha256(seg.read_bytes()).hexdigest()
+    assert payload["fragment"]["size"] == seg.stat().st_size
+    parent = payload["parents"][0]
+    assert parent["repo"] == "test/pub" and parent["revision"] == REV
+    published = json.loads(
+        (repo / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl").read_text())
+    published_payload = json.loads(base64.b64decode(published["payload"]))
+    assert parent["sha256"] == published_payload["fragment"]["sha256"]
+    # the per-expert digests are the publisher's, unchanged: expert bytes are
+    # verbatim even though the containing file is not
+    for eid, digest in payload["expert_sha256"].items():
+        assert digest == published_payload["expert_sha256"][eid]
+    # and the publisher's own line is kept for offline re-checking
+    kept = out / "attestations" / f"test__pub@{REV[:12]}" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    assert json.loads(kept.read_text())["keyid"] == pub
+
+
+def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--no-attest"])
+    assert not (out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl").exists()
+    assert "--insecure" in capsys.readouterr().out

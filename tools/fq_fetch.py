@@ -43,9 +43,20 @@ and attestation files too, and fq_fetch checks their digests against it.
         --source willfalco/GLM-5.2-EXL3-TR3-3.36bpw-FQ@<commit> \\
         --trust-signer a58b7bb79ba58457
 
-    # then, unchanged:
+    # then, with the fingerprint fq_fetch prints for the subset it signed:
     fq_assemble.py --segments ./segments --source <checkpoint> \\
-        --policy recipe.json --out ./my-checkpoint
+        --policy recipe.json --out ./my-checkpoint \\
+        --trust-signer <your local fq_fetch fingerprint>
+
+Why a second key.  A subset file is a NEW file — fewer experts, different
+offsets, a different digest — so no publisher signature can cover it, even
+though every expert byte in it was hashed against the publisher's signed
+digest as it arrived.  fq_fetch therefore signs what it actually produced
+with a local key (`--sign-key`, created on demand), as a `derived-from`
+attestation naming the publisher fragments as parents and pinning them by
+digest.  The publishers' own lines are kept under attestations/<source>/ so
+the upstream hops stay checkable offline.  `--no-attest` skips this, and
+then assembly needs `--insecure`.
 
 Interrupt it and run it again: completed experts are recorded in
 `state.json` and skipped, partial segment files are resumed in place.
@@ -786,7 +797,8 @@ def counterfactual(sources: list[Source], plans: list[FilePlan]) -> dict:
 
 def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                   sources: list[Source], verifier: fq_trust.Verifier,
-                  stats: dict, policy_path: Path) -> None:
+                  stats: dict, policy_path: Path,
+                  local_signer: str | None = None) -> None:
     """Local index-kK.json, fq-manifest.json and the provenance report."""
     ks = sorted({p.k for p in plans})
     per_k: dict[int, dict] = {k: {} for k in ks}
@@ -823,7 +835,14 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                            default=0),
         "sources": [str(s) for s in sources],
         "tensor_indexes": index_names,
-        "signer_pubkey": verifier.fingerprint,
+        # The key that signed THIS tree's attestations.  For a fetched subset
+        # that is the local fq_fetch key (the subset files are new files);
+        # the upstream key whose signatures were checked while fetching is
+        # recorded separately, because conflating them is the mistake this
+        # whole trust model exists to avoid.
+        "signer_pubkey": local_signer,
+        "upstream_signer": verifier.fingerprint,
+        "upstream_trust_rung": verifier.rung,
         "fetched_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     if len(index_names) == 1:
@@ -837,7 +856,8 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "policy": str(policy_path),
         "trust": {"rung": verifier.rung, "signer": verifier.fingerprint,
                   "key_id": verifier.key_id,
-                  "signatures_verified": verifier.checked},
+                  "signatures_verified": verifier.checked,
+                  "local_signer": local_signer},
         "sources": [{"repo": s.repo, "revision": s.revision,
                      "pinned": s.pinned, "resolved_commit": s.resolved_commit,
                      "release_manifest": bool(s.release)} for s in sources],
@@ -860,6 +880,92 @@ def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
             dst = out / "attestations" / src.slug / Path(name).name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(raw)
+
+
+def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
+                      keyid: str) -> dict:
+    """A `derived-from` payload for one locally materialized subset file.
+
+    A subset segment is a NEW file: fewer experts, different offsets,
+    therefore a different whole-file digest than anything the publisher
+    signed.  The publisher's signature covers the experts (their per-expert
+    digests were checked byte by byte as the ranges landed) but cannot cover
+    this file — so fq_fetch signs what it actually produced, with the
+    publisher's fragments named as parents and pinned by digest.
+
+    The chain a consumer ends up with:
+
+        publisher key (pinned at fetch time, out of band)
+          -> attested per-expert digests
+            -> these exact bytes, hashed on arrival
+              -> this file, attested under YOUR key
+                -> fq_assemble --trust-signer <your fingerprint>
+
+    Your own key is the right signer for the last hop: nobody else can
+    honestly attest a file only your machine assembled.  The publishers'
+    original lines are kept under attestations/<source>/ so the earlier
+    hops stay checkable offline.
+    """
+    parents = []
+    for src in sorted({p.source.slug: p.source for p in plan.pieces}.values(),
+                      key=lambda s: s.slug):
+        experts = sorted(p.expert for p in plan.pieces if p.source is src)
+        att = src.attestation(plan.layer, plan.k, verifier,
+                              Source.segment_name(plan.layer, plan.k))
+        frag = att.get("fragment") or {}
+        parents.append({
+            "role": "source_fragment",
+            "repo": src.repo,
+            "revision": src.revision,
+            "file": frag.get("file"),
+            "sha256": frag.get("sha256"),
+            "size": frag.get("size"),
+            "keyid": verifier.fingerprint,
+            "experts": experts,
+        })
+    payload = {
+        "schema": "fq-attestation/1",
+        "predicate": "derived-from",
+        "fragment": {"file": entry["file"], "sha256": entry["sha256"],
+                     "size": entry["size"]},
+        "expert_sha256": {str(p.expert): p.sha256
+                          for p in sorted(plan.pieces, key=lambda x: x.expert)},
+        "layer": plan.layer,
+        "k": plan.k,
+        "derivation": {
+            "rule": "range_subset_v1",
+            "description": (
+                "byte-range subset of the parent fragment(s): the experts this "
+                "recipe routes to K{k} were range-read from the parents and "
+                "written in canonical order into a smaller fq-segment/1 file. "
+                "Expert bytes are verbatim — each span was hashed against the "
+                "parent's signed expert_sha256 before this file was finalized "
+                "— but the file digest is new because the file is new."
+            ).format(k=plan.k),
+        },
+        "parents": parents,
+        "verification": {
+            "tool": "fq_fetch",
+            "upstream_rung": verifier.rung,
+            "upstream_signer": verifier.fingerprint,
+            "expert_digests_checked": len(plan.pieces),
+        },
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    for field in ("layout", "base_model"):
+        value = plan.meta.get(field)
+        if value:
+            payload[field] = value
+    return payload
+
+
+def write_local_attestation(out: Path, plan: FilePlan, entry: dict,
+                            signer, verifier: fq_trust.Verifier) -> None:
+    """Sign and write attestations/<segment stem>.jsonl for a subset file."""
+    payload = local_attestation(plan, entry, verifier, signer.pub_hex)
+    dst = out / "attestations" / f"{Path(plan.name).stem}.jsonl"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(signer.sign_line(payload) + "\n")
 
 
 # --------------------------------------------------------------------- run
@@ -994,6 +1100,15 @@ def main(argv=None) -> int:
     p.add_argument("--max-gap-mb", type=float, default=1.0,
                    help="merge spans separated by less than this, fetching "
                         "and discarding the filler (default 1 MB)")
+    p.add_argument("--sign-key", type=Path,
+                   default=Path.home() / ".fq_keys/fq_fetch.key",
+                   help="ed25519 seed (32 bytes, created on demand) used to "
+                        "attest the subset files this run materializes.  They "
+                        "are new files, so no publisher signature can cover "
+                        "them; pin the printed fingerprint when assembling.")
+    p.add_argument("--no-attest", action="store_true",
+                   help="do not sign the fetched subset — the tree will then "
+                        "need fq_assemble --insecure")
     p.add_argument("--no-verify-resumed", action="store_true",
                    help="trust bytes already on disk from an earlier run "
                         "instead of re-hashing them")
@@ -1072,16 +1187,25 @@ def main(argv=None) -> int:
         print("dry run: nothing fetched")
         return 0
 
+    signer = None
+    if not args.no_attest:
+        from fq_repack import Signer  # local key handling, same as fq_repack
+
+        signer = Signer(args.sign_key)
+
     state = load_state(out)
     entries: dict[tuple[int, int], dict] = {}
     t0 = time.time()
     try:
         for plan in plans:
-            entries[(plan.layer, plan.k)] = fetch_plan(
+            entry = fetch_plan(
                 plan, out, state, transport,
                 max_chunk=max(1, int(args.chunk_mb * (1 << 20))),
                 max_gap=int(args.max_gap_mb * (1 << 20)),
                 verify_local=not args.no_verify_resumed)
+            entries[(plan.layer, plan.k)] = entry
+            if signer is not None:
+                write_local_attestation(out, plan, entry, signer, verifier)
     except TrustError as e:
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
         return 1
@@ -1093,13 +1217,23 @@ def main(argv=None) -> int:
     copy_attestations(out, plans)
     stats = {**summary, "transport": transport.stats(),
              "elapsed_s": round(time.time() - t0, 1)}
-    write_outputs(out, plans, entries, sources, verifier, stats, args.policy)
+    local_fp = signer.pub_hex if signer is not None else None
+    write_outputs(out, plans, entries, sources, verifier, stats, args.policy,
+                  local_signer=local_fp)
     if args.json:
         args.json.write_text(json.dumps({"dry_run": False, **stats}, indent=1) + "\n")
     print(f"fetched {experts} experts ({human(transport.bytes)} over "
           f"{transport.requests} range requests) -> {out}")
-    print(f"assemble with: fq_assemble.py --segments {out} --source "
-          f"<checkpoint> --policy {args.policy} --out <dir>")
+    if local_fp:
+        print(f"subset attested as derived-from under your key {local_fp[:16]}… "
+              f"({args.sign_key})")
+        print(f"assemble with: fq_assemble.py --segments {out} --source "
+              f"<checkpoint> --policy {args.policy} --out <dir> "
+              f"--trust-signer {local_fp}")
+    else:
+        print(f"assemble with: fq_assemble.py --segments {out} --source "
+              f"<checkpoint> --policy {args.policy} --out <dir> --insecure "
+              f"(--no-attest was used, so nothing signs this subset)")
     return 0
 
 

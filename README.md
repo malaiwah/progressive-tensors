@@ -46,9 +46,13 @@ Think progressive JPEG, for quants.
   the artifact download — see [TRUST.md](TRUST.md).
 - **Reassembly is byte-faithful** — assembling the all-K3 recipe from the
   brandonmusic-derived segments reproduces the original checkpoint shards
-  **sha256-identical**: of GLM-5.2's 79 quantized layer shards, 76 are
-  rebuilt from segments and compared byte-for-byte, and 3 dense layers are
-  passed through unchanged.
+  **sha256-identical**: re-verified across **all 76 MoE shards** of GLM-5.2
+  (layers 3–78; 278.5 GB of expert bytes came from segments, the dense
+  layers and embed/head pass through from the source). The full per-quant
+  reconstruction proof — byte-identity rungs and measured numeric similarity
+  across three community quants, including evidence that two *independent*
+  producers' K4 fragments are equal in measured quality — is in
+  [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md).
 - **Fetch only what your recipe uses** — segments are per-expert
   contiguous, so `fq_fetch` HTTP-Range-reads exactly the expert spans a
   recipe names, from one or several publishers, instead of downloading the
@@ -117,18 +121,31 @@ uv run tools/fq_fetch.py --policy recipe-all-k3.json --out ./segments \
   --source malaiwah/GLM-5.2-EXL3-FQ-segments@<commit> \
   --trust-signer a58b7bb79ba58457
 
-# assemble a bootable checkpoint (dense tensors come from the source repo)
+# assemble a bootable checkpoint (dense tensors come from the source repo).
+# Assembly verifies every fragment it consumes — signature under a pinned
+# signer, signed fragment and per-expert digests recomputed from the bytes on
+# disk — and fails closed if you do not pin one.  fq_fetch prints the exact
+# --trust-signer line for the tree it just wrote.
 uv run tools/fq_assemble.py \
   --segments ./segments --source <source-checkpoint-dir> \
-  --policy recipe-all-k3.json --out ./my-checkpoint
+  --policy recipe-all-k3.json --out ./my-checkpoint \
+  --trust-signer <fingerprint>   # or --trust-file keys/FINGERPRINTS
 
 sha256sum ./my-checkpoint/model-layer-030.safetensors
 #  -> identical to the original shard. That's the point.
 ```
 
-`--trust-signer` is the fingerprint from
-[`keys/FINGERPRINTS`](keys/FINGERPRINTS) in *this* repository — the point
-being that it does not come from the download you are checking. An all-K3
+**Two fingerprints, one chain.** For the *fetch* step, `--trust-signer` is
+the publisher's fingerprint from [`keys/FINGERPRINTS`](keys/FINGERPRINTS) in
+*this* repository — the point being that it does not come from the download
+you are checking. For the *assemble* step it is **your own**: a fetched
+subset is a new file (fewer experts, new offsets, new digest), so no
+publisher signature can cover it, and `fq_fetch` signs what it materialized
+as `derived-from`, naming the publisher fragments as parents and pinning
+them by digest. It prints that fingerprint and the exact assemble command.
+Assembling a tree you downloaded whole instead pins the publisher directly.
+
+An all-K3
 recipe over all 76 MoE layers is the whole base tier, so it fetches
 essentially everything; the savings appear as soon as the recipe is
 narrower than the repo (a layer window, or a K4 hot set on top of a K3
@@ -141,21 +158,37 @@ If segments and output live on a reflink-capable filesystem (XFS with
 `reflink=1`, btrfs), add `--reflink` to `fq_assemble.py`: expert-tensor
 bytes are then written with `copy_file_range`, letting the kernel share
 extents between the segment files and the assembled shards instead of
-storing the same bytes twice. Honest caveats:
+storing the same bytes twice — *when alignment permits*.
 
-- **Sharing is the kernel's call.** `copy_file_range` may silently perform
-  a plain copy; extent sharing only happens when the filesystem chooses to
-  reflink.
-- **Savings depend on 4K-block alignment** of identical regions at *both*
-  the source and destination offsets. MB-scale fragments usually share
-  most interior blocks, but alignment is not guaranteed.
-- **Output bytes are always identical** to a non-`--reflink` run — the
-  mode changes how bytes move, never what they are. Every region falls
-  back automatically to the ordinary copy when `copy_file_range` is
-  unavailable or fails (cross-filesystem `EXDEV`, `EOPNOTSUPP`, ...), so
-  it is always safe to pass.
-- **Local disk space only.** It has no effect on HF/remote transfer or
-  storage (Xet chunk-dedupe covers that side).
+**Measured on XFS (Ceph RBD, kernel 6.8), assembling real GLM-5.2 shards
+twice (plain vs `--reflink`):** byte-identity always held (both outputs
+sha256-identical to each other and to the original shards), every expert
+region went through `copy_file_range` without a single fallback, and the
+reflink run was faster (6.3 s → 3.8 s for three shards) — but **zero extents
+ended up shared** (`filefrag -v`: no `shared` flags; identical block usage).
+Cause, measured: XFS only shares blocks when source and destination offsets
+agree mod 4096, and **0.00 % of expert-tensor bytes are 4K-congruent**
+between segment and shard offsets — the canonical per-expert reordering plus
+differing safetensors header lengths shift every offset. A positive control
+(same syscall, aligned offsets, same filesystem) shared extents immediately,
+so the limit is alignment, not the kernel or filesystem.
+
+Caveats that remain true everywhere:
+
+- **Sharing is the kernel's call.** `copy_file_range` silently performs a
+  plain (server-side) copy when it cannot remap blocks.
+- **Output bytes are always identical** to a non-`--reflink` run — the mode
+  changes how bytes move, never what they are. Every region falls back
+  automatically to the ordinary copy when `copy_file_range` is unavailable or
+  fails (cross-filesystem `EXDEV`, `EOPNOTSUPP`, ...), so it is always safe
+  to pass.
+- **Local disk space only.** No effect on HF/remote transfer or storage (Xet
+  chunk-dedupe covers that side).
+
+Net: treat `--reflink` today as "safe, sometimes faster", not as a guaranteed
+space saver. A future `fq-segment/2` could pad per-tensor segment offsets into
+4K congruence with the source layout (≤ 4 KB per tensor, sub-1 % overhead) if
+extent sharing is worth buying.
 
 ## Fetch only what the recipe needs (`fq_fetch`)
 
@@ -230,6 +263,79 @@ same spot-check can be run against the *source* quant with an HTTP range
 request — the trust chain is explicit and third-party-verifiable, which is
 strictly stronger than "download 300 GB from a named uploader and hope."
 
+## Prime segments from a community quant (`fq_prime`)
+
+Any published EXL3 mixed quant on Hugging Face can be decomposed into
+segments **without downloading its shards**. `fq_prime` fetches each layer
+shard's safetensors header with a ranged GET, identifies the per-expert
+fragments and their K from the trellis geometry, then range-reads only the
+expert bytes it needs (coalesced, paced, resumable):
+
+```bash
+# per-expert-layout source (3.36 bpw): pull just the K4 experts
+uv run tools/fq_prime.py prime \
+  --repo willfalco/GLM-5.2-EXL3-TR3-3.36bpw \
+  --revision 8d9aa923a17502675ca23737349b67f2e66bb69d \
+  --layers 3-10 --k 4 --out ~/fq-primed/segments-336
+
+# shared-H-layout source (3.42 bpw): emits BOTH families — the verbatim
+# shared-h segments (repack-of) and, with --expand, the per-expert expanded
+# view (derived-from: shared rows replicated into each expert, an exact,
+# byte-preserving expansion)
+uv run tools/fq_prime.py prime \
+  --repo willfalco/GLM-5.2-EXL3-TR3-3.42bpw \
+  --revision ae68c65947efa90bea37308e15421872f124c46d \
+  --layers 3-10 --k 3,4 --expand --out ~/fq-primed/segments-342
+```
+
+**Measured over layers 3–10 of both quants: 46.6 GB transferred against a
+72.2 GB full-download counterfactual.** The two runs are the honest bracket
+around what ranged reads buy: the 3.36 bpw source, where only the K4 experts
+were wanted, moved 13.7 of 36.0 GB (**62 % saved**, 464 range requests); the
+3.42 bpw source, where every expert was wanted, moved 32.8 of 36.1 GB (**9 %
+saved**, 254 requests — the residue is headers and non-expert tensors).
+**The saving is selectivity, not compression.** Ask for everything and you
+transfer everything; the win scales with how much of the repo your recipe
+does *not* need.
+
+## Verify a reconstruction (`fq_verify`)
+
+`fq_verify` turns "trust me" into a checkable claim, at two rungs:
+
+```bash
+# byte-identity, at the strongest granularity that applies (auto-detected):
+#  * local snapshot available -> stream-reassemble every shard from segments
+#    and compare sha256 against the source checkpoint
+uv run tools/fq_verify.py --identity --segments ./segments \
+  --source <source-checkpoint-dir> --json id.json --md id.md
+
+#  * primed-from-remote family -> re-fetch sampled experts with FRESH ranged
+#    reads of the pinned source and byte-compare (plus a full local hash of
+#    every expert span against the signed attestations)
+uv run tools/fq_verify.py --identity --segments ~/fq-primed/segments-336
+
+#  * expanded (derived-from) family -> re-derive every expert from its parent
+#    shared-h segment + profile and byte-compare in full, checking the
+#    parent sha256 pins
+uv run tools/fq_verify.py --identity \
+  --segments ~/fq-primed/segments-342/expanded \
+  --parent ~/fq-primed/segments-342/shared-h
+
+# numeric similarity (GPU, exllamav3 reference dequant): cosine / relative
+# Frobenius error / max|diff| between families and against BF16 ground truth
+CUDA_VISIBLE_DEVICES=0 python tools/fq_verify.py --similarity \
+  --family bm-k3=./segments,k=3 \
+  --family 342-k4=~/fq-primed/segments-342/expanded,k=4 \
+  --bf16 <bf16-snapshot-dir> --layers 3-10 --experts 24 --seed 42
+```
+
+Byte-identity is claimed only where it actually holds — whole shards for a
+fully repacked family, per-fragment for a primed layer window, full
+re-derivation for expanded views — and everything softer is reported as
+measured similarity, not identity. The complete proof table for the three
+GLM-5.2 community quants is in
+[docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md).
+
 ## Trust: where the key comes from
 
 Signature checking is only as good as the key you check against. Reading
@@ -296,8 +402,9 @@ and are being promoted into this repo as they stabilize.
 | `fq_repack` (checkpoint → segments) / `fq_assemble` (segments+recipe → checkpoint) | working, tested |
 | `fq_fetch` (recipe + sources → range-fetched segment tree) | working, tested; multi-source, content-hash selection, resumable |
 | Trust root (`keys/FINGERPRINTS`, `--trust-signer`, `fq-release/1`) | working, tested; per-source pinning and DSSE/in-toto envelopes still to come ([TRUST.md](TRUST.md)) |
-| GLM-5.2 K3 base segments on HF | **prepared, publication gated on verification enforcement** — built and locally verified, repo still private |
-| K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed from both, fragment byte-identity verified against fresh ranged reads of the pinned sources |
+| GLM-5.2 K3 base segments on HF | **prepared, publication gated on verification enforcement** — repo still private (401); reassembly **sha256-verified 76/76 MoE shards** |
+| K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
+| `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
 | Mixed-size (true mixed-K) assembly + loader metadata | done — mixed-K checkpoint assembled and booted |
 | K2/K5 tiers (fresh encodes) | window 1 (real GLM-5.2, layers 3–10) encoded and uploaded, `encode-of` attestations |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | loader boots from segments; live reallocation demonstrated at 0.4 s |

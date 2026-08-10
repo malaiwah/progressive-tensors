@@ -22,6 +22,10 @@ measured, what is implemented, and what is not.
   signed attestation before anything is finalized; resumable with plan
   digests so a changed recipe never resumes into a stale partial;
   `--dry-run` reports ranged bytes vs whole segment files vs whole repo.
+  Subset files are re-attested locally as `derived-from` (parents pinned by
+  digest, signed with your own `--sign-key`) because a subset is a new file
+  no publisher signature can cover — so a fetched tree assembles under a
+  pinned signer rather than needing `fq_assemble --insecure`.
 - **Trust root** — `keys/FINGERPRINTS` publishes the authorized ed25519
   signer fingerprints *in this git repository*, so a key's authority comes
   from reviewable commit history rather than from the artifact download.
@@ -58,8 +62,9 @@ measured, what is implemented, and what is not.
 - **README honesty pass** — an experimental-alpha banner; the artifact repo
   described as prepared and private rather than published; `fq-segment/1`
   described as schema v1, versioned and frozen once CI and verification
-  ship, rather than a "stable API"; the 79-vs-76 shard count reconciled (79
-  quantized layer shards, 76 rebuilt from segments, 3 dense pass-through);
+  ship, rather than a "stable API"; the shard-count contradiction reconciled
+  against the measurement (all 76 MoE shards rebuilt from segments — 278.5 GB
+  of expert bytes — with dense layers and embed/head passing through);
   the deduplication claim scoped to a segment family, since two independent
   K4 encodes of one expert differ (measured cosine 0.9934); `encode-of`
   qualified with its determinism scope, with `equivalence-of` named as the
@@ -85,7 +90,8 @@ Stated rather than shipped:
   verification enforcement landing.
 - One `--trust-signer` applies to a whole `fq_fetch` run: per-source
   pinning for multi-provider fetches is designed but not implemented.
-- `--trust-signer` is not yet wired into `fq_assemble` and `fq_prime`.
+- `--trust-signer` is not yet wired into `fq_prime` (`fq_assemble` verifies
+  and fails closed as of this release).
 - Attestation envelopes are ad-hoc `{payload, signature, keyid}`; migration
   to DSSE/in-toto and OpenSSF Model Signing compatibility is the intended
   direction, and transparency-log inclusion proofs are what would close the
