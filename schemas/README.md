@@ -19,6 +19,12 @@ fails the build.
 | [`fq-policy-2`](fq-policy-2.schema.json) | the recipe: one K per expert per layer | you, or a solver |
 | [`fq-release-1`](fq-release-1.schema.json) | `fq-release.json` — one signature over every file of a release | `fq_release` |
 
+One document deliberately has no schema yet: the `assembly-of` record
+`fq_assemble` writes (`fq-assembly.json`, declaring `fq-attestation/2`).
+It pins the recipe, every consumed fragment and every produced shard, and
+its shape is still settling alongside the verification work — a schema for
+it lands when it stops moving, rather than freezing a guess.
+
 ## Stability
 
 **These are schema v1 (and policy v2), versioned but not yet frozen.** The

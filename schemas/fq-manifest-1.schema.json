@@ -1,85 +1,311 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-manifest-1.schema.json",
-  "title": "fq-manifest/1 — segment tree manifest",
-  "description": "fq-manifest.json: what a directory of segments IS. Two shapes share the version. A FAMILY manifest describes one coherent set of segments (one base model, one layout, one predicate) and names its index file(s). A MULTI-SOURCE manifest (kind = multi-source) is a root pointing at several family directories, as fq_prime writes when it primes more than one upstream quant. signer_pubkey records which key signed the family's attestations — it is a convenience for locating the key, NOT the authority to trust it: authority comes from keys/FINGERPRINTS in the git repo (see TRUST.md). Derived from files emitted by fq_repack, fq_prime and fq_fetch (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ/fq-manifest.json, ~/fq-0c/fruit-segments/fq-manifest.json, ~/fq-primed/fq-manifest.json).",
+  "title": "fq-manifest/1 \u2014 segment tree manifest",
+  "description": "fq-manifest.json: what a directory of segments IS. Two shapes share the version. A FAMILY manifest describes one coherent set of segments (one base model, one layout, one predicate) and names its index file(s). A MULTI-SOURCE manifest (kind = multi-source) is a root pointing at several family directories, as fq_prime writes when it primes more than one upstream quant. signer_pubkey records which key signed the family's attestations \u2014 it is a convenience for locating the key, NOT the authority to trust it: authority comes from keys/FINGERPRINTS in the git repo (see TRUST.md). Derived from files emitted by fq_repack, fq_prime and fq_fetch (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ/fq-manifest.json, ~/fq-0c/fruit-segments/fq-manifest.json, ~/fq-primed/fq-manifest.json).",
   "oneOf": [
-    { "$ref": "#/$defs/family" },
-    { "$ref": "#/$defs/multi_source" }
+    {
+      "$ref": "#/$defs/family"
+    },
+    {
+      "$ref": "#/$defs/multi_source"
+    }
   ],
   "$defs": {
-    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "index_name": { "type": "string", "pattern": "^index-k[0-9]+\\.json$" },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "index_name": {
+      "type": "string",
+      "pattern": "^index-k[0-9]+\\.json$"
+    },
     "family": {
       "type": "object",
-      "required": ["schema", "predicate", "layout", "k_variants"],
+      "required": [
+        "schema",
+        "predicate",
+        "layout",
+        "k_variants"
+      ],
       "properties": {
-        "schema": { "const": "fq-manifest/1" },
+        "schema": {
+          "const": "fq-manifest/1"
+        },
         "kind": {
           "description": "family (default, may be omitted) or fetched-subset, written by fq_fetch for a tree holding only the experts a recipe needed",
-          "enum": ["family", "fetched-subset"]
+          "enum": [
+            "family",
+            "fetched-subset"
+          ]
         },
-        "predicate": { "enum": ["repack-of", "derived-from", "encode-of"] },
-        "layout": { "type": "string", "examples": ["rank_sliced_tp4", "shared_h_v1"] },
-        "base_model": { "type": ["string", "null"] },
-        "revision": { "type": ["string", "null"], "description": "revision of the source the segments were made from" },
-        "source_revision": { "type": ["string", "null"] },
+        "predicate": {
+          "enum": [
+            "repack-of",
+            "derived-from",
+            "encode-of"
+          ]
+        },
+        "layout": {
+          "type": "string",
+          "examples": [
+            "rank_sliced_tp4",
+            "shared_h_v1"
+          ]
+        },
+        "base_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "revision of the source the segments were made from"
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sources": {
           "type": "array",
           "description": "where the bytes came from: repo ids, repo@revision, or local:<tag> for a local encode",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
-        "k_variants": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 },
+        "k_variants": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 1
+        },
         "moe_layers": {
           "type": "array",
           "description": "[first, last] MoE layer covered, inclusive",
-          "items": { "type": "integer", "minimum": 0 },
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
           "minItems": 0,
           "maxItems": 2
         },
-        "num_experts": { "type": "integer", "minimum": 0 },
-        "hessian_id": { "type": ["string", "null"] },
-        "calibration_corpus_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
-        "tensor_index": { "$ref": "#/$defs/index_name", "description": "single-K families" },
+        "num_experts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hessian_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "calibration_corpus_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tensor_index": {
+          "$ref": "#/$defs/index_name",
+          "description": "single-K families"
+        },
         "tensor_indexes": {
           "type": "object",
           "description": "multi-K families: K (as a string) -> index file",
-          "propertyNames": { "pattern": "^[0-9]+$" },
-          "additionalProperties": { "$ref": "#/$defs/index_name" }
+          "propertyNames": {
+            "pattern": "^[0-9]+$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/index_name"
+          }
         },
-        "signer_pubkey": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
-        "fetched_utc": { "type": "string" }
+        "signer_pubkey": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fetched_utc": {
+          "type": "string"
+        },
+        "per_k": {
+          "type": "object",
+          "description": "multi-K families: per-K coverage, written by fq_repack when several K variants share one tree",
+          "propertyNames": {
+            "pattern": "^[0-9]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "$ref": "#/$defs/index_name"
+              },
+              "predicate": {
+                "enum": [
+                  "repack-of",
+                  "derived-from",
+                  "encode-of"
+                ]
+              },
+              "layers": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "maxItems": 2
+              },
+              "segment_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "num_experts": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "object"
+                  ]
+                }
+              },
+              "signers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/sha256"
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "signers": {
+          "type": "array",
+          "description": "every key that signed something in this tree; signer_pubkey names the primary one. Neither confers authority \u2014 see TRUST.md.",
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "upstream_signer": {
+          "description": "fetched-subset trees: the publisher key that was verified while fetching, kept distinct from signer_pubkey (which signs the local subset)",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "upstream_trust_rung": {
+          "type": "string",
+          "enum": [
+            "pinned",
+            "trust-root",
+            "unpinned",
+            "none"
+          ]
+        },
+        "note": {
+          "type": "string"
+        }
       },
       "anyOf": [
-        { "required": ["tensor_index"] },
-        { "required": ["tensor_indexes"] }
+        {
+          "required": [
+            "tensor_index"
+          ]
+        },
+        {
+          "required": [
+            "tensor_indexes"
+          ]
+        }
       ],
       "additionalProperties": true
     },
     "multi_source": {
       "type": "object",
-      "required": ["schema", "kind", "families"],
+      "required": [
+        "schema",
+        "kind",
+        "families"
+      ],
       "properties": {
-        "schema": { "const": "fq-manifest/1" },
-        "kind": { "const": "multi-source" },
-        "updated_utc": { "type": "string" },
+        "schema": {
+          "const": "fq-manifest/1"
+        },
+        "kind": {
+          "const": "multi-source"
+        },
+        "updated_utc": {
+          "type": "string"
+        },
         "families": {
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["path", "predicate", "layout", "k_variants"],
+            "required": [
+              "path",
+              "predicate",
+              "layout",
+              "k_variants"
+            ],
             "properties": {
-              "path": { "type": "string", "description": "family directory, relative to this manifest" },
-              "predicate": { "enum": ["repack-of", "derived-from", "encode-of"] },
-              "layout": { "type": "string" },
-              "k_variants": { "type": "array", "items": { "type": "integer" } },
-              "moe_layers": { "type": "array", "items": { "type": "integer" } },
+              "path": {
+                "type": "string",
+                "description": "family directory, relative to this manifest"
+              },
+              "predicate": {
+                "enum": [
+                  "repack-of",
+                  "derived-from",
+                  "encode-of"
+                ]
+              },
+              "layout": {
+                "type": "string"
+              },
+              "k_variants": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              },
+              "moe_layers": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              },
               "source": {
                 "type": "object",
                 "properties": {
-                  "repo": { "type": "string" },
-                  "revision": { "type": "string" }
+                  "repo": {
+                    "type": "string"
+                  },
+                  "revision": {
+                    "type": "string"
+                  }
                 },
                 "additionalProperties": true
               }
