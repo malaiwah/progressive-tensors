@@ -1,0 +1,27 @@
+# Progressive Tensors — authorized signer fingerprints (out-of-band trust root)
+#
+# THIS FILE IS THE TRUST ROOT.  Its authority comes from the git history of
+# github.com/malaiwah/progressive-tensors — not from any artifact repo.  A
+# consumer pins a fingerprint from here (or from a commit they have already
+# seen) and passes it to the tools with --trust-signer.  Never copy a key out
+# of the same download you are trying to verify.  See ../TRUST.md.
+#
+# Format: one record per line, whitespace-separated
+#   <fingerprint>  <key-id>  <status>  <added-utc>  <role>
+#
+# <fingerprint> is the ed25519 public key in lowercase hex (32 bytes, 64
+# chars).  For ed25519 the public key is smaller than a SHA-256 digest, so
+# the key IS its own fingerprint — there is nothing to hash.  It is the same
+# string that appears as "keyid" in fq-attestation/1 lines and as
+# "signer_pubkey" in fq-manifest/1.
+#
+# <status> is one of: active | retired | revoked
+#   active   accepted for new artifacts and for verification
+#   retired  no longer signs; signatures made before <retired-utc> stay valid
+#   revoked  reject, including retroactively — treat every signature as unproven
+#
+# Adding or changing a line here is a reviewable commit.  Rotation and
+# revocation happen the same way, so `git log -p keys/FINGERPRINTS` is the
+# complete, timestamped history of who was ever allowed to sign.
+
+a58b7bb79ba5845716aa6fee7d54e714ef243c2875f23a617e1ef3247c565525  malaiwah-fq-1  active  2026-08-10  segments,attestations,release-manifests
