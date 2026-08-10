@@ -143,15 +143,20 @@ def budget_solve(eps: dict, phi: "np.ndarray", layers: list[int],
     }
 
 
-def uniform_baseline(benefit_le: "np.ndarray", budget: int, L: int, E: int) -> float:
+def uniform_baseline(benefit_le, budget: int, L: int, E: int) -> float:
+    """Spend the SAME total budget as the solve, distributed as evenly as
+    integer counts allow (largest-remainder: the budget % L leftover slots
+    go one each to the first layers). Discarding the remainder would give
+    the baseline fewer slots than the solve and inflate the reported
+    advantage — peer-review finding, 2026-08-10."""
     _require_numpy()
-    per_layer = budget // L
+    base, rem = divmod(budget, L)
     total = 0.0
     for i in range(L):
+        take = min(base + (1 if i < rem else 0), E)
         row = np.sort(benefit_le[i])[::-1]
-        total += float(row[:per_layer].sum())
+        total += float(row[:take].sum())
     return total
-
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
