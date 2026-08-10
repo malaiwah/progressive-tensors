@@ -430,7 +430,11 @@ does, uploading each encode window as it finishes — leaves the branch head
 ahead of the last release manifest most of the time. At the release commit
 the file list is exact; at `main` there will usually be published segments
 newer than, and therefore not covered by, the release manifest, and
-`verify --complete` will correctly report them as unlisted. Nor does it say
+`verify --complete` will correctly report them as unlisted — and
+`fq-manifest.json`, which every incremental publish rebuilds from the live
+inventory, as `MISMATCHED`. A newer manifest and a tampered one look the
+same to a signature over an older release, and it should not pretend
+otherwise. Nor does it say
 anything about freshness: a replayed older release verifies perfectly and
 is simply stale, which is why the document carries `release`, `created_utc`
 and `parent_revision` for you to compare against what you expected. Pin

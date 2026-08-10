@@ -159,6 +159,14 @@ the completeness check telling you that "the branch" and "the release" are
 different things. Pin `--revision` to a release commit (or its tag) if you
 want `--complete` to mean something.
 
+One consequence worth naming before it alarms someone: an incremental
+publish also **rewrites `fq-manifest.json`** (deliberately — it is rebuilt
+from the live inventory so it always describes what is actually published).
+Verified against an older release, that file therefore reports as
+`MISMATCHED`, not merely unlisted. It is a newer manifest, not a tampered
+one; the signature cannot distinguish those two and must not pretend to.
+This is what "the release is a commit, not a branch" costs in practice.
+
 What `fq-release/1` still does not give you, in either mode, is
 **freshness**: a replayed older release verifies perfectly and is simply
 stale. Compare `release`, `created_utc` and `parent_revision` inside the
