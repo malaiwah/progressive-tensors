@@ -32,6 +32,19 @@ Think progressive JPEG, for quants.
   built on top (see Research), but everything in this repo works today
   with plain files.
 
+
+## The numbers behind it
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/eps-ladder-dark.svg"><img alt="Per-expert encode error vs bit-width: a clean geometric ladder, ~3.8x lower error per +1 bit (K2 0.0903, K3 0.0231, K4 0.0060, K5 0.0016)" src="assets/eps-ladder-light.svg"></picture>
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/benefit-concentration-dark.svg"><img alt="Cumulative share of K3-to-K4 upgrade benefit vs experts ranked by benefit: strongly concave - the top 16 of 256 experts carry about a third of the total benefit" src="assets/benefit-concentration-light.svg"></picture>
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/k4-allocation-dark.svg"><img alt="K4 experts allocated per layer at a fixed global budget: far from uniform, ranging 42 to 152 across layers" src="assets/k4-allocation-light.svg"></picture>
+
+*All three measured on the GLM-5.2-architecture proxy: one sealed 1.05M-token
+capture, four hessian-identical encodes (K2/K3/K4/K5) with the sha-pinned
+production encoder. Full campaign data and reports in the research branch.*
+
 ## Quickstart: verify + reassemble
 
 Segments for **GLM-5.2** (from
