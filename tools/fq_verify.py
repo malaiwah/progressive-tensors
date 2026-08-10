@@ -43,13 +43,24 @@ Two modes, one per proof rung (see runs/0c-campaign/ATTESTATION-V2.md):
            equivalence-of predicate: byte-identity where it should hold,
            bounded numeric similarity where it should not.
 
+Trust.  Every attestation this tool reads is verified through fq_trust
+against a signer the CALLER chose: --trust-signer <fingerprint> pinned out
+of band, or a key listed active in keys/FINGERPRINTS (git, not the artifact
+download).  The family's own fq-manifest.json is never the authority — an
+attacker who rewrites a family rewrites that field too.  There is no
+"unverified but probably fine" state: a missing attestation, an
+unverifiable line, a placeholder signature, or a missing per-expert digest
+is a FAILURE and the process exits non-zero.  --insecure-skip-signatures
+still prints the byte-level report, but such a run can never exit 0.
+
 Outputs: human-readable progress on stdout, plus --json (machine report) and
 --md (markdown table) files.
 
 Examples:
   # end-to-end shard identity, K3 family vs local brandonmusic snapshot
   fq_verify.py --identity --segments ~/fq-segments/GLM-5.2-EXL3-FQ \
-      --source <snapshot-dir> --json id-k3.json --md id-k3.md
+      --source <snapshot-dir> --trust-signer <fingerprint> \
+      --json id-k3.json --md id-k3.md
 
   # fragment identity of a primed family vs fresh HF ranged reads
   fq_verify.py --identity --segments ~/fq-primed/segments-336 --sample 3
@@ -67,7 +78,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import mmap
@@ -81,9 +91,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fq_repack import EXPERT_RE, PROJ_ORDER, expert_key, read_header  # noqa: E402
 from fq_assemble import SegmentReader  # noqa: E402
 import fq_prime  # noqa: E402  (Transport, SHARED_RE, parse_int_set)
+import fq_trust  # noqa: E402
+from fq_trust import TrustError  # noqa: E402
 
 CHUNK = 1 << 24
 PROJS = ("gate_proj", "up_proj", "down_proj")
+
+# load_attestation() states.  Only VERIFIED is evidence; NOT_CHECKED exists
+# solely because the operator passed --insecure-skip-signatures and asked to
+# be told nothing is proven.
+ATT_VERIFIED = "verified"
+ATT_NOT_CHECKED = "NOT CHECKED"
+ATT_MISSING = "MISSING"
 
 
 def now_utc() -> str:
@@ -160,29 +179,78 @@ def segment_meta(fam: Path, entry: dict) -> dict:
     return read_header(fam / entry["file"])[0].get("__metadata__", {})
 
 
-def load_attestation(fam: Path, stem: str, pubkey_hex: str | None):
-    """(payload, sig_state) for attestations/<stem>.jsonl; sig_state is
-    'verified', 'BAD', 'unverified' (no pynacl / no pubkey) or None (missing
-    file)."""
+def make_verifier(args, manifest: dict) -> fq_trust.Verifier:
+    """The trust decision for this run, from the CLI and the trust root.
+
+    Never from the artifact: the family's own fq-manifest.json names a
+    signer, and an attacker who rewrites the family rewrites that field
+    too.  fq_trust resolves --trust-signer against keys/FINGERPRINTS (git,
+    not the download) and fails closed when the caller pinned nothing and
+    the trust root cannot vouch for the claimed key.
+    """
+    return fq_trust.Verifier.from_args(args, manifest=manifest)
+
+
+def load_attestation(fam: Path, stem: str, verifier: fq_trust.Verifier,
+                     fragment_file: str | None = None):
+    """(payload, state) for attestations/<stem>.jsonl.
+
+    The file is JSON Lines and is treated as such: every line is checked,
+    and the returned payload is merged from the lines that a TRUSTED key
+    signed and that name this fragment.  Decoding is never mistaken for
+    verifying, and the signer never comes from the artifact.
+
+    state is ATT_VERIFIED when at least one trusted line covered the
+    fragment, ATT_NOT_CHECKED on the --insecure-skip-signatures rung,
+    ATT_MISSING when the file is absent, and "BAD: <reason>" when lines
+    exist but none of them can be trusted.  Every state other than
+    ATT_VERIFIED (and ATT_NOT_CHECKED, which the operator asked for
+    explicitly) is a verification FAILURE at the call site.
+    """
     p = fam / "attestations" / f"{stem}.jsonl"
     if not p.exists():
-        return None, None
-    line = json.loads(p.read_text())
-    payload = json.loads(base64.b64decode(line["payload"]))
-    state = "unverified"
-    if pubkey_hex:
+        return None, ATT_MISSING
+    merged: dict = {}
+    reasons: list[str] = []
+    for n, raw in enumerate(p.read_text().splitlines(), 1):
+        if not raw.strip():
+            continue
         try:
-            from nacl.signing import VerifyKey
-            try:
-                VerifyKey(bytes.fromhex(pubkey_hex)).verify(
-                    base64.b64decode(line["payload"]),
-                    base64.b64decode(line["signature"]))
-                state = "verified"
-            except Exception:  # noqa: BLE001 — any failure is a bad signature
-                state = "BAD"
-        except ImportError:
-            pass
-    return payload, state
+            payload = verifier.verify_envelope(json.loads(raw),
+                                               where=f"{p.name}:{n}")
+        except (TrustError, json.JSONDecodeError, TypeError) as e:
+            reasons.append(f"line {n}: {e}")
+            continue
+        frag = payload.get("fragment") or {}
+        if fragment_file and frag.get("file") not in (None, fragment_file):
+            continue
+        if not merged:
+            merged = dict(payload)
+            merged["expert_sha256"] = dict(payload.get("expert_sha256") or {})
+        else:
+            merged["expert_sha256"].update(payload.get("expert_sha256") or {})
+            merged.setdefault("fragment", frag)
+    if not merged:
+        detail = "; ".join(reasons) or "no signed line names this fragment"
+        return None, f"BAD: {detail}"
+    state = (ATT_NOT_CHECKED if verifier.rung == fq_trust.RUNG_NONE
+             else ATT_VERIFIED)
+    return merged, state
+
+
+def attestation_ok(state: str | None) -> bool:
+    """Only a positive verification counts.  MISSING, BAD and (on the
+    explicit --insecure-skip-signatures rung) NOT CHECKED are all failures
+    of the proof; the flag chooses whether the run continues, not whether
+    the evidence exists."""
+    return state == ATT_VERIFIED
+
+
+def trust_report(verifier: fq_trust.Verifier) -> dict:
+    return {"rung": verifier.rung, "signer": verifier.fingerprint,
+            "key_id": verifier.key_id,
+            "signatures_verified": verifier.checked,
+            "summary": verifier.summary()}
 
 
 # --------------------------------------------------------- identity: local
@@ -236,6 +304,7 @@ def cmd_identity_local(args) -> tuple[int, dict]:
         return 2, {}
     manifest_path = fam / "fq-manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    verifier = make_verifier(args, manifest)
     source_shas = {}
     mf = src / "MANIFEST.sha256"
     if mf.exists():
@@ -294,19 +363,25 @@ def cmd_identity_local(args) -> tuple[int, dict]:
             if entry is None:
                 continue
             payload, sig = load_attestation(
-                fam, f"layer-{layer:03d}.k{k}", manifest.get("signer_pubkey"))
+                fam, f"layer-{layer:03d}.k{k}", verifier, entry["file"])
             if payload is None:
-                att_rows.append({"layer": layer, "k": k, "status": "no-attestation"})
+                # No trusted attestation is not "nothing to check": it is a
+                # failed check.  An unsigned fragment proves nothing.
+                failures += 1
+                att_rows.append({"layer": layer, "k": k, "signature": sig,
+                                 "status": "no trusted attestation"})
+                print(f"attestation layer {layer:3d} k{k}: {sig}", flush=True)
                 continue
             seg = fam / entry["file"]
-            frag_ok = file_sha256(seg) == payload["fragment"]["sha256"]
+            frag_ok = file_sha256(seg) == payload.get("fragment", {}).get("sha256")
             n_bad = 0
             for eid, (lo, hi) in entry["experts"].items():
                 got = span_sha256(seg, entry["body_offset"] + lo,
                                   entry["body_offset"] + hi)
+                # a MISSING digest is a mismatch: None never equals a sha
                 if payload.get("expert_sha256", {}).get(str(eid)) != got:
                     n_bad += 1
-            ok = frag_ok and n_bad == 0 and sig != "BAD"
+            ok = frag_ok and n_bad == 0 and attestation_ok(sig)
             failures += 0 if ok else 1
             att_rows.append({"layer": layer, "k": k, "signature": sig,
                              "fragment_sha_match": frag_ok,
@@ -316,12 +391,14 @@ def cmd_identity_local(args) -> tuple[int, dict]:
                   f"{'ok' if frag_ok else 'MISMATCH'} experts="
                   f"{len(entry['experts'])} bad={n_bad}", flush=True)
 
+    print(verifier.summary(), flush=True)
     report = {
         "mode": "identity", "check": "local", "created_utc": now_utc(),
         "segments": str(fam), "source": str(src),
         "family_manifest": {k: manifest.get(k) for k in
                             ("predicate", "layout", "sources", "revision",
                              "source_revision", "signer_pubkey")},
+        "trust": trust_report(verifier),
         "layers": rows, "attestation_sample": att_rows,
         "summary": {"shards": len(rows),
                     "shards_matched": sum(r["match"] for r in rows),
@@ -354,7 +431,7 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
         return 2, {}
     manifest_path = fam / "fq-manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    pubkey = manifest.get("signer_pubkey")
+    verifier = make_verifier(args, manifest)
     wanted = parse_layers(args.layers)
     transport = fq_prime.Transport(pace=args.pace)
     rng = random.Random(args.seed)
@@ -368,17 +445,21 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
             if wanted is not None and layer not in wanted:
                 continue
             seg = fam / entry["file"]
-            payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}", pubkey)
+            payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}",
+                                            verifier, entry["file"])
             seg_sha = file_sha256(seg)
             index_ok = seg_sha == entry["sha256"]
-            att_ok = payload is not None and seg_sha == payload["fragment"]["sha256"]
+            att_ok = (payload is not None
+                      and seg_sha == payload.get("fragment", {}).get("sha256"))
             n_bad = 0
+            # No payload means no per-expert digests to check against: that is
+            # len(experts) unproven spans, not zero mismatches.
             for eid, (lo, hi) in entry["experts"].items():
                 got = span_sha256(seg, entry["body_offset"] + lo,
                                   entry["body_offset"] + hi)
-                if payload and payload.get("expert_sha256", {}).get(str(eid)) != got:
+                if (payload or {}).get("expert_sha256", {}).get(str(eid)) != got:
                     n_bad += 1
-            ok = index_ok and att_ok and n_bad == 0 and sig != "BAD"
+            ok = index_ok and att_ok and n_bad == 0 and attestation_ok(sig)
             failures += 0 if ok else 1
             local_rows.append({"layer": layer, "k": k, "file": entry["file"],
                                "index_sha_match": index_ok,
@@ -481,12 +562,14 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
         finally:
             reader.close()
 
+    print(verifier.summary(), flush=True)
     report = {
         "mode": "identity", "check": "remote", "created_utc": now_utc(),
         "segments": str(fam),
         "family_manifest": {k: manifest.get(k) for k in
                             ("predicate", "layout", "sources", "revision",
                              "source_revision", "signer_pubkey")},
+        "trust": trust_report(verifier),
         "local_integrity": local_rows,
         "remote_fragments": remote_rows,
         "shared_profiles": profile_rows,
@@ -522,7 +605,7 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
     if parent is None:
         parent = fam.parent / "shared-h"
     wanted = parse_layers(args.layers)
-    pubkey = manifest.get("signer_pubkey")
+    verifier = make_verifier(args, manifest)
     parent_sha_cache: dict[Path, str] = {}
 
     def parent_sha(p: Path) -> str:
@@ -546,7 +629,8 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
             prof_path = parent / meta["parent_profile"]
             pin_seg_ok = parent_sha(pseg_path) == meta["parent_segment_sha256"]
             pin_prof_ok = parent_sha(prof_path) == meta["parent_profile_sha256"]
-            payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}", pubkey)
+            payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}",
+                                            verifier, entry["file"])
 
             exp = SegmentReader(seg_path)
             par = SegmentReader(pseg_path)
@@ -575,7 +659,7 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
                     if got != want:
                         n_bad += 1
                 ok = (n_bad == 0 and pin_seg_ok and pin_prof_ok
-                      and sig != "BAD")
+                      and attestation_ok(sig))
                 failures += 0 if ok else 1
                 rows.append({
                     "layer": layer, "k": k, "file": entry["file"],
@@ -600,12 +684,14 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
                 par.close()
                 prof.close()
 
+    print(verifier.summary(), flush=True)
     report = {
         "mode": "identity", "check": "derived", "created_utc": now_utc(),
         "segments": str(fam), "parent": str(parent),
         "family_manifest": {k: manifest.get(k) for k in
                             ("predicate", "layout", "derived_rule",
                              "parent_family", "signer_pubkey")},
+        "trust": trust_report(verifier),
         "layers": rows,
         "summary": {
             "segments_checked": len(rows),
@@ -1032,6 +1118,7 @@ def main(argv=None) -> int:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--json", type=Path, default=None)
     p.add_argument("--md", type=Path, default=None)
+    fq_trust.add_trust_arguments(p)
     args = p.parse_args(argv)
 
     if args.similarity:
@@ -1045,14 +1132,24 @@ def main(argv=None) -> int:
         if check == "auto":
             check = detect_check(args.segments, args.source)
             print(f"identity check: {check}", flush=True)
-        if check == "local":
-            if args.source is None:
-                p.error("--check local requires --source")
-            rc, report = cmd_identity_local(args)
-        elif check == "remote":
-            rc, report = cmd_identity_remote(args)
-        else:
-            rc, report = cmd_identity_derived(args)
+        try:
+            if check == "local":
+                if args.source is None:
+                    p.error("--check local requires --source")
+                rc, report = cmd_identity_local(args)
+            elif check == "remote":
+                rc, report = cmd_identity_remote(args)
+            else:
+                rc, report = cmd_identity_derived(args)
+        except TrustError as e:
+            # A verification tool that cannot decide who to trust has not
+            # verified anything.  Say so and fail.
+            print(f"TRUST FAILURE: {e}", file=sys.stderr)
+            return 1
+        if args.insecure_skip_signatures:
+            print("--insecure-skip-signatures: no signature was checked, so "
+                  "this run proves nothing about provenance and exits "
+                  "non-zero by definition", file=sys.stderr, flush=True)
     if report:
         write_reports(report, args.json, args.md)
         if not args.md:

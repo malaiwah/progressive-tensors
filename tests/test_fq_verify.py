@@ -1,7 +1,10 @@
 """Tests for fq_verify: metric math on known-identical vs known-perturbed
 tensors, streaming local identity (pass, corruption detection, and agreement
 with fq_assemble's materialized output), remote fragment identity against a
-monkeypatched HTTP source, and full re-derivation of expanded families."""
+monkeypatched HTTP source, full re-derivation of expanded families, and the
+trust rules — the signer is pinned by the caller, and anything short of a
+positive verification fails the run."""
+import base64
 import hashlib
 import json
 import sys
@@ -13,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_assemble  # noqa: E402
 import fq_repack  # noqa: E402
+import fq_trust  # noqa: E402
 import fq_verify  # noqa: E402
 from test_fq_prime import build_repo, prime, served  # noqa: E402,F401
 from test_fq_repack import LAYERS, E, write_shard  # noqa: E402
@@ -24,6 +28,29 @@ def _supports_trust() -> bool:
     different sync points, so probe instead of assuming."""
     import inspect
     return "--trust-signer" in inspect.getsource(fq_assemble)
+
+
+def signer_of(family: Path) -> str:
+    """The fingerprint the family claims — which a consumer confirms out of
+    band and then PINS.  Tests pin it explicitly, exactly as a user must."""
+    return json.loads((family / "fq-manifest.json").read_text())["signer_pubkey"]
+
+
+def pin(family: Path) -> list[str]:
+    return ["--trust-signer", signer_of(family)]
+
+
+def att_lines(family: Path, stem: str) -> Path:
+    return family / "attestations" / f"{stem}.jsonl"
+
+
+def resign(path: Path, key: Path, mutate) -> None:
+    """Rewrite an attestation line's payload and re-sign it with `key`, so a
+    test can change what the signature actually covers."""
+    envelope = json.loads(path.read_text().splitlines()[0])
+    payload = json.loads(base64.b64decode(envelope["payload"]))
+    mutate(payload)
+    path.write_text(fq_repack.Signer(key).sign_line(payload) + "\n")
 
 
 # ---------------------------------------------------------------- metrics
@@ -93,7 +120,7 @@ def test_identity_local_pass(tmp_path, capsys):
     snap, seg = _k3_workspace(tmp_path)
     rc = fq_verify.main([
         "--identity", "--segments", str(seg), "--source", str(snap),
-        "--attest", "all", "--seed", "0",
+        "--attest", "all", "--seed", "0", *pin(seg),
         "--json", str(tmp_path / "r.json"), "--md", str(tmp_path / "r.md")])
     assert rc == 0
     report = json.loads((tmp_path / "r.json").read_text())
@@ -147,7 +174,8 @@ def test_identity_local_detects_corruption(tmp_path):
     p.write_bytes(bytes(raw))
     rc = fq_verify.main([
         "--identity", "--segments", str(seg), "--source", str(snap),
-        "--attest", "all", "--seed", "0", "--json", str(tmp_path / "r.json")])
+        "--attest", "all", "--seed", "0", *pin(seg),
+        "--json", str(tmp_path / "r.json")])
     assert rc == 1
     report = json.loads((tmp_path / "r.json").read_text())
     bad = [r for r in report["layers"] if not r["match"]]
@@ -164,8 +192,8 @@ def test_identity_remote_pass(served, tmp_path):
     fam = srv_tmp / "primed" / "segments-sh" / "shared-h"
     rc = fq_verify.main([
         "--identity", "--segments", str(fam), "--sample", "all",
-        "--pace", "0", "--seed", "1", "--json", str(tmp_path / "r.json"),
-        "--md", str(tmp_path / "r.md")])
+        "--pace", "0", "--seed", "1", *pin(fam),
+        "--json", str(tmp_path / "r.json"), "--md", str(tmp_path / "r.md")])
     assert rc == 0
     report = json.loads((tmp_path / "r.json").read_text())
     assert report["check"] == "remote"
@@ -191,7 +219,8 @@ def test_identity_remote_detects_corruption(served, tmp_path):
     p.write_bytes(bytes(raw))
     rc = fq_verify.main([
         "--identity", "--segments", str(fam), "--sample", "all",
-        "--pace", "0", "--seed", "1", "--json", str(tmp_path / "r.json")])
+        "--pace", "0", "--seed", "1", *pin(fam),
+        "--json", str(tmp_path / "r.json")])
     assert rc == 1
     report = json.loads((tmp_path / "r.json").read_text())
     # both the local integrity pass and the remote byte comparison catch it
@@ -209,7 +238,7 @@ def test_identity_derived_pass(served, tmp_path):
     assert prime(srv_tmp, "segments-sh", ["--expand"]) == 0
     fam = srv_tmp / "primed" / "segments-sh" / "expanded"
     rc = fq_verify.main([
-        "--identity", "--segments", str(fam),
+        "--identity", "--segments", str(fam), *pin(fam),
         "--parent", str(srv_tmp / "primed" / "segments-sh" / "shared-h"),
         "--json", str(tmp_path / "r.json"), "--md", str(tmp_path / "r.md")])
     assert rc == 0
@@ -241,7 +270,7 @@ def test_identity_derived_detects_bad_replica(served, tmp_path):
     raw[body + hdr[name]["data_offsets"][0]] ^= 0x01
     seg.write_bytes(bytes(raw))
     rc = fq_verify.main([
-        "--identity", "--segments", str(fam),
+        "--identity", "--segments", str(fam), *pin(fam),
         "--parent", str(srv_tmp / "primed" / "segments-sh" / "shared-h"),
         "--json", str(tmp_path / "r.json")])
     assert rc == 1
@@ -262,11 +291,217 @@ def test_identity_derived_detects_parent_pin_break(served, tmp_path):
     raw[-1] ^= 0x80
     prof.write_bytes(bytes(raw))
     rc = fq_verify.main([
-        "--identity", "--segments", str(fam), "--parent", str(sh),
+        "--identity", "--segments", str(fam), "--parent", str(sh), *pin(fam),
         "--json", str(tmp_path / "r.json")])
     assert rc == 1
     report = json.loads((tmp_path / "r.json").read_text())
     assert any(not r["parent_profile_sha_match"] for r in report["layers"])
+
+
+# ------------------------------------------------------ trust rules (P1-4a)
+
+def _local_run(tmp_path, seg, snap, *extra, json_name="r.json"):
+    return fq_verify.main([
+        "--identity", "--segments", str(seg), "--source", str(snap),
+        "--attest", "all", "--seed", "0", *extra,
+        "--json", str(tmp_path / json_name)])
+
+
+def test_verify_refuses_without_a_pin_or_trust_root(tmp_path, capsys):
+    """The signer must come from the caller, never from the artifact.  With
+    no pin and a trust root that does not list the family's key, the run is
+    a TRUST FAILURE — not a pass with 'unverified' next to it."""
+    snap, seg = _k3_workspace(tmp_path)
+    empty_root = tmp_path / "root"
+    empty_root.mkdir()
+    (empty_root / "FINGERPRINTS").write_text("# nobody is trusted here\n")
+    rc = _local_run(tmp_path, seg, snap, "--trust-root", str(empty_root))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "TRUST FAILURE" in err
+    assert not (tmp_path / "r.json").exists()
+
+
+def test_verify_refuses_a_signer_the_trust_root_does_not_list(tmp_path, capsys):
+    """A rewritten repo names its own key in fq-manifest.json.  Against a
+    real trust root that key is simply not listed, and that is fatal."""
+    snap, seg = _k3_workspace(tmp_path)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "FINGERPRINTS").write_text(
+        f"{'ab' * 32}  someone-else  active  2026-08-10  segments\n")
+    assert _local_run(tmp_path, seg, snap, "--trust-root", str(root)) == 1
+    assert "TRUST FAILURE" in capsys.readouterr().err
+
+
+def test_verify_rejects_a_signer_swap(tmp_path, capsys):
+    """The finding itself: an attacker re-signs every attestation with their
+    own key and updates the manifest to match.  Self-consistent — and
+    refused, because the pin came from the user."""
+    snap, seg = _k3_workspace(tmp_path)
+    good = signer_of(seg)
+    evil = fq_repack.Signer(tmp_path / "evil.key")
+    for att in sorted((seg / "attestations").glob("*.jsonl")):
+        payload = json.loads(base64.b64decode(
+            json.loads(att.read_text().splitlines()[0])["payload"]))
+        att.write_text(evil.sign_line(payload) + "\n")
+    manifest = json.loads((seg / "fq-manifest.json").read_text())
+    manifest["signer_pubkey"] = evil.pub_hex
+    (seg / "fq-manifest.json").write_text(json.dumps(manifest, indent=1))
+    assert signer_of(seg) != good
+    # pinned to the key the user actually trusts -> refused
+    assert _local_run(tmp_path, seg, snap, "--trust-signer", good) == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert report["summary"]["failures"] == len(report["attestation_sample"])
+    assert all("the trusted signer is" in a["signature"]
+               for a in report["attestation_sample"])
+    assert report["trust"]["signer"] == good
+    capsys.readouterr()
+    # ... and taking the signer from the artifact (the old behaviour) is not
+    # something the CLI can even be asked to do without saying so out loud
+    assert _local_run(tmp_path, seg, snap, "--allow-unpinned-signer",
+                      json_name="unpinned.json") == 0
+    report = json.loads((tmp_path / "unpinned.json").read_text())
+    assert report["trust"]["rung"] == fq_trust.RUNG_UNPINNED
+
+
+def test_verify_rejects_a_tampered_signature(tmp_path):
+    snap, seg = _k3_workspace(tmp_path)
+    att = att_lines(seg, f"layer-{LAYERS[0]:03d}.k3")
+    envelope = json.loads(att.read_text().splitlines()[0])
+    sig = bytearray(base64.b64decode(envelope["signature"]))
+    sig[0] ^= 0xFF
+    envelope["signature"] = base64.b64encode(bytes(sig)).decode()
+    att.write_text(json.dumps(envelope) + "\n")
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    bad = [a for a in report["attestation_sample"]
+           if a["signature"].startswith("BAD")]
+    assert bad and "BAD SIGNATURE" in bad[0]["signature"]
+
+
+def test_verify_rejects_a_placeholder_signature(tmp_path):
+    """'AA==' decodes fine and proves nothing."""
+    snap, seg = _k3_workspace(tmp_path)
+    att = att_lines(seg, f"layer-{LAYERS[0]:03d}.k3")
+    envelope = json.loads(att.read_text().splitlines()[0])
+    envelope["signature"] = base64.b64encode(b"\x00" * 64).decode()
+    att.write_text(json.dumps(envelope) + "\n")
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert any(a["signature"].startswith("BAD")
+               for a in report["attestation_sample"])
+
+
+def test_verify_rejects_a_missing_attestation(tmp_path):
+    """Absent evidence is a failed check, not a skipped one."""
+    snap, seg = _k3_workspace(tmp_path)
+    att_lines(seg, f"layer-{LAYERS[0]:03d}.k3").unlink()
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert any(a["signature"] == fq_verify.ATT_MISSING
+               for a in report["attestation_sample"])
+    assert report["summary"]["failures"] >= 1
+
+
+def test_verify_rejects_an_empty_attestation_file(tmp_path):
+    snap, seg = _k3_workspace(tmp_path)
+    att_lines(seg, f"layer-{LAYERS[0]:03d}.k3").write_text("")
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 1
+
+
+def test_verify_rejects_a_missing_expert_digest(tmp_path):
+    """A validly signed line that simply omits an expert proves nothing
+    about that expert's bytes."""
+    snap, seg = _k3_workspace(tmp_path)
+    att = att_lines(seg, f"layer-{LAYERS[0]:03d}.k3")
+    resign(att, tmp_path / "k.key",
+           lambda p: p["expert_sha256"].pop(sorted(p["expert_sha256"])[0]))
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert any(a["expert_sha_mismatches"] >= 1
+               for a in report["attestation_sample"]
+               if "expert_sha_mismatches" in a)
+
+
+def test_verify_iterates_every_jsonl_line(tmp_path):
+    """The file is JSON Lines: a leading line signed by someone else (say a
+    countersignature) must not hide the line that does verify."""
+    snap, seg = _k3_workspace(tmp_path)
+    stranger = fq_repack.Signer(tmp_path / "stranger.key")
+    for att in sorted((seg / "attestations").glob("*.jsonl")):
+        good = att.read_text().splitlines()[0]
+        payload = json.loads(base64.b64decode(json.loads(good)["payload"]))
+        att.write_text(stranger.sign_line(payload) + "\n" + good + "\n")
+    assert _local_run(tmp_path, seg, snap, *pin(seg)) == 0
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert all(a["signature"] == "verified"
+               for a in report["attestation_sample"])
+    assert report["summary"]["failures"] == 0
+
+
+def test_verify_insecure_skip_can_never_exit_zero(tmp_path, capsys):
+    """The escape hatch prints the byte report and still fails: a run that
+    checked no signature has not verified anything."""
+    snap, seg = _k3_workspace(tmp_path)
+    rc = _local_run(tmp_path, seg, snap, "--insecure-skip-signatures")
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "proves nothing" in err
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert report["trust"]["rung"] == fq_trust.RUNG_NONE
+    assert all(a["signature"] == fq_verify.ATT_NOT_CHECKED
+               for a in report["attestation_sample"])
+    # the byte-level work still happened and still matched
+    assert report["summary"]["shards_matched"] == len(LAYERS)
+
+
+def test_verify_remote_requires_a_pin(served, tmp_path, capsys):
+    srv_tmp, calls = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh") == 0
+    fam = srv_tmp / "primed" / "segments-sh" / "shared-h"
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "FINGERPRINTS").write_text("# empty\n")
+    rc = fq_verify.main([
+        "--identity", "--segments", str(fam), "--sample", "1",
+        "--pace", "0", "--seed", "1", "--trust-root", str(root)])
+    assert rc == 1
+    assert "TRUST FAILURE" in capsys.readouterr().err
+
+
+def test_verify_remote_rejects_a_missing_attestation(served, tmp_path):
+    srv_tmp, calls = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh") == 0
+    fam = srv_tmp / "primed" / "segments-sh" / "shared-h"
+    next(iter((fam / "attestations").glob("layer-*.k*.jsonl"))).unlink()
+    rc = fq_verify.main([
+        "--identity", "--segments", str(fam), "--sample", "all",
+        "--pace", "0", "--seed", "1", *pin(fam),
+        "--json", str(tmp_path / "r.json")])
+    assert rc == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert any(r["signature"] == fq_verify.ATT_MISSING
+               for r in report["local_integrity"])
+
+
+def test_verify_derived_rejects_a_missing_attestation(served, tmp_path):
+    srv_tmp, calls = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh", ["--expand"]) == 0
+    sh = srv_tmp / "primed" / "segments-sh" / "shared-h"
+    fam = srv_tmp / "primed" / "segments-sh" / "expanded"
+    for att in (fam / "attestations").glob("*.jsonl"):
+        att.unlink()
+    rc = fq_verify.main([
+        "--identity", "--segments", str(fam), "--parent", str(sh), *pin(fam),
+        "--json", str(tmp_path / "r.json")])
+    assert rc == 1
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert all(r["signature"] == fq_verify.ATT_MISSING
+               for r in report["layers"])
 
 
 # ------------------------------------------------------------ auto-detect
