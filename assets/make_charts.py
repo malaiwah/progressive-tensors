@@ -4,7 +4,18 @@
 Three charts x light/dark, static SVG (no hover layer in READMEs).
 Palette: validated reference instance (dataviz skill) — single-series
 charts use categorical slot 1; text wears text tokens, never series color.
+
+The campaign inputs live in the research repo and in the encoder work
+dirs, neither of which is public, so their locations are ARGUMENTS.  The
+defaults are the paths on the machine the published charts were made on:
+running this with no arguments there reproduces assets/*.svg exactly.
+Elsewhere, point --analysis / --work-root at your own campaign output.
+
+    make_charts.py                                   # reproduce as published
+    make_charts.py --analysis eps-analysis.json \
+                   --work-root ./fq-0c --out ./charts
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -15,9 +26,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).parent
-ANALYSIS = json.loads(Path(
+REPO = HERE.parent
+
+# Defaults: where the published charts' inputs live on the build machine.
+DEFAULT_ANALYSIS = Path(
     "/home/mbelleau/protensors-work/vllm-voipmonitor/research/fungible-quant/"
-    "runs/0c-campaign/eps-analysis.json").read_text())
+    "runs/0c-campaign/eps-analysis.json")
+DEFAULT_WORK_ROOT = Path("/home/mbelleau/fq-0c")
+DEFAULT_FQ_EPS = Path(
+    "/home/mbelleau/protensors-work/vllm-voipmonitor/research/fungible-quant/tools")
+
+ANALYSIS: dict = {}
+OUT_DIR = HERE
+WORK_ROOT = DEFAULT_WORK_ROOT
+FQ_EPS_DIR = DEFAULT_FQ_EPS
 
 MODES = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e",
@@ -48,7 +70,7 @@ def fig_ax(m, w=7.2, h=4.0):
 
 def save(f, name, mode):
     f.tight_layout(pad=1.2)
-    f.savefig(HERE / f"{name}-{mode}.svg", facecolor=f.get_facecolor(),
+    f.savefig(OUT_DIR / f"{name}-{mode}.svg", facecolor=f.get_facecolor(),
               bbox_inches="tight")
     f2 = None
     plt.close(f)
@@ -83,11 +105,12 @@ def eps_ladder(mode, m):
 
 
 def benefit_concentration(mode, m):
-    sys.path.insert(0, "/home/mbelleau/protensors-work/vllm-voipmonitor/"
-                       "research/fungible-quant/tools")
+    for candidate in (REPO / "tools", FQ_EPS_DIR):
+        if (candidate / "fq_eps.py").exists():
+            sys.path.insert(0, str(candidate))
+            break
     import fq_eps
-    eps, phi, layers = fq_eps.load_eps(
-        Path("/home/mbelleau/fq-0c"), [3, 4])
+    eps, phi, layers = fq_eps.load_eps(WORK_ROOT, [3, 4])
     delta = eps[3] - eps[4]
     phi_n = phi / np.maximum(phi.sum(axis=1, keepdims=True), 1)
     benefit = delta * phi_n
@@ -153,8 +176,53 @@ def allocation(mode, m):
     save(f, "k4-allocation", mode)
 
 
-for mode, m in MODES.items():
-    eps_ladder(mode, m)
-    benefit_concentration(mode, m)
-    allocation(mode, m)
-print("charts written:", sorted(p.name for p in HERE.glob("*.svg")))
+def main(argv=None) -> int:
+    global ANALYSIS, OUT_DIR, WORK_ROOT, FQ_EPS_DIR
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--analysis", type=Path, default=DEFAULT_ANALYSIS,
+                   help="eps-analysis.json from the 0c campaign "
+                        "(default: the research-repo path used for the "
+                        "published charts)")
+    p.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT,
+                   help="encoder work-dir root that fq_eps.load_eps reads "
+                        "(per-K done JSONs)")
+    p.add_argument("--fq-eps-dir", type=Path, default=DEFAULT_FQ_EPS,
+                   help="fallback directory holding fq_eps.py, when it is "
+                        "not next to this repo's tools/")
+    p.add_argument("--out", type=Path, default=HERE,
+                   help="where to write the SVGs (default: this assets/ dir)")
+    p.add_argument("--charts", default="all",
+                   help="comma-separated subset of: eps-ladder, "
+                        "benefit-concentration, k4-allocation")
+    args = p.parse_args(argv)
+
+    if not args.analysis.exists():
+        p.error(f"{args.analysis} not found — pass --analysis pointing at an "
+                f"eps-analysis.json (the campaign data is not in this repo)")
+    ANALYSIS = json.loads(args.analysis.read_text())
+    OUT_DIR = args.out
+    WORK_ROOT = args.work_root
+    FQ_EPS_DIR = args.fq_eps_dir
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    known = {"eps-ladder": eps_ladder,
+             "benefit-concentration": benefit_concentration,
+             "k4-allocation": allocation}
+    wanted = list(known) if args.charts == "all" else [
+        c.strip() for c in args.charts.split(",") if c.strip()]
+    unknown = [c for c in wanted if c not in known]
+    if unknown:
+        p.error(f"unknown chart(s): {', '.join(unknown)} "
+                f"(known: {', '.join(known)})")
+
+    for mode, m in MODES.items():
+        for name in wanted:
+            known[name](mode, m)
+    print("charts written:", sorted(q.name for q in OUT_DIR.glob("*.svg")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
