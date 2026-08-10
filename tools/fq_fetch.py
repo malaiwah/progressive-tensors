@@ -31,7 +31,34 @@ pinned out of band (`--trust-signer`, resolved through keys/FINGERPRINTS in
 the git repo — see ../TRUST.md), and every fetched expert's bytes are hashed
 against the attested digest before the file is finalized.  When the source
 publishes a signed `fq-release/1` manifest, one signature covers the index
-and attestation files too, and fq_fetch checks their digests against it.
+and attestation files too, fq_fetch checks their digests against it, and it
+refuses when the release and the attestation disagree about a fragment.
+
+The plan itself is authenticated too (peer review, finding P1-4c).  Tensor
+names, dtypes, shapes and offsets come from the remote segment's
+safetensors header, and a ranged read of a header is just bytes the server
+chose to send: hashing the payload afterwards proves the *bytes* are the
+attested ones, not that they are the tensors the header claims.  A
+publisher who rewrote a header could relabel gate_proj as up_proj, or F16
+as I16, and the reconstructed file would still pass every digest check —
+and then be signed as trustworthy.  So before anything plans from a header,
+--header-trust decides how it is proven:
+
+  auto      (default) use the signed `fragment.header_sha256` when the
+            publisher provides one; otherwise verify the WHOLE fragment
+            against the signed `fragment.sha256` and read the header out of
+            those verified bytes.  Always authenticated, sometimes slow —
+            the plan summary says which fragments need the full read and
+            how many bytes that costs before any of it happens.
+  attested  require the signed header digest; refuse rather than download.
+  full      always verify the whole fragment.
+  unsafe    plan from the unauthenticated ranged header (the old
+            behaviour).  Prints a banner, and the emitted attestation says
+            `header_authentication: NONE` so downstream can see it.
+
+Whatever is used is recorded per parent fragment in the `derived-from`
+attestation this tool emits, so the tree says exactly which authenticated
+inputs its layout came from.
 
     # what would this cost?
     fq_fetch.py --policy recipe.json --out ./segments --dry-run \\
@@ -94,6 +121,18 @@ SELECT_SCHEMA = "fq-select/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+
+# --header-trust rungs, strongest guarantee per byte first.
+HEADER_ATTESTED = "attested"    # require a signed fragment.header_sha256
+HEADER_AUTO = "auto"            # signed header digest, else whole fragment
+HEADER_FULL = "full"            # always verify the whole fragment
+HEADER_UNSAFE = "unsafe"        # plan from an unauthenticated header
+HEADER_TRUST_MODES = (HEADER_AUTO, HEADER_ATTESTED, HEADER_FULL, HEADER_UNSAFE)
+# how the header of a segment was proven, as recorded in the attestation
+AUTH_HEADER_DIGEST = "attested-header-digest"
+AUTH_FULL_FRAGMENT = "full-fragment"
+AUTH_NONE = "NONE (--header-trust unsafe)"
+FULL_VERIFY_CHUNK = 1 << 26  # 64 MB per ranged GET when hashing a fragment
 
 
 # ---------------------------------------------------------------- transport
@@ -246,6 +285,7 @@ class Source:
         self._small: dict[str, bytes | None] = {}
         self._headers: dict[str, tuple[dict, int]] = {}
         self._attestations: dict[str, dict] = {}
+        self._header_auth: dict[str, dict] = {}
         self.release: dict | None = None
         self.manifest: dict = {}
 
@@ -329,6 +369,37 @@ class Source:
               flush=True)
         return self.release
 
+    def release_entry(self, name: str) -> dict | None:
+        return ((self.release or {}).get("files") or {}).get(name)
+
+    def cross_check_fragment(self, name: str, frag: dict) -> bool:
+        """The signed release and the signed attestation must agree.
+
+        Both are signatures over the same publisher's claims about the same
+        file; when they disagree, one of them is a rollback or a swap, and
+        preferring either would be a guess.  Returns True when the release
+        actually covered this fragment.
+        """
+        want = self.release_entry(name)
+        if not want:
+            if self.release:
+                raise TrustError(
+                    f"{self}: {name} is not listed in the signed release "
+                    f"manifest — refusing to fetch an uncovered fragment")
+            return False
+        got = frag.get("sha256")
+        if got and got != want["sha256"]:
+            raise TrustError(
+                f"{self}: the signed attestation says {name} is "
+                f"{got[:16]}… but the signed release says "
+                f"{want['sha256'][:16]}… — refusing while the publisher's "
+                f"own signatures disagree")
+        if frag.get("size") and want.get("size") and frag["size"] != want["size"]:
+            raise TrustError(
+                f"{self}: attested size {frag['size']} != release size "
+                f"{want['size']} for {name}")
+        return True
+
     def check_against_release(self, name: str, data: bytes) -> None:
         """Digest-check a small document against the signed release list."""
         if not self.release:
@@ -356,10 +427,12 @@ class Source:
                     segment_file: str) -> dict:
         """Verified, merged attestation payload for one segment file.
 
-        Every line whose fragment.file matches is signature-checked; their
-        expert_sha256 maps are merged.  Raises TrustError when the file is
-        missing, unsigned, or signed by the wrong key — a fetch that cannot
-        be checked does not happen.
+        The file is JSON Lines and every line is checked on its own: a line
+        this consumer cannot trust (a third party's countersignature, an
+        older key, a corrupted line) is skipped with its reason recorded,
+        and only lines a trusted key signed for THIS fragment contribute.
+        Raises TrustError when the file is missing or when nothing in it
+        verifies — a fetch that cannot be checked does not happen.
         """
         cache_key = f"{layer}.{k}"
         if cache_key in self._attestations:
@@ -373,12 +446,17 @@ class Source:
                 f"for offline fixtures, and even then attestations carry the "
                 f"per-expert digests)")
         self.check_against_release(name, raw)
-        merged: dict = {"expert_sha256": {}, "fragment": None, "lines": 0}
+        merged: dict = {"expert_sha256": {}, "fragment": None, "lines": 0,
+                        "rejected_lines": []}
         for n, line in enumerate(raw.decode().splitlines(), 1):
             if not line.strip():
                 continue
-            payload = verifier.verify_envelope(
-                json.loads(line), where=f"{self}:{name}:{n}")
+            try:
+                payload = verifier.verify_envelope(
+                    json.loads(line), where=f"{self}:{name}:{n}")
+            except (TrustError, json.JSONDecodeError, TypeError) as e:
+                merged["rejected_lines"].append(f"line {n}: {e}")
+                continue
             frag = payload.get("fragment") or {}
             if frag.get("file") != segment_file:
                 continue
@@ -390,15 +468,24 @@ class Source:
             merged.setdefault("materials", payload.get("materials"))
             merged.setdefault("layout", payload.get("layout"))
         if not merged["lines"]:
+            detail = ("; ".join(merged["rejected_lines"])
+                      or f"no line names {segment_file}")
             raise TrustError(
-                f"{self}: {name} has no attestation line for {segment_file}")
+                f"{self}: {name} has no trusted attestation line for "
+                f"{segment_file} ({detail})")
+        self.cross_check_fragment(segment_file, merged["fragment"] or {})
         self._attestations[cache_key] = merged
         return merged
 
     # -- segment headers ---------------------------------------------------
 
     def segment_header(self, layer: int, k: int) -> tuple[dict, int]:
-        """(header, body_offset) of a remote segment, by ranged read."""
+        """(header, body_offset) of a remote segment, by ranged read.
+
+        UNAUTHENTICATED: these are bytes the server chose to send.  Good
+        enough to draft a plan and price it; authenticate_header() must
+        prove them before anything is fetched or written.
+        """
         name = self.segment_name(layer, k)
         if name in self._headers:
             return self._headers[name]
@@ -406,6 +493,8 @@ class Source:
         if cache.exists():
             obj = json.loads(cache.read_text())
             out = (obj["header"], obj["body_offset"])
+            if obj.get("authentication"):
+                self._header_auth.setdefault(name, obj["authentication"])
         else:
             url = self.url(name)
             d, meta = self.t.get_range(url, 0, 8)
@@ -416,9 +505,145 @@ class Source:
             self.resolved_commit = self.resolved_commit or meta.get("commit")
             header = json.loads(hj)
             out = (header, 8 + hlen)
-            cache.write_text(json.dumps({"header": header, "body_offset": out[1]}))
+            self._write_header_cache(name, header, out[1], None)
         self._headers[name] = out
         return out
+
+    def _write_header_cache(self, name: str, header: dict, body_offset: int,
+                            auth: dict | None) -> None:
+        (self.cache / f"hdr-{name}.json").write_text(json.dumps(
+            {"header": header, "body_offset": body_offset,
+             "authentication": auth}))
+        self._headers[name] = (header, body_offset)
+
+    def authenticate_header(self, layer: int, k: int, att: dict,
+                            mode: str) -> dict:
+        """Prove a segment's safetensors header before planning from it.
+
+        The header carries tensor names, dtypes, shapes and offsets — the
+        meaning of the bytes.  Hashing payload spans afterwards cannot catch
+        a rewritten header, so the header itself has to trace back to a
+        signature.  Returns a provenance record describing how (see
+        AUTH_* constants); raises TrustError when it cannot be proven under
+        the requested mode.
+        """
+        name = self.segment_name(layer, k)
+        frag = att.get("fragment") or {}
+        covered = bool(self.release_entry(name))
+        if mode == HEADER_UNSAFE:
+            header, body_offset = self.segment_header(layer, k)
+            prov = {"method": AUTH_NONE, "authenticated": False,
+                    "body_offset": body_offset, "release_manifest": covered,
+                    "note": "the plan came from an unverified ranged read"}
+            self._header_auth[name] = prov
+            return prov
+        cached = self._header_auth.get(name)
+        if cached and cached.get("authenticated") and self._auth_fits(cached, mode, frag):
+            return cached
+        if frag.get("header_sha256"):
+            prov = self._auth_by_header_digest(name, frag)
+        elif mode == HEADER_ATTESTED:
+            raise TrustError(
+                f"{self}: {name} has no signed fragment.header_sha256, so its "
+                f"header cannot be authenticated cheaply, and --header-trust "
+                f"attested refuses to guess. Ask the publisher to attest the "
+                f"header digest, or re-run with --header-trust full to verify "
+                f"the whole fragment ({frag.get('size') or '?'} bytes) — "
+                f"--header-trust unsafe plans from the unverified header and "
+                f"says so in the output tree.")
+        else:
+            prov = self._auth_by_full_fragment(name, frag)
+        prov["release_manifest"] = covered
+        self._header_auth[name] = prov
+        return prov
+
+    @staticmethod
+    def _auth_fits(prov: dict, mode: str, frag: dict) -> bool:
+        """Is a cached authentication strong enough for this run?"""
+        if mode == HEADER_ATTESTED:
+            return prov.get("method") == AUTH_HEADER_DIGEST
+        if mode == HEADER_FULL:
+            return (prov.get("method") == AUTH_FULL_FRAGMENT
+                    and prov.get("fragment_sha256") == frag.get("sha256"))
+        if prov.get("method") == AUTH_FULL_FRAGMENT:
+            return prov.get("fragment_sha256") == frag.get("sha256")
+        return prov.get("header_sha256") == frag.get("header_sha256")
+
+    def _auth_by_header_digest(self, name: str, frag: dict) -> dict:
+        """Cheap path: the publisher signed a digest of the header bytes."""
+        url = self.url(name)
+        d, meta = self.t.get_range(url, 0, 8)
+        hlen = struct.unpack("<Q", d)[0]
+        if not 0 < hlen < (1 << 31):
+            raise IOError(f"{self}:{name}: implausible header length {hlen}")
+        hj, meta = self.t.get_range(url, 8, 8 + hlen)
+        self.resolved_commit = self.resolved_commit or meta.get("commit")
+        got = hashlib.sha256(bytes(d) + bytes(hj)).hexdigest()
+        want = frag["header_sha256"]
+        if got != want:
+            raise TrustError(
+                f"{self}: {name} header hashes to {got[:16]}… but the signed "
+                f"attestation says {want[:16]}… — the header this plan would "
+                f"use is not the header the publisher signed")
+        body_offset = 8 + hlen
+        if frag.get("body_offset") not in (None, body_offset):
+            raise TrustError(
+                f"{self}: {name} body starts at {body_offset}, the signed "
+                f"attestation says {frag['body_offset']}")
+        header = json.loads(hj)
+        prov = {"method": AUTH_HEADER_DIGEST, "authenticated": True,
+                "header_sha256": got, "body_offset": body_offset,
+                "bytes_read": body_offset}
+        self._write_header_cache(name, header, body_offset, prov)
+        return prov
+
+    def _auth_by_full_fragment(self, name: str, frag: dict) -> dict:
+        """Fallback: no signed header digest, so verify the whole fragment
+        against the signed file digest and read the header out of bytes that
+        are then known to be the publisher's."""
+        size, want = frag.get("size"), frag.get("sha256")
+        if not want:
+            raise TrustError(
+                f"{self}: {name} has no attested fragment sha256; nothing "
+                f"authenticates this fragment at all")
+        if not isinstance(size, int) or size <= 0:
+            raise TrustError(
+                f"{self}: {name} has neither a signed header digest nor a "
+                f"signed size, so the fragment cannot be verified in full. "
+                f"Ask the publisher for fragment.header_sha256.")
+        url = self.url(name)
+        digest = hashlib.sha256()
+        head = bytearray()
+        need = 8
+        off = 0
+        while off < size:
+            end = min(off + FULL_VERIFY_CHUNK, size)
+            data, meta = self.t.get_range(url, off, end)
+            if len(data) != end - off:
+                raise IOError(f"{self}:{name}: short read at {off}")
+            self.resolved_commit = self.resolved_commit or meta.get("commit")
+            digest.update(data)
+            if off == 0:
+                need = 8 + struct.unpack("<Q", data[:8])[0]
+                if not 8 < need <= size:
+                    raise IOError(
+                        f"{self}:{name}: implausible header length {need - 8}")
+            if len(head) < need:
+                head += data[:need - len(head)]
+            off = end
+        got = digest.hexdigest()
+        if got != want:
+            raise TrustError(
+                f"{self}: {name} hashes to {got[:16]}… over {size} bytes but "
+                f"the signed attestation says {want[:16]}… — refusing to plan "
+                f"from a fragment that is not the one that was signed")
+        header = json.loads(bytes(head[8:need]))
+        prov = {"method": AUTH_FULL_FRAGMENT, "authenticated": True,
+                "fragment_sha256": got, "body_offset": need,
+                "header_sha256": hashlib.sha256(bytes(head[:need])).hexdigest(),
+                "bytes_read": size}
+        self._write_header_cache(name, header, need, prov)
+        return prov
 
 
 # ------------------------------------------------------------------- policy
@@ -522,6 +747,19 @@ class FilePlan:
         self.body_size = 0
         self.body_offset = 0
         self.meta: dict = {}
+        self.sources_used: dict[str, str] = {}
+        # what the plan was drafted from, so it can be re-derived once the
+        # remote headers have actually been authenticated
+        self.chosen: list = []
+        self.atts: dict[str, dict] = {}
+        self.header_provenance: dict[str, dict] = {}
+
+    def shape(self) -> tuple:
+        """Everything about this plan that the remote header decides."""
+        return (self.header, self.body_size,
+                tuple((p.expert, str(p.source), p.remote_start, p.remote_end,
+                       p.local_off, p.sha256, tuple(p.names))
+                      for p in self.pieces))
 
     @property
     def bytes_needed(self) -> int:
@@ -613,8 +851,68 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                 continue
             _build_file_plan(plan, chosen, problems)
             if plan.pieces:
+                plan.chosen = chosen
+                plan.atts = {src.slug: att for src, _idx, att in cands}
                 plans.append(plan)
     return plans, problems
+
+
+def authenticate_plan(plan: FilePlan, mode: str) -> dict:
+    """Prove every remote header this plan reads from, then re-derive it.
+
+    Planning happens against an unauthenticated ranged header so the run can
+    price itself before spending anything.  Nothing may be fetched or
+    written from that draft: here each source's header is authenticated
+    (signed header digest, or the whole fragment re-hashed against the
+    signed file digest) and the plan is rebuilt from the proven bytes.  Any
+    difference means the ranged read and the signed bytes disagree, which is
+    exactly the substitution this check exists to catch.
+    """
+    provenance: dict[str, dict] = {}
+    for src in sorted({p.source.slug: p.source for p in plan.pieces}.values(),
+                      key=lambda s: s.slug):
+        att = plan.atts.get(src.slug) or {}
+        provenance[src.slug] = src.authenticate_header(
+            plan.layer, plan.k, att, mode)
+    if mode == HEADER_UNSAFE:
+        plan.header_provenance = provenance
+        return provenance
+    before = plan.shape()
+    fresh = FilePlan(plan.layer, plan.k)
+    problems: list[str] = []
+    _build_file_plan(fresh, plan.chosen, problems)
+    if problems:
+        raise TrustError(
+            f"{plan.name}: the authenticated header does not support this "
+            f"plan ({'; '.join(problems)})")
+    if fresh.shape() != before:
+        raise TrustError(
+            f"{plan.name}: the authenticated segment header differs from the "
+            f"ranged header this plan was drafted from — tensor names, "
+            f"dtypes, shapes or offsets were substituted between the two "
+            f"reads; refusing")
+    plan.header_provenance = provenance
+    return provenance
+
+
+def authentication_cost(plans: list[FilePlan], mode: str) -> dict:
+    """What proving the plans' headers will cost, before it is spent."""
+    methods: dict[str, int] = {}
+    extra = 0
+    for plan in plans:
+        for src in {p.source.slug: p.source for p in plan.pieces}.values():
+            frag = (plan.atts.get(src.slug) or {}).get("fragment") or {}
+            if mode == HEADER_UNSAFE:
+                methods[AUTH_NONE] = methods.get(AUTH_NONE, 0) + 1
+            elif frag.get("header_sha256"):
+                methods[AUTH_HEADER_DIGEST] = methods.get(AUTH_HEADER_DIGEST, 0) + 1
+            elif mode == HEADER_ATTESTED:
+                methods["refused (no signed header digest)"] = methods.get(
+                    "refused (no signed header digest)", 0) + 1
+            else:
+                methods[AUTH_FULL_FRAGMENT] = methods.get(AUTH_FULL_FRAGMENT, 0) + 1
+                extra += int(frag.get("size") or 0)
+    return {"mode": mode, "methods": methods, "extra_bytes": extra}
 
 
 def _build_file_plan(plan: FilePlan, chosen, problems: list[str]) -> None:
@@ -850,6 +1148,15 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
     (out / "fq-manifest.json").write_text(
         json.dumps(manifest, indent=1, sort_keys=True) + "\n")
 
+    headers = {}
+    for plan in plans:
+        for slug, prov in (plan.header_provenance or {}).items():
+            headers.setdefault(plan.name, {})[slug] = {
+                "method": prov.get("method"),
+                "authenticated": bool(prov.get("authenticated")),
+                "header_sha256": prov.get("header_sha256"),
+                "signed_release_manifest": bool(prov.get("release_manifest")),
+            }
     report = {
         "schema": REPORT_SCHEMA,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -857,7 +1164,12 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "trust": {"rung": verifier.rung, "signer": verifier.fingerprint,
                   "key_id": verifier.key_id,
                   "signatures_verified": verifier.checked,
-                  "local_signer": local_signer},
+                  "local_signer": local_signer,
+                  "plan_authenticated": all(
+                      h["authenticated"]
+                      for per_file in headers.values()
+                      for h in per_file.values()) if headers else False},
+        "header_authentication": headers,
         "sources": [{"repo": s.repo, "revision": s.revision,
                      "pinned": s.pinned, "resolved_commit": s.resolved_commit,
                      "release_manifest": bool(s.release)} for s in sources],
@@ -913,6 +1225,7 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
         att = src.attestation(plan.layer, plan.k, verifier,
                               Source.segment_name(plan.layer, plan.k))
         frag = att.get("fragment") or {}
+        prov = plan.header_provenance.get(src.slug) or {}
         parents.append({
             "role": "source_fragment",
             "repo": src.repo,
@@ -922,12 +1235,21 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "size": frag.get("size"),
             "keyid": verifier.fingerprint,
             "experts": experts,
+            # exactly which authenticated inputs this plan was computed from:
+            # the layout (names, dtypes, shapes, offsets) came from the
+            # parent's header, so say how that header was proven
+            "header_authentication": prov.get("method"),
+            "header_authenticated": bool(prov.get("authenticated")),
+            "header_sha256": prov.get("header_sha256"),
+            "signed_release_manifest": bool(prov.get("release_manifest")),
         })
     payload = {
         "schema": "fq-attestation/1",
         "predicate": "derived-from",
         "fragment": {"file": entry["file"], "sha256": entry["sha256"],
-                     "size": entry["size"]},
+                     "size": entry["size"],
+                     "header_sha256": entry.get("header_sha256"),
+                     "body_offset": entry.get("body_offset")},
         "expert_sha256": {str(p.expert): p.sha256
                           for p in sorted(plan.pieces, key=lambda x: x.expert)},
         "layer": plan.layer,
@@ -949,6 +1271,18 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "upstream_rung": verifier.rung,
             "upstream_signer": verifier.fingerprint,
             "expert_digests_checked": len(plan.pieces),
+            # the byte plan (which tensor lives where, with what dtype and
+            # shape) is only as trustworthy as the header it was read from
+            "plan_inputs": {
+                "expert_digests": "signed attestation (per-expert sha256)",
+                "byte_layout": "segment header, authenticated per parent "
+                               "(see parents[].header_authentication)",
+                "index_spans": "cross-checked against the authenticated "
+                               "header before use",
+                "plan_authenticated": all(
+                    (plan.header_provenance.get(s) or {}).get("authenticated")
+                    for s in {p.source.slug for p in plan.pieces}),
+            },
         },
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -1052,11 +1386,14 @@ def fetch_plan(plan: FilePlan, out: Path, state: dict, transport: Transport,
         state["files"][key] = st
         save_state(out, state)
         raise
+    with open(target, "rb") as f:  # the header digest OUR consumers can pin
+        header_sha = hashlib.sha256(f.read(writer.body_off)).hexdigest()
     entry = {
         "file": plan.name,
         "sha256": sha,
         "size": size,
         "body_offset": writer.body_off,
+        "header_sha256": header_sha,
         "experts": {str(p.expert): [p.local_off, p.local_off + p.size]
                     for p in sorted(plan.pieces, key=lambda x: x.expert)},
         "sources": getattr(plan, "sources_used", {}),
@@ -1112,6 +1449,18 @@ def main(argv=None) -> int:
     p.add_argument("--no-verify-resumed", action="store_true",
                    help="trust bytes already on disk from an earlier run "
                         "instead of re-hashing them")
+    p.add_argument("--header-trust", choices=HEADER_TRUST_MODES,
+                   default=HEADER_AUTO,
+                   help="how the remote segment HEADER (tensor names, dtypes, "
+                        "shapes, offsets — the meaning of the bytes) is "
+                        "authenticated before the plan uses it.  auto: signed "
+                        "fragment.header_sha256 when published, else verify "
+                        "the whole fragment against the signed file digest.  "
+                        "attested: require the signed header digest, never "
+                        "download a whole fragment.  full: always verify the "
+                        "whole fragment.  unsafe: plan from the unverified "
+                        "ranged header (what fq_fetch did before) — recorded "
+                        "as such in the emitted attestation.")
     p.add_argument("--json", type=Path, default=None,
                    help="write the plan/result summary here as well")
     fq_trust.add_trust_arguments(p)
@@ -1159,6 +1508,7 @@ def main(argv=None) -> int:
     needed = sum(pl.bytes_needed for pl in plans)
     experts = sum(len(pl.pieces) for pl in plans)
     cf = counterfactual(sources, plans)
+    auth = authentication_cost(plans, args.header_trust)
     summary = {
         "experts": experts,
         "files": len(plans),
@@ -1168,6 +1518,7 @@ def main(argv=None) -> int:
         "segment_files_touched": cf["files_touched"],
         "trust_rung": verifier.rung,
         "signer": verifier.fingerprint,
+        "header_authentication": auth,
     }
     print(f"plan: {experts} experts across {len(plans)} segment files")
     print(f"  ranged fetch:        {human(needed)}")
@@ -1176,7 +1527,20 @@ def main(argv=None) -> int:
     print(f"  whole repo download: {human(cf['whole_repo'])}"
           + (f"  ({cf['whole_repo'] / max(needed, 1):.1f}x)" if needed else "")
           + "   <- what `hf download <repo>` costs")
+    print("  header authentication: "
+          + ", ".join(f"{n}x {m}" for m, n in sorted(auth["methods"].items()))
+          + (f"  (+{human(auth['extra_bytes'])} read to prove the plan; ask "
+             f"the publisher for fragment.header_sha256 to avoid it)"
+             if auth["extra_bytes"] else ""))
     print(f"  {verifier.summary()}")
+    if args.header_trust == HEADER_UNSAFE:
+        print("!" * 72 + "\n"
+              "!! --header-trust unsafe: tensor names, dtypes, shapes and\n"
+              "!! offsets come from an UNAUTHENTICATED ranged read.  Expert\n"
+              "!! bytes are still hashed against the signed attestation, but\n"
+              "!! a publisher who rewrote a header can relabel them, and the\n"
+              "!! subset this run signs would carry the relabelling.\n"
+              + "!" * 72, file=sys.stderr, flush=True)
     if args.dry_run:
         if args.json:
             args.json.write_text(json.dumps(
@@ -1184,7 +1548,8 @@ def main(argv=None) -> int:
                  "plans": [{"file": pl.name, "experts": len(pl.pieces),
                             "bytes": pl.bytes_needed} for pl in plans]},
                 indent=1) + "\n")
-        print("dry run: nothing fetched")
+        print("dry run: nothing fetched (the plan above is drafted from "
+              "unverified headers; a real run authenticates them first)")
         return 0
 
     signer = None
@@ -1198,6 +1563,9 @@ def main(argv=None) -> int:
     t0 = time.time()
     try:
         for plan in plans:
+            # Prove the header before a single byte of this file is fetched
+            # or written: the draft plan above is not evidence of anything.
+            authenticate_plan(plan, args.header_trust)
             entry = fetch_plan(
                 plan, out, state, transport,
                 max_chunk=max(1, int(args.chunk_mb * (1 << 20))),

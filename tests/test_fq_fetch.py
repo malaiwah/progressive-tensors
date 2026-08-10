@@ -529,6 +529,296 @@ def test_subset_is_attested_as_derived_from_its_parents(tmp_path, served):
     assert json.loads(kept.read_text())["keyid"] == pub
 
 
+# ------------------------------- plan authentication (finding P1-4c)
+
+def _att_path(repo: Path, layer: int, k: int) -> Path:
+    return repo / "attestations" / f"layer-{layer:03d}.k{k}.jsonl"
+
+
+def _payload(att: Path) -> dict:
+    import base64
+    return json.loads(base64.b64decode(
+        json.loads(att.read_text().splitlines()[0])["payload"]))
+
+
+def _resign(att: Path, key: Path, mutate) -> None:
+    payload = _payload(att)
+    mutate(payload)
+    att.write_text(fq_repack.Signer(key).sign_line(payload) + "\n")
+
+
+def _attest_header_digests(repo: Path, key: Path, ks=KS) -> None:
+    """Publish fragment.header_sha256 the way a publisher should, so the
+    consumer can authenticate the header without reading the payload."""
+    for k in ks:
+        for layer in LAYERS:
+            att = _att_path(repo, layer, k)
+            if not att.exists():
+                continue
+            seg = repo / f"layer-{layer:03d}.k{k}.safetensors"
+            raw = seg.read_bytes()
+            body = 8 + struct.unpack("<Q", raw[:8])[0]
+            _resign(att, key, lambda p, raw=raw, body=body: p["fragment"].update(
+                {"header_sha256": hashlib.sha256(raw[:body]).hexdigest(),
+                 "body_offset": body}))
+
+
+def _retag_header(seg: Path, old: bytes, new: bytes) -> None:
+    """Rewrite the segment's safetensors header in place, keeping its length
+    (and every payload byte) identical — the substitution a ranged header
+    read cannot detect on its own."""
+    assert len(old) == len(new)
+    raw = bytearray(seg.read_bytes())
+    hlen = struct.unpack("<Q", raw[:8])[0]
+    head = bytes(raw[8:8 + hlen])
+    assert old in head, old
+    raw[8:8 + hlen] = head.replace(old, new, 1)
+    seg.write_bytes(bytes(raw))
+
+
+def test_plan_records_which_authenticated_inputs_it_came_from(tmp_path, served):
+    """The positive path: the header is proven, and the tree says how."""
+    repo, snap, out, policy, pub = _fetch_all(tmp_path, served)
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["plan_authenticated"] is True
+    per_file = report["header_authentication"][f"layer-{LAYERS[0]:03d}.k3.safetensors"]
+    prov = next(iter(per_file.values()))
+    assert prov["method"] == fq_fetch.AUTH_FULL_FRAGMENT
+    assert prov["authenticated"] is True
+    local = json.loads((out / "fq-manifest.json").read_text())["signer_pubkey"]
+    att = out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    payload = fq_trust.verify_signature(json.loads(att.read_text()), local,
+                                        where=att.name)
+    parent = payload["parents"][0]
+    assert parent["header_authentication"] == fq_fetch.AUTH_FULL_FRAGMENT
+    assert parent["header_authenticated"] is True
+    assert payload["verification"]["plan_inputs"]["plan_authenticated"] is True
+    # the subset we produced publishes its own header digest, so a consumer
+    # fetching from this tree gets the cheap authenticated path
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = seg.read_bytes()
+    body = 8 + struct.unpack("<Q", raw[:8])[0]
+    assert payload["fragment"]["header_sha256"] == hashlib.sha256(
+        raw[:body]).hexdigest()
+
+
+def test_tampered_segment_header_is_refused(tmp_path, served, capsys):
+    """The finding: names/dtypes/shapes/offsets came from an unauthenticated
+    ranged read.  Relabel a dtype without touching one payload byte — every
+    per-expert digest still matches — and the fetch must still refuse."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    _retag_header(repo / f"layer-{LAYERS[0]:03d}.k3.safetensors", b'"I16"', b'"F16"')
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "TRUST FAILURE" in err and "signed attestation" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_attested_header_digest_authenticates_without_the_full_download(
+        tmp_path, served, capsys):
+    """When the publisher signs fragment.header_sha256, the plan is proven
+    from a header-sized read — no whole fragment, no re-download."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _attest_header_digests(repo, key, ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    seg = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    served["ranges"].clear()
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    prov = next(iter(report["header_authentication"][seg.name].values()))
+    assert prov["method"] == fq_fetch.AUTH_HEADER_DIGEST
+    assert prov["authenticated"] is True
+    # nothing read the whole fragment
+    biggest = max(r[2] - r[1] for r in served["ranges"] if r[0] == seg.name)
+    assert biggest < seg.stat().st_size
+    assert "attested-header-digest" in capsys.readouterr().out
+
+
+def test_attested_header_digest_catches_a_tampered_header(tmp_path, served,
+                                                          capsys):
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _attest_header_digests(repo, key, ks=(3,))
+    served["mount"]("test/pub", repo)
+    _retag_header(repo / f"layer-{LAYERS[0]:03d}.k3.safetensors", b'"I16"', b'"F16"')
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "not the header the publisher signed" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
+                                                                   served,
+                                                                   capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--header-trust", "attested"], expect=1)
+    err = capsys.readouterr().err
+    assert "no signed fragment.header_sha256" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_header_trust_unsafe_is_loud_and_recorded(tmp_path, served, capsys):
+    """The escape hatch stays available, but it is never silent."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--header-trust", "unsafe"])
+    assert "UNAUTHENTICATED ranged read" in capsys.readouterr().err
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["plan_authenticated"] is False
+    local = json.loads((out / "fq-manifest.json").read_text())["signer_pubkey"]
+    att = out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    payload = fq_trust.verify_signature(json.loads(att.read_text()), local,
+                                        where=att.name)
+    assert payload["parents"][0]["header_authentication"] == fq_fetch.AUTH_NONE
+    assert payload["parents"][0]["header_authenticated"] is False
+    assert payload["verification"]["plan_inputs"]["plan_authenticated"] is False
+
+
+def test_release_manifest_and_attestation_must_agree(tmp_path, served, capsys):
+    """Two signatures by the same publisher over the same fragment: if they
+    disagree, one of them is a rollback and neither is preferred."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    # re-sign the attestation so it claims a different fragment digest, and
+    # re-sign the release over the new attestation file: both signatures are
+    # valid and current, and they contradict each other about the fragment
+    att = _att_path(repo, LAYERS[0], 3)
+    _resign(att, key, lambda p: p["fragment"].update({"sha256": "b" * 64}))
+    import base64
+    rel = json.loads((repo / "fq-release.json").read_text())
+    payload = json.loads(base64.b64decode(rel["payload"]))
+    payload["files"][f"attestations/{att.name}"] = {
+        "sha256": hashlib.sha256(att.read_bytes()).hexdigest(),
+        "size": att.stat().st_size}
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "signatures disagree" in err or "not listed in the signed release" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_release_manifest_covers_the_fetched_fragments(tmp_path, served, capsys):
+    """A fragment absent from the signed release is not fetched from a repo
+    that publishes one."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    rel = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(rel["payload"]))
+    payload["files"].pop(f"layer-{LAYERS[0]:03d}.k3.safetensors")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    assert "not listed in the signed release" in capsys.readouterr().err
+
+
+def test_every_attestation_line_is_considered(tmp_path, served):
+    """JSON Lines: a stranger's countersignature on line 1 must not hide the
+    publisher's line on line 2."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    stranger = fq_repack.Signer(tmp_path / "stranger.key")
+    for layer in LAYERS:
+        att = _att_path(repo, layer, 3)
+        good = att.read_text().splitlines()[0]
+        payload = _payload(att)
+        att.write_text(stranger.sign_line(payload) + "\n" + good + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    assert (out / f"layer-{LAYERS[0]:03d}.k3.safetensors").exists()
+
+
+def test_only_untrusted_lines_is_a_refusal(tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    stranger = fq_repack.Signer(tmp_path / "stranger.key")
+    for layer in LAYERS:
+        att = _att_path(repo, layer, 3)
+        att.write_text(stranger.sign_line(_payload(att)) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "no trusted attestation line" in err or "no source carries it" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_absent_attestation_file_is_a_refusal(tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    for att in (repo / "attestations").glob("*.jsonl"):
+        att.unlink()
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "cannot verify fetched bytes" in err or "no source carries it" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
+    """A signed line that omits an expert: those bytes are unverifiable, so
+    they are refused rather than fetched and signed."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _resign(_att_path(repo, LAYERS[0], 3), key,
+            lambda p: p["expert_sha256"].pop("1"))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    assert "no attested digest" in capsys.readouterr().err
+    index = json.loads((out / "index-k3.json").read_text())
+    assert "1" not in index[str(LAYERS[0])]["experts"]
+
+
 def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
     served["mount"]("test/pub", repo)
