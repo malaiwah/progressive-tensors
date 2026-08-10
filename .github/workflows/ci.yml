@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create environment
+        run: uv venv --python ${{ matrix.python }}
+
+      - name: Install locked dev dependencies
+        run: uv pip install --require-hashes -r requirements-dev.txt
+
+      - name: Run test suite
+        run: uv run --no-project pytest tests/ -q
+
+  package:
+    name: package (wheel + console entry points)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv --python 3.12 .venv-pkg
+          # numpy comes from the [numeric] extra; fq-eps needs it at import
+          VIRTUAL_ENV=.venv-pkg uv pip install dist/*.whl numpy
+
+      - name: Console entry points are importable and runnable
+        run: |
+          for cmd in fq-repack fq-assemble fq-fetch fq-prime fq-verify fq-release fq-eps; do
+            echo "--- $cmd --help"
+            ./.venv-pkg/bin/$cmd --help > /dev/null
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  trust-root:
+    name: trust root (published fingerprints are well-formed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check keys/ fingerprints
+        run: python3 keys/check_fingerprints.py

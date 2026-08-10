@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "progressive-tensors"
+version = "0.1.0a0"
+description = "Mixed-K quants as a service: assemble EXL3 checkpoints from shared, attested, per-expert segments"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = ["exl3", "quantization", "moe", "safetensors", "provenance", "huggingface"]
+authors = [{ name = "Michel Belleau" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Runtime floor: signing/verification only.  Everything else is stdlib —
+# ranged HTTP reads go through urllib so a consumer needs no hub client.
+dependencies = ["pynacl>=1.5"]
+
+[project.optional-dependencies]
+# Hub-backed convenience: token/endpoint resolution for fq_fetch, uploads
+# for fq_repack --publish.  fq_fetch works without it (stdlib urllib).
+hub = ["huggingface_hub>=0.23"]
+# Numeric work: fq_eps analysis and fq_verify --similarity.
+numeric = ["numpy>=1.24"]
+charts = ["numpy>=1.24", "matplotlib>=3.7"]
+
+[project.urls]
+Homepage = "https://github.com/malaiwah/progressive-tensors"
+Source = "https://github.com/malaiwah/progressive-tensors"
+Research = "https://github.com/malaiwah/vllm-voipmonitor/tree/claude/gg-overview-exploration-jchgd3/research/fungible-quant"
+
+[project.scripts]
+fq-repack = "fq_repack:main"
+fq-assemble = "fq_assemble:main"
+fq-fetch = "fq_fetch:main"
+fq-prime = "fq_prime:main"
+fq-verify = "fq_verify:main"
+fq-release = "fq_release:main"
+fq-eps = "fq_eps:main"
+
+# The tools are flat, mutually-importing single-file modules (they add their
+# own directory to sys.path when run as scripts).  Ship them as top-level
+# fq_* modules rather than a package so `uv run tools/fq_fetch.py` from a
+# clone and `fq-fetch` from an install execute the same code path.
+[tool.hatch.build.targets.wheel]
+only-include = ["tools"]
+sources = ["tools"]
+
+# The trust root and the schemas travel with the wheel so an installed
+# `fq-fetch` can resolve --trust-signer and validate documents offline.  The
+# copy is a SNAPSHOT for convenience: authority over which keys may sign
+# lives in git (keys/FINGERPRINTS), and `git pull` is the revocation channel.
+[tool.hatch.build.targets.wheel.force-include]
+"keys/FINGERPRINTS" = "fq_data/keys/FINGERPRINTS"
+"schemas" = "fq_data/schemas"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/tools",
+  "/tests",
+  "/schemas",
+  "/keys",
+  "/docs",
+  "/README.md",
+  "/TRUST.md",
+  "/CHANGELOG.md",
+  "/LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
