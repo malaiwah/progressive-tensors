@@ -65,3 +65,43 @@ def test_budget_conservation(hetero):
     for frac in (0.25, 0.5, 1.0):
         s = fq_eps.budget_solve(eps, phi, layers, frac)
         assert sum(s["n_k4_per_layer"].values()) == s["budget_experts"]
+
+
+def test_module_imports_without_numpy(monkeypatch, tmp_path):
+    """A base install (no [numeric] extra) must still get a working `fq-eps`
+    command: --help works, and running it names the extra instead of dying
+    with a bare ModuleNotFoundError."""
+    import builtins
+    import importlib
+
+    real_import = builtins.__import__
+
+    def no_numpy(name, *a, **kw):
+        if name == "numpy" or name.startswith("numpy."):
+            raise ImportError("No module named 'numpy'")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.delitem(sys.modules, "fq_eps", raising=False)
+    for mod in [m for m in sys.modules if m == "numpy" or m.startswith("numpy.")]:
+        monkeypatch.delitem(sys.modules, mod, raising=False)
+    monkeypatch.setattr(builtins, "__import__", no_numpy)
+
+    bare = importlib.import_module("fq_eps")          # the import must survive
+    assert bare.np is None
+
+    with pytest.raises(SystemExit) as exc:            # argparse --help still works
+        bare.main(["--help"])
+    assert exc.value.code == 0
+
+    rc = bare.main(["--work-root", str(tmp_path), "--out", str(tmp_path / "o")])
+    assert rc == 2
+
+    with pytest.raises(bare.MissingNumPy) as err:
+        bare._require_numpy()
+    assert "progressive-tensors[numeric]" in str(err.value)
+
+    monkeypatch.delitem(sys.modules, "fq_eps", raising=False)
+
+
+def test_missing_numpy_is_an_importerror_subclass():
+    assert issubclass(fq_eps.MissingNumPy, ImportError)

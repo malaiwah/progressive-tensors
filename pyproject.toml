@@ -28,7 +28,11 @@ dependencies = ["pynacl>=1.5"]
 # Hub-backed convenience: token/endpoint resolution for fq_fetch, uploads
 # for fq_repack --publish.  fq_fetch works without it (stdlib urllib).
 hub = ["huggingface_hub>=0.23"]
-# Numeric work: fq_eps analysis and fq_verify --similarity.
+# Numeric work: fq_eps analysis and fq_verify --similarity.  Every console
+# script below must *start* on a base install with none of these extras —
+# `fq-eps` imports NumPy lazily and, without it, prints the name of this
+# extra and exits 2 rather than dying on ModuleNotFoundError.  CI installs
+# the bare wheel and runs `--help` on all of them to keep that true.
 numeric = ["numpy>=1.24"]
 charts = ["numpy>=1.24", "matplotlib>=3.7"]
 

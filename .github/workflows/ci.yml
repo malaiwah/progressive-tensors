@@ -7,9 +7,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+# Third-party actions are pinned to a commit SHA, never to a tag.  A tag is a
+# mutable pointer that the action's owner — or anyone who compromises them —
+# can move, so `@v4` today and `@v4` tomorrow are not required to be the same
+# code.  This workflow checks out the repository and, on `v*` tags, runs
+# beside the release artifacts, so "whatever v4 means this morning" is not an
+# acceptable input.  The trailing comment records which release each SHA was
+# at pin time; bumping one is a reviewable diff of 40 hex characters.
 
 jobs:
   tests:
@@ -21,10 +32,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
           enable-cache: true
 
@@ -41,28 +52,48 @@ jobs:
     name: package (wheel + console entry points)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
 
       - name: Build sdist + wheel
         run: uv build
 
-      - name: Install the wheel into a clean environment
+      # A BASE install ships no numpy.  Every console entry point the wheel
+      # declares must still start, because a command that exists and cannot
+      # run is a broken install, not a missing extra.  This step is the
+      # regression test for exactly that: it installs the wheel alone and
+      # deliberately does NOT add numpy.
+      - name: Base install (no extras) — every entry point starts
         run: |
-          uv venv --python 3.12 .venv-pkg
-          # numpy comes from the [numeric] extra; fq-eps needs it at import
-          VIRTUAL_ENV=.venv-pkg uv pip install dist/*.whl numpy
-
-      - name: Console entry points are importable and runnable
-        run: |
+          uv venv --python 3.12 .venv-base
+          VIRTUAL_ENV=.venv-base uv pip install dist/*.whl
+          VIRTUAL_ENV=.venv-base uv pip list | grep -qi '^numpy ' \
+            && { echo "numpy leaked into the base install"; exit 1; } || true
           for cmd in fq-repack fq-assemble fq-fetch fq-prime fq-verify fq-release fq-eps; do
             echo "--- $cmd --help"
-            ./.venv-pkg/bin/$cmd --help > /dev/null
+            ./.venv-base/bin/$cmd --help > /dev/null
           done
 
-      - uses: actions/upload-artifact@v4
+      - name: Base install — fq-eps explains the missing extra instead of crashing
+        run: |
+          set +e
+          out=$(./.venv-base/bin/fq-eps --work-root /nonexistent --out /tmp/o 2>&1)
+          rc=$?
+          echo "$out"
+          [ $rc -ne 0 ] || { echo "expected a non-zero exit"; exit 1; }
+          echo "$out" | grep -q "progressive-tensors\[numeric\]" \
+            || { echo "expected the message to name the extra"; exit 1; }
+
+      - name: Numeric install ([numeric] extra) — fq-eps runs for real
+        run: |
+          uv venv --python 3.12 .venv-numeric
+          VIRTUAL_ENV=.venv-numeric uv pip install "$(echo dist/*.whl)[numeric]"
+          ./.venv-numeric/bin/fq-eps --help > /dev/null
+          ./.venv-numeric/bin/python -c "import fq_eps, numpy; print(numpy.__version__)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: dist
           path: dist/
@@ -71,6 +102,6 @@ jobs:
     name: trust root (published fingerprints are well-formed)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Check keys/ fingerprints
         run: python3 keys/check_fingerprints.py

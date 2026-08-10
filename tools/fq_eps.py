@@ -14,6 +14,17 @@ produces the knob inputs of 01-artifacts-policy-stats.md §6:
 Usage: fq_eps.py --work-root /home/mbelleau/fq-0c --ks 2,3,4,5 \
                  --out <dir> [--budgets 0.25,0.42,0.5]
 (budgets = fraction of experts at the upper tier, model-wide)
+
+NumPy is an *extra*, not a runtime dependency.  The base install exists so
+that someone who only wants to fetch, verify and assemble segments does not
+have to build a numeric stack for it — everything on that path is stdlib plus
+pynacl.  But the wheel still declares the `fq-eps` console script, so a base
+install used to ship a command that died with `ModuleNotFoundError: numpy`
+the instant it was run: a broken command, not a missing feature.  NumPy is
+therefore imported on demand, inside the functions that do arithmetic, and a
+base install gets `--help`, a clean diagnostic, and the name of the extra to
+install.  CI installs the bare wheel and runs every entry point to keep it
+that way.
 """
 from __future__ import annotations
 
@@ -22,11 +33,32 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
+np = None  # bound by _require_numpy(); see the module docstring
 
 
-def load_eps(work_root: Path, ks: list[int]) -> tuple[dict, np.ndarray, list[int]]:
+class MissingNumPy(ImportError):
+    """NumPy is in the [numeric] extra and this install does not have it."""
+
+
+def _require_numpy():
+    """Import NumPy on first use, or explain precisely how to get it."""
+    global np
+    if np is None:
+        try:
+            import numpy
+        except ImportError as exc:                      # pragma: no cover
+            raise MissingNumPy(
+                "fq-eps needs NumPy, which the base install deliberately does "
+                "not pull in (fetch/verify/assemble are stdlib + pynacl).\n"
+                "Install the extra:  pip install 'progressive-tensors[numeric]'"
+            ) from exc
+        np = numpy
+    return np
+
+
+def load_eps(work_root: Path, ks: list[int]) -> tuple[dict, "np.ndarray", list[int]]:
     """Return (eps: {k: [L,E]}, phi: [L,E], layers)."""
+    _require_numpy()
     eps: dict[int, list] = {}
     phi_rows, layers = [], []
     for k in ks:
@@ -45,9 +77,10 @@ def load_eps(work_root: Path, ks: list[int]) -> tuple[dict, np.ndarray, list[int
     return out, phi, layers
 
 
-def analyze(eps: dict, phi: np.ndarray, layers: list[int],
+def analyze(eps: dict, phi: "np.ndarray", layers: list[int],
             lo: int = 3, hi: int = 4) -> dict:
     """Benefit signal, variance table, K2 verdict for the (lo→hi) upgrade."""
+    _require_numpy()
     delta = eps[lo] - eps[hi]                      # [L,E] error reduction
     phi_n = phi / np.maximum(phi.sum(axis=1, keepdims=True), 1)
     benefit = delta * phi_n                        # spec D5: ε-gap × mass
@@ -73,7 +106,8 @@ def analyze(eps: dict, phi: np.ndarray, layers: list[int],
                          "median_benefit_gini": float(np.median(ginis))}}
 
 
-def gini(x: np.ndarray) -> float:
+def gini(x: "np.ndarray") -> float:
+    _require_numpy()
     x = np.sort(np.clip(x, 0, None))
     n = len(x)
     if x.sum() == 0:
@@ -82,10 +116,11 @@ def gini(x: np.ndarray) -> float:
     return float((n + 1 - 2 * (cum / cum[-1]).sum()) / n)
 
 
-def budget_solve(eps: dict, phi: np.ndarray, layers: list[int],
+def budget_solve(eps: dict, phi: "np.ndarray", layers: list[int],
                  frac: float, lo: int = 3, hi: int = 4) -> dict:
     """Global greedy solve: spend the model-wide upper-tier budget on the
     highest benefit (l,e) pairs → n_k4_per_layer (00-overview: 0c sets N_L)."""
+    _require_numpy()
     L, E = phi.shape
     budget = int(round(frac * L * E))
     delta = eps[lo] - eps[hi]
@@ -108,7 +143,8 @@ def budget_solve(eps: dict, phi: np.ndarray, layers: list[int],
     }
 
 
-def uniform_baseline(benefit_le: np.ndarray, budget: int, L: int, E: int) -> float:
+def uniform_baseline(benefit_le: "np.ndarray", budget: int, L: int, E: int) -> float:
+    _require_numpy()
     per_layer = budget // L
     total = 0.0
     for i in range(L):
@@ -125,6 +161,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
     ks = [int(k) for k in args.ks.split(",")]
+    try:
+        _require_numpy()
+    except MissingNumPy as e:
+        print(e, file=sys.stderr)
+        return 2
     eps, phi, layers = load_eps(args.work_root, ks)
 
     result = {"layers": layers, "ks": ks,
