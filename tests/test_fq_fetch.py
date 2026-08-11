@@ -912,16 +912,57 @@ def test_attestation_signature_output_counts_only_verified_lines(
 
 
 
-def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsys):
-    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+@pytest.mark.parametrize("dry_run", (False, True), ids=("fetch", "dry-run"))
+def test_missing_expert_aborts_without_a_final_segment_tree(
+        tmp_path, served, capsys, dry_run):
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    layer = LAYERS[0]
+    index_path = repo / "index-k3.json"
+    index = json.loads(index_path.read_text())
+    index[str(layer)]["experts"].pop("1")
+    index_path.write_text(json.dumps(index))
     served["mount"]("test/pub", repo)
-    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 5, 3, 3]})
+    policy = write_policy(tmp_path / "recipe.json", {layer: [3] * E})
     out = tmp_path / "fetched"
-    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
-    assert "no source carries it" in capsys.readouterr().err
-    assert set(json.loads((out / "index-k3.json").read_text())
-               [str(LAYERS[0])]["experts"]) == {"0", "2", "3"}
+    argv = ["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+            "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)]
+    if dry_run:
+        argv.append("--dry-run")
+    run(argv, expect=1)
+
+    err = capsys.readouterr().err
+    assert "incomplete fetch plan" in err
+    assert f"layer {layer} K3 expert 1: no source carries it" in err
+    assert not list(out.glob("*.safetensors"))
+    assert not list(out.glob("index-k*.json"))
+    assert not (out / "fq-fetch-report.json").exists()
+    assert not (out / "state.json").exists()
+
+    segment = f"layer-{layer:03d}.k3.safetensors"
+    header_len = struct.unpack("<Q", (repo / segment).read_bytes()[:8])[0]
+    assert [(start, end) for name, start, end in served["ranges"]
+            if name == segment] == [(0, 8), (8, 8 + header_len)]
+
+
+def test_untrusted_candidate_does_not_veto_valid_multi_source_fallback(
+        tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo_a, _snap, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _snap, _ = build_source(tmp_path, "b", ks=(3,), key=key)
+    _att_path(repo_a, LAYERS[0], 3).unlink()
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+
+    run(["--policy", policy, "--out", out, "--source", f"test/a@{REV}",
+         "--source", f"test/b@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)])
+
+    assert "cannot verify fetched bytes" in capsys.readouterr().err
+    experts = json.loads((out / "fq-fetch-report.json").read_text())[
+        "experts"][str(LAYERS[0])]["k3"]
+    assert {record["source"] for record in experts.values()} == {f"test/b@{REV}"}
 
 def test_published_commit_is_strict_via_signed_parent_relation(
         tmp_path, served, monkeypatch, capsys):

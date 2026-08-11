@@ -1696,6 +1696,49 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             "to substitute a different fragment")
     return plans, problems
 
+def validate_plan_completeness(policy: dict[int, dict[int, int]],
+                               plans: list[FilePlan],
+                               problems: list[str]) -> None:
+    """Require exactly one planned, attested piece for every policy tuple.
+
+    Source-specific planning failures are deliberately not errors here: another
+    source may have supplied the requested expert.  The authoritative result is
+    the selected plan after its pieces have been derived from the candidate
+    headers, before those headers are authenticated or payload bytes transfer.
+    """
+    requested = {
+        (layer, expert, k)
+        for layer, experts in policy.items()
+        for expert, k in experts.items()
+    }
+    selected: dict[tuple[int, int, int], int] = {}
+    for plan in plans:
+        for piece in plan.pieces:
+            key = (plan.layer, piece.expert, plan.k)
+            selected[key] = selected.get(key, 0) + 1
+
+    failures = []
+    for layer, expert, k in sorted(requested):
+        count = selected.pop((layer, expert, k), 0)
+        if count == 1:
+            continue
+        if count == 0:
+            prefix = f"layer {layer} K{k} expert {expert}:"
+            detail = next((problem for problem in problems
+                           if problem.startswith(prefix)),
+                          f"{prefix} no selected authenticated source piece")
+            failures.append(detail)
+        else:
+            failures.append(
+                f"layer {layer} K{k} expert {expert}: selected {count} source "
+                "pieces, expected exactly one")
+    for layer, expert, k in sorted(selected):
+        failures.append(
+            f"layer {layer} K{k} expert {expert}: selected source piece is "
+            "not requested by the policy")
+    if failures:
+        raise TrustError("incomplete fetch plan: " + "; ".join(failures))
+
 def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
     """Require every selected parent to describe the same tensor contract."""
     expected = plan.identity
@@ -2535,6 +2578,16 @@ def main(argv=None) -> int:
         plans, problems = plan_fetch(policy, sources, verifier,
                                      prefer_sha=prefer_sha, select=select,
                                      binding=binding)
+        try:
+            validate_plan_completeness(policy, plans, problems)
+        except TrustError as e:
+            for msg in problems:
+                print(f"  ! {msg}", file=sys.stderr)
+            if binding:
+                print("bound recipe has unsatisfied providers or content digests; "
+                      "nothing fetched", file=sys.stderr)
+            print(f"TRUST FAILURE: {e}", file=sys.stderr)
+            return 1
         validate_policy_cardinality(policy, plans, sources, verifier)
     except TrustError as e:
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
@@ -2545,13 +2598,13 @@ def main(argv=None) -> int:
 
     for msg in problems:
         print(f"  ! {msg}", file=sys.stderr)
-    if problems and (binding or args.select or args.prefer_sha):
-        if binding:
-            print("bound recipe has unsatisfied providers or content digests; "
-                  "nothing fetched", file=sys.stderr)
-        else:
-            print("explicit provider or content constraints were unsatisfied; "
-                  "nothing fetched", file=sys.stderr)
+    # Problems are candidate-local unless completeness failed above.  A bad or
+    # incomplete source must not veto a tuple supplied by another source.
+    unmatched_preferences = [msg for msg in problems
+                             if msg.startswith("--prefer-sha ")]
+    if unmatched_preferences:
+        print("explicit content constraints were unsatisfied; nothing fetched",
+              file=sys.stderr)
         return 1
     if not plans:
         print("nothing to fetch: no source carries the experts this recipe asks "
