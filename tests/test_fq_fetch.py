@@ -295,6 +295,26 @@ def test_fetch_rejects_manifest_authenticated_header_cardinality_disagreement(
             policy, [plan], fq_fetch.HEADER_AUTO)
 
 
+def test_authenticated_header_cannot_escape_signed_family_bounds(monkeypatch):
+    source = _CardinalitySource(experts=4, manifest_experts=4)
+    source.header.pop(
+        "model.layers.3.mlp.experts.3.gate_proj.rank0.trellis")
+    source.header["model.layers.3.mlp.experts.4.gate_proj.rank0.trellis"] = {}
+    source.attestation = lambda *_args: {"num_experts": 4}
+    policy = {3: {expert: 3 for expert in range(4)}}
+    plan = type("Plan", (), {
+        "layer": 3, "k": 3, "atts": {source.slug: {"num_experts": 4}},
+        "pieces": [type("Piece", (), {"source": source})()]})()
+    monkeypatch.setattr(fq_fetch, "authenticate_plan", lambda plan, mode: None)
+    fq_fetch.validate_policy_cardinality(policy, [plan], [source], object())
+    with pytest.raises(
+            fq_trust.TrustError,
+            match=r"authenticated header contains expert ids outside signed "
+                  r"family cardinality 4"):
+        fq_fetch.authenticate_policy_cardinality(
+            policy, [plan], fq_fetch.HEADER_AUTO)
+
+
 def test_signed_expert_digest_union_supports_legacy_primed_family(monkeypatch):
     """Older primed attestations prove full cardinality through K-union."""
     source = _CardinalitySource(experts=4, manifest_experts=4)

@@ -1354,6 +1354,13 @@ def authenticate_policy_cardinality(policy: dict[int, dict[int, int]],
             expected_count = getattr(plan, "attested_expert_counts", {}).get(
                 piece.source.slug)
             held = _header_expert_ids(header)
+            if (expected_count is not None
+                    and any(expert < 0 or expert >= expected_count
+                            for expert in held)):
+                raise TrustError(
+                    f"layer {plan.layer}: {piece.source} authenticated header "
+                    f"contains expert ids outside signed family cardinality "
+                    f"{expected_count}")
             if expected_count is None:
                 # Sparse signed digests establish no family size. Once the
                 # header itself is authenticated, a complete dense inventory
