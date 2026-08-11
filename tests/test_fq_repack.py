@@ -11,27 +11,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_repack  # noqa: E402
 
-E, RANKS = 4, 2
+E, RANKS = 4, 4
 LAYERS = [3, 4]
 PROJS = ["gate_proj", "up_proj", "down_proj"]
 COMPS = ["trellis", "suh", "svh", "mcg"]
 
 
 def tensor_bytes(layer, e, proj, rank, comp, k=3) -> bytes:
-    """Synthetic tensor payload; trellis size scales with K (16*K bytes, the
-    same 4/3 K3->K4 ratio as real [in/16, out/16, 16*K] i16 tensors) and all
-    expert tensor CONTENT depends on K (independent encodes per K)."""
+    """Synthetic tensor payload with the rank-sliced topology invariants."""
     seed = f"{layer}.{e}.{proj}.{rank}.{comp}.k{k}".encode()
     h = hashlib.sha256(seed).digest()
-    return (h * 3)[: 16 * k if comp == "trellis" else 16]
+    size = 32 * k if comp == "trellis" else 32
+    return (h * (size // len(h) + 1))[:size]
 
 
-def write_shard(path: Path, layer: int, scramble: bool, k: int = 3) -> None:
+def write_shard(path: Path, layer: int, scramble: bool, k: int = 3,
+                ranks: int = RANKS) -> None:
     """Synthetic shard; scramble=True stores tensors in non-logical order."""
     entries = []
     for e in range(E):
         for proj in PROJS:
-            for rank in range(RANKS):
+            for rank in range(ranks):
                 for comp in COMPS:
                     name = f"model.layers.{layer}.mlp.experts.{e}.{proj}.rank{rank}.{comp}"
                     entries.append((name, tensor_bytes(layer, e, proj, rank, comp, k)))
@@ -42,7 +42,7 @@ def write_shard(path: Path, layer: int, scramble: bool, k: int = 3) -> None:
     for name, data in entries:
         hdr[name] = {
             "dtype": "I16" if name.endswith(".trellis") else "F16",
-            "shape": [len(data) // 2],
+            "shape": [1, 1, 16 * k] if name.endswith(".trellis") else [16],
             "data_offsets": [off, off + len(data)],
         }
         blobs.append(data)
@@ -67,6 +67,8 @@ def workspace(tmp_path):
         f"  model-layer-{l:03d}.safetensors"
         for l in LAYERS
     ]
+    (snap / "config.json").write_text(json.dumps({
+        "hybrid_tr3_tail": {"tp": 4, "codebook": "mcg"}}))
     (snap / "MANIFEST.sha256").write_text("\n".join(lines) + "\n")
     return snap, tmp_path / "out", tmp_path / "sign.key"
 
@@ -82,6 +84,38 @@ def run(snap, out, key):
             "--sign-key", str(key),
         ]
     )
+
+
+def test_repack_refuses_to_stamp_tp4_on_tp2_source(tmp_path):
+    snap = tmp_path / "tp2-source"
+    snap.mkdir()
+    write_shard(snap / "model-layer-003.safetensors", LAYERS[0],
+                scramble=False, ranks=2)
+    (snap / "config.json").write_text(json.dumps({
+        "hybrid_tr3_tail": {"tp": 2, "codebook": "mcg"}}))
+    out = tmp_path / "segments"
+    with pytest.raises(fq_repack.SourceLayoutError, match="TP1/TP2 cannot be repacked"):
+        fq_repack.main([
+            "--snapshot", str(snap), "--source-repo", "test/source-repo",
+            "--revision", "deadbeef", "--base-model", "test/base",
+            "--out", str(out), "--sign-key", str(tmp_path / "sign.key")])
+    assert not out.exists()
+
+
+def test_repack_rejects_unknown_routed_component_before_output(workspace):
+    snap, out, key = workspace
+    shard = snap / f"model-layer-{LAYERS[0]:03d}.safetensors"
+    header, body_off = fq_repack.read_header(shard)
+    old = next(name for name in header if name.endswith(".mcg"))
+    header[old.removesuffix("mcg") + "unexpected"] = header.pop(old)
+    body = shard.read_bytes()[body_off:]
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
+
+    with pytest.raises(fq_repack.SourceLayoutError, match="unsupported routed component"):
+        run(snap, out, key)
+    assert not out.exists()
 
 
 def test_round_trip_byte_identity(workspace):

@@ -46,7 +46,7 @@ import time
 from pathlib import Path
 
 PROJ_ORDER = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}
-COMP_ORDER = {"trellis": 0, "suh": 1, "svh": 2, "mcg": 3}
+COMP_ORDER = {"trellis": 0, "suh": 1, "svh": 2, "mcg": 3, "mul1": 3}
 EXPERT_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(\w+_proj)\.rank(\d+)\.(\w+)$"
 )
@@ -57,10 +57,17 @@ STATE_SCHEMA = "fq-repack-state/2"
 TOOL_VERSION = "fq_repack/2"
 DEFAULT_LAYOUT = "rank_sliced_tp4"
 SEG_NAME_RE = re.compile(r"^layer-(\d+)\.k(\d+)\.safetensors$")
+TP4_RANKS = frozenset(range(4))
+TP4_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+TP4_CORE_COMPONENTS = frozenset(("trellis", "suh", "svh"))
 
 
 class ProvenanceError(RuntimeError):
     """Refusal to mix incompatible provenance in one output family."""
+
+
+class SourceLayoutError(ProvenanceError):
+    """The source cannot be represented by the selected segment layout."""
 
 
 def read_header(path: Path) -> tuple[dict, int]:
@@ -69,6 +76,237 @@ def read_header(path: Path) -> tuple[dict, int]:
         hlen = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(hlen))
     return hdr, 8 + hlen
+
+def _source_tail(snapshot: Path) -> dict:
+    """Return the optional rank-sliced config block, rejecting malformed JSON."""
+    path = Path(snapshot) / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SourceLayoutError(f"{path}: cannot read source topology ({e})") from e
+    if not isinstance(config, dict):
+        raise SourceLayoutError(f"{path}: source config must be a JSON object")
+    tail = config.get("hybrid_tr3_tail")
+    if tail is None:
+        return {}
+    if not isinstance(tail, dict):
+        raise SourceLayoutError(
+            f"{path}: hybrid_tr3_tail must be an object when present")
+    return tail
+
+
+def _required_tp4_components(tail: dict) -> frozenset[str]:
+    """The codebook marker is configured, not a hard-coded rotation-layout key."""
+    components = set(TP4_CORE_COMPONENTS)
+    schema = tail.get("tensor_schema")
+    if isinstance(schema, str):
+        groups = re.findall(r"\{([^{}]+)\}", schema)
+        if groups:
+            components.update(part for part in groups[-1].split("|") if part)
+    codebook = tail.get("codebook")
+    if codebook is not None:
+        if not isinstance(codebook, str) or not codebook:
+            raise SourceLayoutError(
+                "config.json: hybrid_tr3_tail.codebook must name the codebook "
+                "tensor component")
+        components.add(codebook)
+    else:
+        # The published layout's legacy config does not need to spell this out.
+        components.add("mcg")
+    unsupported = components - COMP_ORDER.keys()
+    if unsupported:
+        raise SourceLayoutError(
+            "config.json: rank_sliced_tp4 does not support routed component(s) "
+            f"{sorted(unsupported)}")
+    return frozenset(components)
+
+
+def _tensor_shape(tensor: dict, where: str) -> list[int]:
+    shape = tensor.get("shape") if isinstance(tensor, dict) else None
+    if not isinstance(shape, list) or any(
+            isinstance(axis, bool) or not isinstance(axis, int) or axis <= 0
+            for axis in shape):
+        raise SourceLayoutError(f"{where}: tensor shape must be positive integer axes")
+    return shape
+
+
+def _numel(shape: list[int]) -> int:
+    result = 1
+    for axis in shape:
+        result *= axis
+    return result
+
+
+def _routed_groups(header: dict, *, layer: int, who: str,
+                   components: frozenset[str]) -> dict:
+    groups: dict[int, dict[str, dict[int, dict[str, dict]]]] = {}
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            continue
+        match = EXPERT_RE.match(name)
+        if not match:
+            continue
+        named_layer, expert, projection, rank, component = match.groups()
+        if int(named_layer) != layer:
+            raise SourceLayoutError(
+                f"{who}: routed tensor {name!r} names layer {named_layer}, "
+                f"not source shard layer {layer}")
+        if projection not in TP4_PROJECTIONS:
+            raise SourceLayoutError(
+                f"{who}: unsupported routed projection {projection!r} in {name!r}")
+        if component not in components:
+            raise SourceLayoutError(
+                f"{who}: unsupported routed component {component!r} in {name!r}")
+        groups.setdefault(int(expert), {}).setdefault(projection, {}).setdefault(
+            int(rank), {})[component] = tensor
+    return groups
+
+
+def _validate_tp4_groups(groups: dict, *, experts: set[int], components: frozenset[str],
+                         layer: int, who: str) -> None:
+    for expert in sorted(experts):
+        projections = groups.get(expert)
+        if projections is None:
+            raise SourceLayoutError(
+                f"{who}: layer {layer} routed expert {expert} is absent; "
+                "rank_sliced_tp4 requires ranks {0, 1, 2, 3}")
+        for projection in TP4_PROJECTIONS:
+            ranks_by_component = projections.get(projection, {})
+            for component in sorted(components):
+                ranks = {rank for rank, values in ranks_by_component.items()
+                         if component in values}
+                if ranks != TP4_RANKS:
+                    raise SourceLayoutError(
+                        f"{who}: layer {layer} expert {expert} {projection}."
+                        f"{component} has ranks {sorted(ranks)}; "
+                        "rank_sliced_tp4 is TP4 only and requires exactly "
+                        "{0, 1, 2, 3} (TP1/TP2 cannot be repacked; TP8/TP16 "
+                        "are unimplemented)")
+            for rank in TP4_RANKS:
+                values = ranks_by_component[rank]
+                trellis = values["trellis"]
+                trellis_shape = _tensor_shape(
+                    trellis, f"{who}: layer {layer} expert {expert} "
+                    f"{projection}.rank{rank}.trellis")
+                if trellis.get("dtype") != "I16" or len(trellis_shape) != 3:
+                    raise SourceLayoutError(
+                        f"{who}: layer {layer} expert {expert} {projection}."
+                        f"rank{rank}.trellis must be I16 with [in_tiles, "
+                        "out_tiles, 16*K] shape")
+                if trellis_shape[2] % 16:
+                    raise SourceLayoutError(
+                        f"{who}: layer {layer} expert {expert} {projection}."
+                        f"rank{rank}.trellis K axis {trellis_shape[2]} is not "
+                        "a multiple of 16")
+                suh = _numel(_tensor_shape(
+                    values["suh"], f"{who}: layer {layer} expert {expert} "
+                    f"{projection}.rank{rank}.suh"))
+                svh = _numel(_tensor_shape(
+                    values["svh"], f"{who}: layer {layer} expert {expert} "
+                    f"{projection}.rank{rank}.svh"))
+                if suh != trellis_shape[0] * 16 or svh != trellis_shape[1] * 16:
+                    raise SourceLayoutError(
+                        f"{who}: layer {layer} expert {expert} {projection}."
+                        f"rank{rank} rotation axes do not match trellis "
+                        f"[{trellis_shape[0]}, {trellis_shape[1]}, 16*K] "
+                        f"(suh={suh}, svh={svh})")
+
+
+def _compare_tp4_topology(source: dict, segment: dict, *, layer: int, expert: int,
+                          projection: str, rank: int, component: str) -> None:
+    src_shape = _tensor_shape(
+        source, f"source layer {layer} expert {expert} {projection}.rank{rank}.{component}")
+    seg_shape = _tensor_shape(
+        segment, f"segment layer {layer} expert {expert} {projection}.rank{rank}.{component}")
+    if source.get("dtype") != segment.get("dtype"):
+        raise SourceLayoutError(
+            f"segment layer {layer} expert {expert} {projection}.rank{rank}."
+            f"{component} dtype {segment.get('dtype')!r} does not match source "
+            f"{source.get('dtype')!r}")
+    # K changes the final trellis axis.  Its tile axes still determine TP
+    # topology, whereas comparing the full shape would incorrectly reject K4.
+    if component == "trellis":
+        matches = src_shape[:2] == seg_shape[:2]
+    else:
+        matches = src_shape == seg_shape
+    if not matches:
+        raise SourceLayoutError(
+            f"segment layer {layer} expert {expert} {projection}.rank{rank}."
+            f"{component} topology {seg_shape} does not match source {src_shape}"
+            + (" on the non-K trellis axes" if component == "trellis" else ""))
+
+
+def preflight_source_layout(snapshot: Path, *, layout: str | None,
+                            targets: dict[int, set[int] | None],
+                            segment_headers: dict[tuple[int, int], dict] | None = None,
+                            segment_targets: dict[tuple[int, int], set[int]] | None = None
+                            ) -> None:
+    """Fail before hashing/staging when a selected layout cannot represent source.
+
+    Layouts are deliberately dispatched: TP4 facts apply only to
+    ``rank_sliced_tp4`` and do not constrain dense, MTP, or future layouts.
+    A missing ``hybrid_tr3_tail.tp`` is accepted only after exact routed-tensor
+    structure proves TP4; DCP fields are never treated as TP metadata.
+    """
+    if layout != DEFAULT_LAYOUT:
+        return
+    tail = _source_tail(snapshot)
+    if "tp" in tail:
+        tp = tail["tp"]
+        if isinstance(tp, bool) or not isinstance(tp, int) or tp != 4:
+            raise SourceLayoutError(
+                "config.json: hybrid_tr3_tail.tp must be integer 4 for "
+                "rank_sliced_tp4; TP1/TP2 cannot be repacked and TP8/TP16 "
+                "are unimplemented")
+    components = _required_tp4_components(tail)
+    source_groups: dict[int, dict] = {}
+    for shard in sorted(Path(snapshot).glob("model-layer-*.safetensors")):
+        try:
+            layer = int(shard.stem.split("-")[-1])
+        except ValueError as e:
+            raise SourceLayoutError(f"cannot determine layer from {shard.name}") from e
+        requested = targets.get(layer)
+        if layer not in targets:
+            continue
+        try:
+            header, _ = read_header(shard)
+        except (OSError, struct.error, json.JSONDecodeError) as e:
+            raise SourceLayoutError(f"{shard}: cannot read source header ({e})") from e
+        groups = _routed_groups(header, layer=layer, who=f"source {shard.name}",
+                                components=components)
+        if not groups:
+            # Dense/MTP shards are intentionally outside this routed layout.
+            continue
+        experts = set(groups) if requested is None else set(requested)
+        _validate_tp4_groups(groups, experts=experts, components=components,
+                             layer=layer, who=f"source {shard.name}")
+        source_groups[layer] = groups
+    if segment_headers is None:
+        return
+    for key, header in segment_headers.items():
+        layer, _k = key
+        wanted = (segment_targets or {}).get(key, set())
+        if not wanted:
+            continue
+        source = source_groups.get(layer)
+        if source is None:
+            # The source layer was dense/MTP and did not route experts.
+            continue
+        segment = _routed_groups(header, layer=layer, who=f"segment layer {layer}",
+                                 components=components)
+        _validate_tp4_groups(segment, experts=set(wanted), components=components,
+                             layer=layer, who=f"segment layer {layer}")
+        for expert in wanted:
+            for projection in TP4_PROJECTIONS:
+                for rank in TP4_RANKS:
+                    for component in components:
+                        _compare_tp4_topology(
+                            source[expert][projection][rank][component],
+                            segment[expert][projection][rank][component],
+                            layer=layer, expert=expert, projection=projection,
+                            rank=rank, component=component)
 
 
 def expert_key(name: str):
@@ -524,6 +762,25 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     out, k, layout = args.out, args.k, DEFAULT_LAYOUT
+    shards = sorted(args.snapshot.glob("model-layer-*.safetensors"))
+    wanted = None
+    if args.layers:
+        wanted = set()
+        for part in args.layers.split(","):
+            if "-" in part:
+                a, b = part.split("-")
+                wanted.update(range(int(a), int(b) + 1))
+            else:
+                wanted.add(int(part))
+    targets = {
+        int(shard.stem.split("-")[-1]): None
+        for shard in shards
+        if wanted is None or int(shard.stem.split("-")[-1]) in wanted
+    }
+    # This runs before output creation, source hashing, signing, or a segment
+    # write: an incompatible TP source must never gain a trusted TP4 label.
+    preflight_source_layout(args.snapshot, layout=layout, targets=targets)
+
     (out / "attestations").mkdir(parents=True, exist_ok=True)
     existing = check_output_family(
         out, base_model=args.base_model, layout=layout, repo=args.source_repo,
@@ -551,18 +808,6 @@ def main(argv=None) -> int:
     signer = Signer(args.sign_key)
     source_shas = load_source_shas(args.snapshot)
     publisher = Publisher(args.publish, args.private)
-
-    shards = sorted(args.snapshot.glob("model-layer-*.safetensors"))
-    wanted = None
-    if args.layers:
-        wanted = set()
-        for part in args.layers.split(","):
-            if "-" in part:
-                a, b = part.split("-")
-                wanted.update(range(int(a), int(b) + 1))
-            else:
-                wanted.add(int(part))
-
     meta_common = {
         "base_model": args.base_model,
         "source_repo": args.source_repo,

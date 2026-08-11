@@ -115,8 +115,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fq_repack import (  # noqa: E402
     EXPERT_RE,
     Signer,
+    SourceLayoutError,
     atomic_write_json,
     expert_key,
+    preflight_source_layout,
     read_header,
     sha256_file,
 )
@@ -170,6 +172,43 @@ def _as_int(value):
         return int(str(value).strip())
     except ValueError:
         return None
+
+def effective_layout(policy: dict, manifest: dict, segments: Path, jobs) -> str | None:
+    """Resolve layout evidence before source bytes or fragment bodies are used."""
+    layouts = {
+        value for value in (policy.get("layout"), manifest.get("layout"))
+        if isinstance(value, str) and value
+    }
+    for _source, layer, bits in jobs:
+        if bits is None:
+            continue
+        for k in set(bits):
+            path = segments / f"layer-{layer:03d}.k{k}.safetensors"
+            if not path.exists():
+                continue
+            try:
+                header, _ = read_header(path)
+            except (OSError, struct.error, json.JSONDecodeError) as e:
+                raise AssemblyError(
+                    f"{path}: cannot read segment layout header ({e})") from e
+            metadata = header.get("__metadata__")
+            if not isinstance(metadata, dict) or metadata.get("layout") is None:
+                continue
+            layout = metadata["layout"]
+            if not isinstance(layout, str) or not layout:
+                raise AssemblyError(f"{path}: segment layout must be a non-empty string")
+            layouts.add(layout)
+    if not layouts:
+        if any(bits is not None for _source, _layer, bits in jobs):
+            raise AssemblyError(
+                "cannot determine routed source layout: add layout to the policy "
+                "or family manifest, or use segments carrying layout metadata")
+        return None
+    # Any rank-sliced evidence must not silently bypass the TP4 preflight while
+    # SegmentVerifier later reports the conflicting source of truth.
+    if "rank_sliced_tp4" in layouts:
+        return "rank_sliced_tp4"
+    return next(iter(layouts))
 
 
 # ------------------------------------------------- strict header validation
@@ -1218,6 +1257,17 @@ def main(argv=None) -> int:
         if wanted is not None and layer not in wanted:
             continue
         jobs.append((src_shard, layer, bpe.get(str(layer))))
+    layout = effective_layout(policy, manifest, args.segments, jobs)
+    source_targets = {
+        layer: set(range(len(lb)))
+        for _src, layer, lb in jobs
+        if lb is not None
+    }
+    try:
+        # Source-only evidence is checked before a segment is even opened.
+        preflight_source_layout(args.source, layout=layout, targets=source_targets)
+    except SourceLayoutError as e:
+        raise AssemblyError(str(e)) from e
 
     # Every segment is opened and authenticated BEFORE the output dir is
     # touched: a bad fragment (or a bad trust configuration) must never cost
@@ -1227,6 +1277,7 @@ def main(argv=None) -> int:
     total, seg_records = {}, []
     staged = StagedOutput(args.out, args.force)
     try:
+        segment_targets = {}
         for _src, layer, lb in jobs:
             for k in sorted(set(lb or ())):
                 seg = args.segments / f"layer-{layer:03d}.k{k}.safetensors"
@@ -1234,9 +1285,22 @@ def main(argv=None) -> int:
                     raise FileNotFoundError(
                         f"missing segment {seg} for layer {layer}")
                 readers[(layer, k)] = SegmentReader(seg)
+                segment_targets[(layer, k)] = {
+                    e for e, assigned_k in enumerate(lb) if assigned_k == k}
+        try:
+            # Segment headers are enough to compare TP-bearing axes; no
+            # fragment bytes have been hashed or staged at this point.
+            preflight_source_layout(
+                args.source, layout=layout, targets=source_targets,
+                segment_headers={key: reader.hdr for key, reader in readers.items()},
+                segment_targets=segment_targets)
+        except SourceLayoutError as e:
+            raise AssemblyError(str(e)) from e
+        for _src, layer, lb in jobs:
+            for k in sorted(set(lb or ())):
                 seg_records.append(verifier.verify(
                     layer, k, readers[(layer, k)],
-                    [e for e, kk in enumerate(lb) if kk == k]))
+                    [e for e, assigned_k in enumerate(lb) if assigned_k == k]))
         if args.insecure:
             who = "NOT VERIFIED (--insecure)"
         else:

@@ -25,7 +25,8 @@ def _build_k3_workspace(root: Path) -> tuple[Path, Path]:
     snap.mkdir()
     for i, layer in enumerate(LAYERS):
         write_shard(snap / f"model-layer-{layer:03d}.safetensors", layer, scramble=bool(i))
-    (snap / "config.json").write_text("{}")
+    (snap / "config.json").write_text(json.dumps({
+        "hybrid_tr3_tail": {"tp": 4, "codebook": "mcg"}}))
     lines = [
         f"{hashlib.sha256((snap / f'model-layer-{l:03d}.safetensors').read_bytes()).hexdigest()}"
         f"  model-layer-{l:03d}.safetensors"
@@ -68,7 +69,99 @@ def policy_file(root: Path, bits: dict, name="policy.json") -> Path:
     p.write_text(json.dumps({"schema": "fq-policy/2", "bits_per_expert": bits}))
     return p
 
+def topology_snapshot(root: Path, *, ranks: int = 4, tp: int | None = 4,
+                      dcp: int | None = None) -> Path:
+    """A source whose routed structure can intentionally differ from TP4."""
+    snap = root / "topology-source"
+    snap.mkdir()
+    for layer in LAYERS:
+        write_shard(snap / f"model-layer-{layer:03d}.safetensors", layer,
+                    scramble=False, ranks=ranks)
+    tail = {"codebook": "mcg"}
+    if tp is not None:
+        tail["tp"] = tp
+    if dcp is not None:
+        tail["dcp"] = dcp
+    (snap / "config.json").write_text(json.dumps({"hybrid_tr3_tail": tail}))
+    return snap
 
+
+def test_tp2_source_fails_before_segment_hashing_or_output(repacked, monkeypatch):
+    _snap, segments, tmp = repacked
+    source = topology_snapshot(tmp, ranks=2, tp=2)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "tp2-output"
+    monkeypatch.setattr(
+        fq_assemble.SegmentVerifier, "verify",
+        lambda *_args, **_kwargs: pytest.fail("TP2 source reached fragment hashing"))
+    with pytest.raises(fq_assemble.AssemblyError, match="tp must be integer 4"):
+        assemble(segments, source, ppath, out)
+    assert not out.exists()
+
+
+def test_manifestless_segments_still_dispatch_tp4_preflight(repacked):
+    _snap, segments, tmp = repacked
+    (segments / "fq-manifest.json").unlink()
+    source = topology_snapshot(tmp, ranks=2, tp=2)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "manifestless-tp2"
+    with pytest.raises(fq_assemble.AssemblyError, match="tp must be integer 4"):
+        assemble(segments, source, ppath, out, "--insecure")
+    assert not out.exists()
+
+
+def test_routed_assembly_requires_layout_evidence(repacked):
+    snap, segments, tmp = repacked
+    (segments / "fq-manifest.json").unlink()
+    for segment in segments.glob("layer-*.safetensors"):
+        rewrite_header(segment, lambda header: header["__metadata__"].pop("layout"))
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "layout-unknown"
+    with pytest.raises(fq_assemble.AssemblyError, match="cannot determine routed source layout"):
+        assemble(segments, snap, ppath, out, "--insecure")
+    assert not out.exists()
+
+
+def test_missing_tp4_rank_fails_before_output(repacked):
+    _snap, segments, tmp = repacked
+    source = topology_snapshot(tmp, ranks=3, tp=4)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "missing-rank-output"
+    with pytest.raises(fq_assemble.AssemblyError, match=r"ranks \[0, 1, 2\]"):
+        assemble(segments, source, ppath, out)
+    assert not out.exists()
+
+
+def test_missing_tp_is_accepted_only_for_structurally_exact_tp4(repacked):
+    _snap, segments, tmp = repacked
+    source = topology_snapshot(tmp, ranks=4, tp=None)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    assert assemble(segments, source, ppath, tmp / "metadata-absent") == 0
+
+
+def test_dcp4_is_not_mistaken_for_tp(repacked):
+    _snap, segments, tmp = repacked
+    source = topology_snapshot(tmp, ranks=4, tp=4, dcp=4)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    assert assemble(segments, source, ppath, tmp / "dcp4") == 0
+
+
+
+
+def test_segment_trellis_axes_must_match_source_before_hashing(repacked):
+    snap, segments, tmp = repacked
+    segment = segments / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+
+    def alter_axis(header):
+        name = next(name for name in header if name.endswith(".trellis"))
+        header[name]["shape"] = [3, 1, 16]
+
+    rewrite_header(segment, alter_axis)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "axis-mismatch"
+    with pytest.raises(fq_assemble.AssemblyError, match="rotation axes"):
+        assemble(segments, snap, ppath, out)
+    assert not out.exists()
 @pytest.fixture()
 def repacked(tmp_path):
     snap, out = _build_k3_workspace(tmp_path)
@@ -591,7 +684,7 @@ def test_segment_declaring_another_layer_fails(repacked):
     for layer in LAYERS:
         reattest(segments, layer, 3, tmp / "k.key")
     ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
-    with pytest.raises(fq_assemble.VerificationError, match="declares layer"):
+    with pytest.raises(fq_assemble.AssemblyError, match="names layer"):
         assemble(segments, snap, ppath, tmp / "asm-swap")
 
 
