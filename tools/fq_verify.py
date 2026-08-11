@@ -1126,11 +1126,31 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     (upstream_payload or {}).get("expert_sha256", {}).get(str(eid)) ==
                     (payload or {}).get("expert_sha256", {}).get(str(eid))
                     for eid in claimed_experts)
+                parent_identity = parent_record.get("identity")
+                encode_identity_ok = False
+                if (upstream_payload or {}).get("predicate") == "encode-of":
+                    try:
+                        encoded_model, encoded_revision = fq_fetch.encode_materials_identity(
+                            upstream_payload, where=f"{copied}: encode evidence")
+                        quant_k = (upstream_payload.get("quant_args") or {}).get("K")
+                        encode_identity_ok = (
+                            quant_k == k and
+                            isinstance(parent_identity, dict) and
+                            parent_identity.get("predicate") == "encode-of" and
+                            parent_identity.get("base_model") == encoded_model and
+                            parent_identity.get("base_revision") == encoded_revision and
+                            (not parent_record.get("header_authenticated") or
+                             parent_identity.get("layout") ==
+                             (payload or {}).get("layout")))
+                    except TrustError:
+                        encode_identity_ok = False
                 material_file = materials.get("file")
                 terminal_source_ok = (
-                    parent_record.get("role") == "source_fragment" and
-                    (upstream_payload or {}).get("predicate") == "repack-of" and
-                    isinstance(material_file, str) and bool(material_file))
+                    parent_record.get("role") == "source_fragment" and (
+                        ((upstream_payload or {}).get("predicate") == "repack-of" and
+                         isinstance(material_file, str) and bool(material_file)) or
+                        ((upstream_payload or {}).get("predicate") == "encode-of" and
+                         encode_identity_ok)))
                 release_ok, release = verify_release_evidence(
                     fam, parent_record, evidence_source=evidence_source,
                     parent_verifier=parent_verifier,
