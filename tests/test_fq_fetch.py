@@ -1744,6 +1744,14 @@ def test_commit_ids_are_normalized_before_drift_checks(tmp_path, served):
     report = json.loads((out / "fq-fetch-report.json").read_text())
     assert report["sources"][0]["revision"] == REV
     assert report["sources"][0]["requested_revision"] == REV.upper()
+    payload = _payload(
+        out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
+    parent = payload["parents"][0]
+    slug = fq_fetch.slugify("test/pub", REV)
+    assert parent["subdir"] == ""
+    assert parent["evidence_source"] == slug
+    assert (out / "attestations" / slug
+            / f"layer-{LAYERS[0]:03d}.k3.jsonl").exists()
 
 
 def test_recursive_fetched_subset_is_refused_without_signed_nested_evidence(
@@ -1798,3 +1806,27 @@ def test_unbound_family_identity_mismatch_is_fatal(tmp_path, served, capsys):
          "--trust-root", trust_root(tmp_path, pub)], expect=1)
     assert "incompatible with prior selected family" in capsys.readouterr().err
     assert not list(out.glob("*.safetensors"))
+
+
+def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
+    key = tmp_path / "shared.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(4,), key=key,
+                                salt="root")
+    family, _, _ = build_source(tmp_path, "family", ks=(4,), key=key,
+                                salt="nested")
+    subdir = "families/nested"
+    _copy_k_family(repo, family, subdir, 4)
+    nested = f"test/pub@main:{subdir}"
+    select = tmp_path / "select.json"
+    select.write_text(json.dumps(
+        {"schema": "fq-select/1",
+         "experts": {str(LAYERS[0]): {"0": nested}}}))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [4] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--source", nested, "--select", select, "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    source = report["experts"][str(LAYERS[0])]["k4"]["0"]["source"]
+    assert source == f"test/pub@{REV}:{subdir}"

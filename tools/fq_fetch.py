@@ -312,10 +312,13 @@ class Source:
         self.subdir = subdir
         self.t = transport
         self.order = order
-        # A symbolic-ref cache is only for the resolver request. All
-        # artifact caches move under the resolved immutable commit.
+        # Immutable commit spellings identify the same revision irrespective
+        # of case.  Evidence and cache paths must use that canonical spelling
+        # because locally signed parents serialize the normalized commit.
         self.cache_root = cache_root
-        self.slug = slugify(repo, self.requested_revision, subdir)
+        self.slug = slugify(
+            repo, self.revision if self.pinned else self.requested_revision,
+            subdir)
         self.cache = cache_root / self.slug
         self.cache.mkdir(parents=True, exist_ok=True)
         self.resolved_commit: str | None = (self.revision if self.pinned else None)
@@ -739,7 +742,7 @@ class Source:
             merged["identity"] = identity
             merged["parents"] = payload.get("parents")
             merged["lines"] += 1
-1:             for eid, digest in payload["expert_sha256"].items():
+            for eid, digest in payload["expert_sha256"].items():
                 eid = str(eid)
                 if eid in merged["expert_sha256"] and merged["expert_sha256"][eid] != digest:
                     raise TrustError(
@@ -756,13 +759,6 @@ class Source:
             merged.setdefault("predicate", payload.get("predicate"))
             merged.setdefault("materials", payload.get("materials"))
             merged.setdefault("layout", payload.get("layout"))
-2:         "base_model": plan.identity.get("base_model"),
-        "base_revision": plan.identity.get("base_revision"),
-        "layout": plan.identity.get("layout"),
-        # This is the authenticated full family count, not len(plan.pieces):
-        # a mixed-K recipe distributes one dense layer across multiple
-        # derived subset files, each of which must remain usable as a source.
-        "num_experts": plan.family_num_experts,
         if not merged["lines"]:
             detail = ("; ".join(merged["rejected_lines"])
                       or f"no line names {segment_file}")
@@ -1408,8 +1404,13 @@ def select_preference(sel: dict, layer: int, expert: int) -> str | None:
 
 
 def source_matches(source: Source, alias: str) -> bool:
-    return alias in (source.repo, str(source), source.slug,
-                     f"{source.repo}@{source.requested_revision}")
+    aliases = {source.repo, str(source), source.slug,
+               f"{source.repo}@{source.requested_revision}"}
+    if source.subdir:
+        aliases.add(
+            f"{source.repo}@{source.requested_revision}:{source.subdir}")
+        aliases.add(f"{source.repo}@{source.revision}:{source.subdir}")
+    return alias in aliases
 
 
 def validate_fetch_binding(binding: dict, policy: dict[int, dict[int, int]],
@@ -2124,6 +2125,10 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "repo": src.repo,
             "revision": src.resolved_commit,
             "requested_revision": src.requested_revision,
+            "subdir": src.subdir,
+            # Signed locator for the copied evidence.  It is canonicalized
+            # from repo, resolved commit, and subdirectory—not user input.
+            "evidence_source": src.slug,
             "file": frag.get("file"),
             "sha256": frag.get("sha256"),
             "size": frag.get("size"),
@@ -2152,24 +2157,7 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
                           for p in sorted(plan.pieces, key=lambda x: x.expert)},
         "layer": plan.layer,
         "k": plan.k,
-1:             for eid, digest in payload["expert_sha256"].items():
-                eid = str(eid)
-                if eid in merged["expert_sha256"] and merged["expert_sha256"][eid] != digest:
-                    raise TrustError(
-                        f"{where}: trusted lines disagree about expert {eid} digest")
-                merged["expert_sha256"][eid] = digest
-            count = payload.get("num_experts")
-            if count is not None:
-                previous = merged.get("num_experts")
-                if previous is not None and previous != count:
-                    raise TrustError(
-                        f"{self}: {name} trusted attestation lines disagree on "
-                        f"num_experts ({previous} vs {count})")
-                merged["num_experts"] = count
-            merged.setdefault("predicate", payload.get("predicate"))
-            merged.setdefault("materials", payload.get("materials"))
-            merged.setdefault("layout", payload.get("layout"))
-2:         "base_model": plan.identity.get("base_model"),
+        "base_model": plan.identity.get("base_model"),
         "base_revision": plan.identity.get("base_revision"),
         "layout": plan.identity.get("layout"),
         # This is the authenticated full family count, not len(plan.pieces):
