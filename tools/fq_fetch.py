@@ -114,7 +114,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import fq_trust  # noqa: E402
-from fq_repack import expert_key  # noqa: E402
+from fq_repack import EXPERT_RE, expert_key  # noqa: E402
 from fq_trust import TrustError  # noqa: E402
 
 SEGMENT_SCHEMA = "fq-segment/1"
@@ -613,6 +613,14 @@ class Source:
             merged["lines"] += 1
             for eid, digest in (payload.get("expert_sha256") or {}).items():
                 merged["expert_sha256"][str(eid)] = digest
+            count = payload.get("num_experts")
+            if count is not None:
+                previous = merged.get("num_experts")
+                if previous is not None and previous != count:
+                    raise TrustError(
+                        f"{self}: {name} trusted attestation lines disagree on "
+                        f"num_experts ({previous} vs {count})")
+                merged["num_experts"] = count
             merged.setdefault("predicate", payload.get("predicate"))
             merged.setdefault("materials", payload.get("materials"))
             merged.setdefault("layout", payload.get("layout"))
@@ -997,6 +1005,243 @@ def _is_sha256(value: object) -> bool:
     except ValueError:
         return False
     return True
+def _header_expert_count(header: dict, *, layer: int, where: str) -> int:
+    """Return the dense expert cardinality authenticated by one segment header."""
+    experts = _header_expert_ids(header)
+    count = len(experts)
+    if experts != set(range(count)):
+        raise TrustError(
+            f"layer {layer}: {where} header has non-dense expert ids "
+            f"{sorted(experts)}; fq-policy/2 requires experts 0 through "
+            f"{count - 1}")
+    declared = (header.get("__metadata__") or {}).get("num_experts")
+    if declared is not None:
+        try:
+            declared = int(declared)
+        except (TypeError, ValueError) as e:
+            raise TrustError(
+                f"layer {layer}: {where} header declares invalid "
+                f"num_experts={declared!r}") from e
+        if declared != count:
+            raise TrustError(
+                f"layer {layer}: {where} header declares {declared} experts "
+                f"but holds {count}")
+    return count
+
+
+def _header_expert_ids(header: dict) -> set[int]:
+    """Expert ids physically present in an authenticated segment header."""
+    return {int(m.group(2)) for name in header if (m := EXPERT_RE.match(name))}
+
+
+def _manifest_expert_count(source: Source, *, layer: int) -> int | None:
+    value = source.manifest.get("num_experts")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise TrustError(
+            f"layer {layer}: {source} family manifest declares invalid "
+            f"num_experts={value!r}") from e
+
+
+def _signed_expert_count(attestation: dict, *, layer: int, source: Source) -> int:
+    """Read the cardinality from the trusted signed attestation payload."""
+    value = attestation.get("num_experts")
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as e:
+        raise TrustError(
+            f"layer {layer}: {source} signed attestation has no valid "
+            "num_experts; refusing to transfer a payload before a dense "
+            "fq-policy/2 can be checked") from e
+    if count < 0:
+        raise TrustError(
+            f"layer {layer}: {source} signed attestation declares invalid "
+            f"num_experts={value!r}")
+    return count
+
+
+def _attested_cardinality(source: Source, layer: int, k: int,
+                          verifier: fq_trust.Verifier) -> int:
+    """Get a trusted family cardinality without reading segment payload bytes.
+
+    New producers sign ``num_experts`` directly.  Older primed families sign
+    the per-expert digest map instead; unioning those signed maps across their
+    advertised K files supplies the same dense inventory without trusting a
+    ranged header or fetching a parent body.
+    """
+    index = source.index(k) or {}
+    entry = index.get(str(layer))
+    if not entry:
+        raise TrustError(
+            f"layer {layer}: {source} has no K{k} segment with a signed "
+            "expert cardinality")
+    attestation = source.attestation(layer, k, verifier, entry["file"])
+    if attestation.get("num_experts") is not None:
+        return _signed_expert_count(attestation, layer=layer, source=source)
+
+    experts: set[int] = set()
+    variants = {int(k)}
+    for variant in source.manifest.get("k_variants") or ():
+        try:
+            variants.add(int(variant))
+        except (TypeError, ValueError):
+            continue
+    for variant in sorted(variants):
+        candidate = source.index(variant) or {}
+        candidate_entry = candidate.get(str(layer))
+        if not candidate_entry:
+            continue
+        candidate_attestation = source.attestation(
+            layer, variant, verifier, candidate_entry["file"])
+        digests = candidate_attestation.get("expert_sha256")
+        if not isinstance(digests, dict):
+            raise TrustError(
+                f"layer {layer}: {source} K{variant} signed attestation has "
+                "neither num_experts nor an expert_sha256 map")
+        try:
+            experts.update(int(expert) for expert in digests)
+        except (TypeError, ValueError) as e:
+            raise TrustError(
+                f"layer {layer}: {source} K{variant} signed expert ids are "
+                "not integers") from e
+    count = len(experts)
+    if experts != set(range(count)):
+        raise TrustError(
+            f"layer {layer}: {source} signed expert digest maps are not dense "
+            f"0..{count - 1}")
+    return count
+
+
+def _check_policy_length(layer: int, bits: dict[int, int],
+                         counts: set[int], *, authority: str) -> None:
+    if not counts:
+        return  # the ordinary no-source error explains this case
+    if len(counts) != 1:
+        raise TrustError(
+            f"layer {layer}: {authority} sources disagree on family expert "
+            f"cardinality ({', '.join(map(str, sorted(counts)))})")
+    expected = next(iter(counts))
+    supplied = len(bits)
+    if supplied != expected:
+        raise TrustError(
+            f"layer {layer} policy has {supplied} entries; source/family "
+            f"requires {expected}")
+
+
+def validate_policy_cardinality(policy: dict[int, dict[int, int]],
+                                plans: list[FilePlan], sources: list[Source],
+                                verifier: fq_trust.Verifier) -> None:
+    """Reject bad dense policies from signed attestation metadata before I/O.
+
+    `num_experts` is signed in each repack attestation.  That makes it safe to
+    reject malformed policies before header authentication's deliberate
+    full-fragment fallback, avoiding an otherwise pointless multi-gigabyte
+    transfer when a publisher has not yet signed a header digest.
+    """
+    counts: dict[int, set[int]] = {}
+    seen: set[tuple[int, str, int]] = set()
+    for plan in plans:
+        for piece in plan.pieces:
+            key = (plan.layer, piece.source.slug, plan.k)
+            if key in seen:
+                continue
+            seen.add(key)
+            if plan.atts.get(piece.source.slug) is None:
+                raise TrustError(
+                    f"layer {plan.layer}: {piece.source} has no trusted "
+                    "attestation for its planned segment")
+            count = _attested_cardinality(
+                piece.source, plan.layer, plan.k, verifier)
+            known = getattr(plan, "attested_expert_counts", {})
+            known[piece.source.slug] = count
+            plan.attested_expert_counts = known
+            counts.setdefault(plan.layer, set()).add(count)
+
+    # An empty list routes no K and creates no plan.  Its cardinality still
+    # comes from an attestation, never from an unauthenticated header.
+    for layer in policy:
+        if layer in counts:
+            continue
+        for source in sources:
+            for k in source.manifest.get("k_variants") or ():
+                try:
+                    count = _attested_cardinality(source, layer, int(k), verifier)
+                except (TypeError, ValueError):
+                    continue
+                counts.setdefault(layer, set()).add(count)
+                break
+            if layer in counts:
+                break
+
+    for layer, bits in sorted(policy.items()):
+        _check_policy_length(layer, bits, counts.get(layer, set()),
+                             authority="signed attestation")
+
+
+def authenticate_policy_cardinality(policy: dict[int, dict[int, int]],
+                                    plans: list[FilePlan], mode: str) -> None:
+    """Authenticate headers and bind signed counts to their actual inventory."""
+    counts: dict[int, set[int]] = {}
+    seen: set[tuple[int, str, int]] = set()
+    for plan in plans:
+        authenticate_plan(plan, mode)
+        for piece in plan.pieces:
+            key = (plan.layer, piece.source.slug, plan.k)
+            if key in seen:
+                continue
+            seen.add(key)
+            header = piece.source.segment_header(plan.layer, plan.k)[0]
+            attestation = plan.atts[piece.source.slug]
+            expected_count = getattr(plan, "attested_expert_counts", {}).get(
+                piece.source.slug)
+            if expected_count is None:
+                raise TrustError(
+                    f"layer {plan.layer}: {piece.source} has no preflight "
+                    "signed family cardinality")
+            held = _header_expert_ids(header)
+            if any(expert < 0 or expert >= expected_count for expert in held):
+                raise TrustError(
+                    f"layer {plan.layer}: {piece.source} authenticated header "
+                    f"contains expert ids outside signed family cardinality "
+                    f"{expected_count}")
+            declared = (header.get("__metadata__") or {}).get("num_experts")
+            if declared is not None:
+                try:
+                    declared = int(declared)
+                except (TypeError, ValueError) as e:
+                    raise TrustError(
+                        f"layer {plan.layer}: {piece.source} authenticated header "
+                        f"declares invalid num_experts={declared!r}") from e
+                if declared not in (len(held), expected_count):
+                    raise TrustError(
+                        f"layer {plan.layer}: {piece.source} authenticated header "
+                        f"declares {declared} experts; it holds {len(held)} and "
+                        f"signed family evidence requires {expected_count}")
+            manifest_count = _manifest_expert_count(piece.source, layer=plan.layer)
+            if manifest_count is not None and manifest_count != expected_count:
+                if held == set(range(expected_count)):
+                    raise TrustError(
+                        f"layer {plan.layer}: {piece.source} family manifest "
+                        f"declares {manifest_count} experts but its authenticated "
+                        f"header holds {expected_count}")
+                raise TrustError(
+                    f"layer {plan.layer}: {piece.source} family manifest declares "
+                    f"{manifest_count} experts but its signed family evidence "
+                    f"requires {expected_count}")
+            prior = getattr(plan, "family_num_experts", None)
+            if prior is not None and prior != expected_count:
+                raise TrustError(
+                    f"layer {plan.layer}: authenticated sources disagree on "
+                    f"family expert cardinality ({prior} vs {expected_count})")
+            plan.family_num_experts = expected_count
+            plan.meta["num_experts"] = str(expected_count)
+            counts.setdefault(plan.layer, set()).add(expected_count)
+    for layer, bits in sorted(policy.items()):
+        _check_policy_length(layer, bits, counts.get(layer, set()),
+                             authority="authenticated")
 
 
 def load_select(path: Path | None) -> dict:
@@ -1508,9 +1753,11 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "hessian_id": base.get("hessian_id"),
         "k_variants": ks,
         "moe_layers": [min(layers), max(layers)] if layers else [],
-        "num_experts": max((len(v.get("experts", {}))
-                            for idx in per_k.values() for v in idx.values()),
-                           default=0),
+        "num_experts": max(
+            (len({piece.expert for plan in plans if plan.layer == layer
+                  for piece in plan.pieces})
+             for layer in layers),
+            default=0),
         "sources": [str(s) for s in sources],
         "tensor_indexes": index_names,
         # The key that signed THIS tree's attestations.  For a fetched subset
@@ -1644,6 +1891,10 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
                           for p in sorted(plan.pieces, key=lambda x: x.expert)},
         "layer": plan.layer,
         "k": plan.k,
+        # This is the authenticated full family count, not len(plan.pieces):
+        # a mixed-K recipe distributes one dense layer across multiple
+        # derived subset files, each of which must remain usable as a source.
+        "num_experts": plan.family_num_experts,
         "derivation": {
             "rule": "range_subset_v1",
             "description": (
@@ -1976,6 +2227,7 @@ def main(argv=None) -> int:
         plans, problems = plan_fetch(policy, sources, verifier,
                                      prefer_sha=prefer_sha, select=select,
                                      binding=binding)
+        validate_policy_cardinality(policy, plans, sources, verifier)
     except TrustError as e:
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
         return 1
@@ -2037,9 +2289,18 @@ def main(argv=None) -> int:
                  "plans": [{"file": pl.name, "experts": len(pl.pieces),
                             "bytes": pl.bytes_needed} for pl in plans]},
                 indent=1) + "\n")
-        print("dry run: nothing fetched (the plan above is drafted from "
-              "unverified headers; a real run authenticates them first)")
+        print("dry run: no payload bytes fetched (signed attestations "
+              "validated dense policy cardinality)")
         return 0
+    try:
+        authenticate_policy_cardinality(policy, plans, args.header_trust)
+    except TrustError as e:
+        for plan in plans:
+            for source in {p.source.slug: p.source for p in plan.pieces}.values():
+                source.discard_verified_pieces(plan.name)
+        print(f"TRUST FAILURE: {e}", file=sys.stderr)
+        return 1
+
 
     signer = None
     if not args.no_attest:
@@ -2052,11 +2313,8 @@ def main(argv=None) -> int:
     t0 = time.time()
     try:
         for plan in plans:
-            # Prove the header before a single byte of this file is fetched
-            # or written: the draft plan above is not evidence of anything.
             parents = {p.source.slug: p.source for p in plan.pieces}.values()
             try:
-                authenticate_plan(plan, args.header_trust)
                 entry = fetch_plan(
                     plan, out, state, transport,
                     max_chunk=max(1, int(args.chunk_mb * (1 << 20))),

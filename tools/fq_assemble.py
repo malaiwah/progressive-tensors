@@ -616,8 +616,12 @@ class SegmentVerifier:
                     if EXPERT_RE.match(n)})
         declared = _as_int(meta.get("num_experts"))
         if declared is not None and declared != held:
-            raise VerificationError(
-                f"{name}: metadata says num_experts={declared}, header holds {held}")
+            derived_count = _as_int((payload or {}).get("num_experts"))
+            if (payload or {}).get("predicate") != "derived-from" or (
+                    derived_count != declared or declared < held):
+                raise VerificationError(
+                    f"{name}: metadata says num_experts={declared}, header holds "
+                    f"{held}")
         family_n = _as_int(self.manifest.get("num_experts"))
         if family_n is not None and held > family_n:
             raise VerificationError(
@@ -647,6 +651,38 @@ class SegmentVerifier:
                     f"{name}: attestation {field}={got!r} contradicts segment "
                     f"metadata {have!r}")
 
+
+
+def validate_policy_cardinality(jobs, manifest: dict) -> None:
+    """Reject incomplete or oversized dense policies before segment hashing.
+
+    The source checkpoint is the assembly-time authority: it tells us exactly
+    which routed expert ids will be dereferenced.  A segment-family manifest
+    is an additional family claim, so it must agree rather than silently
+    widening or narrowing that source inventory.
+    """
+    manifest_count = _as_int(manifest.get("num_experts"))
+    for src_shard, layer, bits in jobs:
+        if bits is None:
+            continue
+        header, _meta, _body, _size = validate_safetensors_file(src_shard)
+        experts = {int(match.group(2)) for name in header
+                   if (match := EXPERT_RE.match(name))}
+        required = len(experts)
+        if experts != set(range(required)):
+            raise VerificationError(
+                f"layer {layer}: source shard has non-dense expert ids "
+                f"{sorted(experts)}; fq-policy/2 requires experts 0 through "
+                f"{required - 1}")
+        if manifest_count is not None and manifest_count != required:
+            raise VerificationError(
+                f"layer {layer}: source shard holds {required} experts but "
+                f"the family manifest declares {manifest_count}")
+        supplied = len(bits)
+        if supplied != required:
+            raise VerificationError(
+                f"layer {layer} policy has {supplied} entries; source/family "
+                f"requires {required}")
 
 # ------------------------------------------------------------------ writing
 
@@ -1256,7 +1292,12 @@ def main(argv=None) -> int:
         layer = int(src_shard.stem.split("-")[-1])
         if wanted is not None and layer not in wanted:
             continue
+
         jobs.append((src_shard, layer, bpe.get(str(layer))))
+
+    # This reads only source headers and rejects incomplete dense recipes
+    # before any segment header/layout evidence is opened.
+    validate_policy_cardinality(jobs, manifest)
     layout = effective_layout(policy, manifest, args.segments, jobs)
     source_targets = {
         layer: set(range(len(lb)))
@@ -1268,6 +1309,8 @@ def main(argv=None) -> int:
         preflight_source_layout(args.source, layout=layout, targets=source_targets)
     except SourceLayoutError as e:
         raise AssemblyError(str(e)) from e
+
+
 
     # Every segment is opened and authenticated BEFORE the output dir is
     # touched: a bad fragment (or a bad trust configuration) must never cost

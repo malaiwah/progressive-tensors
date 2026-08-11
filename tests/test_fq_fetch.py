@@ -225,7 +225,102 @@ def _bound_policy(path: Path, *, source: str, nested: Path,
             },
         },
     )
+class _CardinalitySource:
+    """Authenticated-header fixture without 256 real expert payloads."""
 
+    def __init__(self, experts=256, manifest_experts=256):
+        self.slug = "test__cardinality@0123456789ab"
+        self.manifest = {"num_experts": manifest_experts, "k_variants": [3]}
+        self.header = {
+            "__metadata__": {"num_experts": str(experts)},
+            **{f"model.layers.3.mlp.experts.{e}.gate_proj.rank0.trellis": {}
+               for e in range(experts)},
+        }
+
+    def __str__(self):
+        return "test/cardinality@0123456789abcdef"
+
+    def index(self, k):
+        assert k == 3
+        return {"3": {"file": "layer-003.k3.safetensors"}}
+
+    def attestation(self, layer, k, verifier, filename):
+        assert (layer, k, filename) == (3, 3, "layer-003.k3.safetensors")
+        return {"num_experts": 256}
+
+    def authenticate_header(self, layer, k, attestation, mode):
+        assert (layer, k) == (3, 3)
+
+    def segment_header(self, layer, k):
+        assert (layer, k) == (3, 3)
+        return self.header, 0
+
+
+@pytest.mark.parametrize(("supplied", "valid"),
+                         [(0, False), (1, False), (255, False),
+                          (256, True), (257, False)])
+def test_dense_policy_requires_signed_256_expert_cardinality(supplied, valid):
+    source = _CardinalitySource()
+    policy = {3: {expert: 3 for expert in range(supplied)}}
+    plans = ([] if not supplied else
+             [type("Plan", (), {
+                 "layer": 3, "k": 3,
+                 "atts": {source.slug: {"num_experts": 256}},
+                 "pieces": [type("Piece", (), {"source": source})()]})()])
+    if valid:
+        fq_fetch.validate_policy_cardinality(policy, plans, [source], object())
+    else:
+        with pytest.raises(fq_trust.TrustError,
+                           match=fr"layer 3 policy has {supplied} entries; "
+                                 r"source/family requires 256"):
+            fq_fetch.validate_policy_cardinality(
+                policy, plans, [source], object())
+
+
+def test_fetch_rejects_manifest_authenticated_header_cardinality_disagreement(
+        monkeypatch):
+    source = _CardinalitySource(manifest_experts=255)
+    policy = {3: {expert: 3 for expert in range(256)}}
+    plan = type("Plan", (), {
+        "layer": 3, "k": 3,
+        "atts": {source.slug: {"num_experts": 256}},
+        "pieces": [type("Piece", (), {"source": source})()]})()
+    monkeypatch.setattr(fq_fetch, "authenticate_plan", lambda plan, mode: None)
+    fq_fetch.validate_policy_cardinality(policy, [plan], [source], object())
+    with pytest.raises(
+            fq_trust.TrustError,
+            match=r"layer 3: test/cardinality@.* family manifest declares 255 "
+                  r"experts but its authenticated header holds 256"):
+        fq_fetch.authenticate_policy_cardinality(
+            policy, [plan], fq_fetch.HEADER_AUTO)
+
+
+def test_signed_expert_digest_union_supports_legacy_primed_family(monkeypatch):
+    """Older primed attestations prove full cardinality through K-union."""
+    source = _CardinalitySource(experts=4, manifest_experts=4)
+    source.manifest = {"k_variants": [3, 4]}
+    source.index = lambda k: {"3": {"file": f"layer-003.k{k}.safetensors"}}
+    by_k = {3: {"0": "a" * 64, "2": "b" * 64},
+            4: {"1": "c" * 64, "3": "d" * 64}}
+    source.attestation = lambda layer, k, verifier, filename: {
+        "expert_sha256": by_k[k]}
+    source.header = {
+        "__metadata__": {"num_experts": "2"},
+        **{f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis": {}
+           for expert in (0, 2)},
+    }
+    policy = {3: {expert: 3 for expert in range(4)}}
+    plan = type("Plan", (), {
+        "layer": 3, "k": 3, "meta": {},
+        "atts": {source.slug: {"expert_sha256": by_k[3]}},
+        "pieces": [type("Piece", (), {"source": source})()]})()
+
+    fq_fetch.validate_policy_cardinality(policy, [plan], [source], object())
+    monkeypatch.setattr(fq_fetch, "authenticate_plan", lambda plan, mode: None)
+    fq_fetch.authenticate_policy_cardinality(
+        policy, [plan], fq_fetch.HEADER_AUTO)
+    assert plan.attested_expert_counts[source.slug] == 4
+    assert plan.meta["num_experts"] == "4"
 
 # --------------------------------------------------------------------- tests
 
@@ -297,6 +392,22 @@ def test_only_needed_bytes_are_fetched(tmp_path, served):
             published = json.loads((repo / f"index-k{k}.json").read_text())[layer_s]
             assert entry["size"] < published["size"]
             assert set(entry["experts"]) <= set(published["experts"])
+
+
+def test_derived_subset_remains_a_dense_fetch_source(tmp_path, served):
+    """Its local attestations carry the full family count, not subset size."""
+    _repo, _snap, subset, policy, _pub = _fetch_all(tmp_path, served)
+    local = json.loads((subset / "fq-manifest.json").read_text())["signer_pubkey"]
+    for segment in subset.glob("layer-*.safetensors"):
+        assert fq_repack.read_header(segment)[0]["__metadata__"]["num_experts"] == str(E)
+    served["mount"]("test/subset", subset)
+    refetched = tmp_path / "refetched"
+
+    run(["--policy", policy, "--out", refetched,
+         "--source", f"test/subset@{REV}",
+         "--trust-signer", local, "--trust-root", trust_root(tmp_path, local)])
+
+    assert list(refetched.glob("layer-*.safetensors"))
 
 
 def test_local_tree_is_self_describing(tmp_path, served):
@@ -1214,10 +1325,31 @@ def test_done_output_header_length_is_bounded_by_authenticated_plan(tmp_path,
     assert any(name == seg.name for name, _, _ in served["ranges"])
 
 
+
+
+def test_bad_policy_skips_full_header_fallback_payload(tmp_path, served, capsys):
+    """Signed cardinality rejects before auto would hash a whole parent file."""
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    drop_header_digests(repo, tmp_path / "pub.key")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3]})
+    out = tmp_path / "fetched"
+    segment = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    body = 8 + struct.unpack("<Q", segment.read_bytes()[:8])[0]
+
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+
+    assert "layer 3 policy has 1 entries; source/family requires 4" in (
+        capsys.readouterr().err)
+    assert all(end <= body for name, _start, end in served["ranges"]
+               if name == segment.name)
+    assert not list(out.glob("*.safetensors"))
 def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
                                                                    served,
                                                                    capsys):
-    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(3,))
     drop_header_digests(repo, tmp_path / "pub.key")
     served["mount"]("test/pub", repo)
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
@@ -1227,6 +1359,24 @@ def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
          "--header-trust", "attested"], expect=1)
     err = capsys.readouterr().err
     assert "no signed fragment.header_sha256" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_dry_run_skips_full_header_fallback_payload(tmp_path, served):
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    drop_header_digests(repo, tmp_path / "pub.key")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    segment = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    body = 8 + struct.unpack("<Q", segment.read_bytes()[:8])[0]
+
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--dry-run"])
+
+    assert all(end <= body for name, _start, end in served["ranges"]
+               if name == segment.name)
     assert not list(out.glob("*.safetensors"))
 
 
