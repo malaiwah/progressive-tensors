@@ -694,6 +694,10 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)
     resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"revision": "ab" * 32}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
            lambda p: p["parents"][0].update({"signed_release_manifest": True}))
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)

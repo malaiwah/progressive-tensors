@@ -212,8 +212,8 @@ PROJS = ("gate_proj", "up_proj", "down_proj")
 
 
 def is_immutable_revision(value) -> bool:
-    """A resolved Git/HF object ID, never a mutable branch or tag name."""
-    return (isinstance(value, str) and len(value) >= 40 and
+    """A full 40-hex Git commit accepted by the shared fetch locator."""
+    return (isinstance(value, str) and len(value) == 40 and
             all(c in "0123456789abcdef" for c in value))
 
 
