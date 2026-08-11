@@ -2170,19 +2170,50 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         json.dumps(report, indent=1, sort_keys=True) + "\n")
 
 
+def release_evidence(src: Source) -> tuple[bytes, dict] | None:
+    """Return the exact verified release envelope and its signed locator.
+
+    The payload in ``src.release`` is useful while fetching, but an offline
+    verifier must re-check the publisher's *envelope* under its own pin.  Keep
+    that byte-for-byte envelope beside the copied publisher JSONL evidence and
+    bind both the artifact source and the release's signed identity.
+    """
+    if not src.release:
+        return None
+    raw = src.small_file("fq-release.json")
+    if raw is None:
+        raise TrustError(f"{src}: verified fq-release.json disappeared from cache")
+    release_revision = (src.release.get("revision") or
+                        src.release.get("parent_revision"))
+    return raw, {
+        "file": "fq-release.json",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "repo": src.release.get("repo"),
+        "revision": release_revision,
+        "source_revision": src.resolved_commit,
+    }
+
+
 def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
-    """Keep the (verified) attestation lines that justify these bytes, one
-    directory per source, so the fetched tree can be re-checked offline."""
+    """Keep verified publisher evidence so a fetched tree is checkable offline."""
+    copied_sources: set[str] = set()
     for plan in plans:
         for src in {p.source.slug: p.source for p in plan.pieces}.values():
+            evidence_dir = out / "attestations" / evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir)
             name = Source.attestation_name(plan.layer, plan.k)
             raw = src.small_file(name)
-            if raw is None:
-                continue
-            dst = out / "attestations" / evidence_source_slug(
-                src.repo, src.resolved_commit, src.subdir) / Path(name).name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(raw)
+            if raw is not None:
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                (evidence_dir / Path(name).name).write_bytes(raw)
+            if src.slug not in copied_sources:
+                copied_sources.add(src.slug)
+                release = release_evidence(src)
+                if release is not None:
+                    raw_release, _ = release
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    (evidence_dir / "fq-release.json").write_bytes(raw_release)
 
 
 def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
@@ -2217,6 +2248,8 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
                               Source.segment_name(plan.layer, plan.k))
         frag = att.get("fragment") or {}
         prov = plan.header_provenance.get(src.slug) or {}
+        release_covered = src.expert_release_covered(plan.layer, plan.k)
+        release = release_evidence(src) if release_covered else None
         parents.append({
             "role": "source_fragment",
             "repo": src.repo,
@@ -2241,8 +2274,12 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "header_authentication": prov.get("method"),
             "header_authenticated": bool(prov.get("authenticated")),
             "header_sha256": prov.get("header_sha256"),
-            "signed_release_manifest": bool(prov.get("release_manifest")),
-            "release_covered": bool(prov.get("release_covered")),
+            # This stronger claim means the exact source fragment *and* its
+            # copied publisher JSONL are release-listed.  The envelope itself
+            # is named below for independent offline verification.
+            "signed_release_manifest": release_covered,
+            "release_covered": release_covered,
+            **({"release_evidence": release[1]} if release else {}),
         })
     payload = {
         "schema": "fq-attestation/1",

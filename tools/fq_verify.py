@@ -100,6 +100,7 @@ from fq_assemble import SegmentReader  # noqa: E402
 import fq_prime  # noqa: E402  (Transport, SHARED_RE, parse_int_set)
 import fq_fetch  # noqa: E402
 import fq_trust  # noqa: E402
+import fq_release  # noqa: E402
 from fq_trust import TrustError  # noqa: E402
 
 
@@ -964,6 +965,71 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
     return (1 if failures else 0), report
 
 
+def release_entry_matches(entry: object, path: Path) -> bool:
+    """Check one copied input against the publisher's signed release entry."""
+    return (isinstance(entry, dict) and is_sha256(entry.get("sha256")) and
+            isinstance(entry.get("size"), int) and entry["size"] >= 0 and
+            path.is_file() and path.stat().st_size == entry["size"] and
+            file_sha256(path) == entry["sha256"])
+
+
+def verify_release_evidence(fam: Path, parent: dict, *, evidence_source: str,
+                            parent_verifier: fq_trust.Verifier | None,
+                            copied_attestation: Path,
+                            parent_file: object) -> tuple[bool, str]:
+    """Verify a release-covered parent's exact copied publisher envelope.
+
+    The local attestation binds the envelope's bytes and identity.  The
+    independently pinned publisher key then authenticates that envelope, which
+    must in turn cover both offline inputs used for the parent hop.
+    """
+    claim = parent.get("signed_release_manifest", False)
+    if claim is False:
+        return True, "not-release-covered"
+    if claim is not True or parent_verifier is None:
+        return False, "invalid-release-claim"
+    evidence = parent.get("release_evidence")
+    if not isinstance(evidence, dict):
+        return False, "claimed-release-not-available-offline"
+    if (evidence.get("file") != "fq-release.json" or
+            not is_sha256(evidence.get("sha256")) or
+            not isinstance(evidence.get("size"), int) or evidence["size"] < 1):
+        return False, "invalid-release-evidence-binding"
+    release_path = fam / "attestations" / evidence_source / evidence["file"]
+    if (not release_path.is_file() or
+            release_path.stat().st_size != evidence["size"] or
+            file_sha256(release_path) != evidence["sha256"]):
+        return False, "release-evidence-missing-or-replaced"
+    try:
+        release = fq_release.verify_release(
+            json.loads(release_path.read_text()), parent_verifier,
+            where=str(release_path))
+    except (OSError, ValueError, TrustError):
+        return False, "release-evidence-invalid"
+    release_revision = release.get("revision") or release.get("parent_revision")
+    if (evidence.get("repo") != parent.get("repo") or
+            evidence.get("source_revision") != parent.get("revision") or
+            evidence.get("revision") != release_revision or
+            release.get("repo") != parent.get("repo") or
+            not isinstance(release_revision, str) or not release_revision):
+        return False, "release-identity-mismatch"
+    if not isinstance(parent_file, str) or not parent_file:
+        return False, "release-parent-fragment-invalid"
+    files = release["files"]
+    # The parent fragment is deliberately not copied into a range subset.
+    # Its digest and size are instead already bound by the local signer, and
+    # this release entry must independently repeat those exact values.
+    fragment = files.get(parent_file)
+    if not (isinstance(fragment, dict) and
+            fragment.get("sha256") == parent.get("sha256") and
+            fragment.get("size") == parent.get("size")):
+        return False, "release-parent-fragment-mismatch"
+    if not release_entry_matches(
+            files.get(f"attestations/{copied_attestation.name}"), copied_attestation):
+        return False, "release-publisher-attestation-mismatch"
+    return True, "release-covered-verified"
+
+
 
 # ------------------------------------------------------- identity: fetched
 
@@ -1063,10 +1129,10 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     parent_record.get("role") == "source_fragment" and
                     (upstream_payload or {}).get("predicate") == "repack-of" and
                     isinstance(material_file, str) and bool(material_file))
-                release_claim = parent_record.get("signed_release_manifest", False)
-                release_ok = release_claim is False
-                release = ("not-release-covered" if release_ok else
-                           "claimed-release-not-available-offline")
+                release_ok, release = verify_release_evidence(
+                    fam, parent_record, evidence_source=evidence_source,
+                    parent_verifier=parent_verifier,
+                    copied_attestation=copied, parent_file=parent_file)
                 parent_ok = (
                     valid_parent and upstream_payload is not None and
                     attestation_ok(upstream_sig) and terminal_source_ok and
