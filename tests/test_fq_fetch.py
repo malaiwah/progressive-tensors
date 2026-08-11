@@ -1812,6 +1812,51 @@ def test_unbound_family_identity_mismatch_is_fatal(tmp_path, served, capsys):
     assert not list(out.glob("*.safetensors"))
 
 
+def test_unbound_family_cardinality_mismatch_is_fatal(tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo_a, _, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _, _ = build_source(tmp_path, "b", ks=(4,), key=key)
+    _resign(_att_path(repo_a, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__("family_num_experts", 64))
+    _resign(_att_path(repo_b, LAYERS[0], 4), key,
+            lambda payload: payload.__setitem__("family_num_experts", 128))
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    policy = write_policy(tmp_path / "recipe.json",
+                          {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/a@{REV}",
+         "--source", f"test/b@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "family_num_experts 128 is incompatible with prior 64" in (
+        capsys.readouterr().err)
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_mixed_sources_must_share_concrete_family_cardinality(
+        tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo_a, _, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _, _ = build_source(tmp_path, "b", ks=(3,), key=key, salt="b")
+    _resign(_att_path(repo_a, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__("family_num_experts", 64))
+    _resign(_att_path(repo_b, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__("family_num_experts", 128))
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    select = tmp_path / "select.json"
+    select.write_text(json.dumps(
+        {"schema": "fq-select/1",
+         "experts": {str(LAYERS[0]): {"1": "test/b"}}}))
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/a@{REV}", "--source", f"test/b@{REV}",
+         "--select", select, "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "selected parents disagree on family_num_experts [64, 128]" in (
+        capsys.readouterr().err)
+
+
 def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
     key = tmp_path / "shared.key"
     repo, _, pub = build_source(tmp_path, "pub", ks=(4,), key=key,

@@ -1649,13 +1649,27 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                 raise TrustError(
                     f"layer {layer} K{k}: {src} identity {ident} is "
                     f"incompatible with selected parent identity {canonical}")
+            counts = {ident["num_experts"] for _src, ident in identities
+                      if ident["num_experts"] is not None}
+            if len(counts) > 1:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected parents disagree on "
+                    f"family_num_experts {sorted(counts)}")
             current_family = {field: canonical[field] for field in contract_fields}
+            current_count = next(iter(counts), None)
+            prior_count = family.get("num_experts") if family else None
             if family is None:
-                family = current_family
-            elif family != current_family:
+                family = {**current_family, "num_experts": current_count}
+            elif family != {**current_family, "num_experts": prior_count}:
                 raise TrustError(
                     f"layer {layer} K{k}: selected family {current_family} is "
                     f"incompatible with prior selected family {family}")
+            elif prior_count is not None and current_count is not None and prior_count != current_count:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected family_num_experts "
+                    f"{current_count} is incompatible with prior {prior_count}")
+            elif prior_count is None and current_count is not None:
+                family["num_experts"] = current_count
             plan.identity = canonical
             _build_file_plan(plan, chosen, problems)
             if plan.pieces:
