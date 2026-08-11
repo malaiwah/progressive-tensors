@@ -1916,7 +1916,6 @@ def test_policy_preflight_uses_signed_family_not_fragment_count(
     run(["--policy", policy, "--out", tmp_path / "planned",
          "--source", f"test/pub@{REV}", "--trust-signer", pub,
          "--trust-root", trust_root(tmp_path, pub), "--dry-run"])
-
 def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
     key = tmp_path / "shared.key"
     repo, _, pub = build_source(tmp_path, "pub", ks=(4,), key=key,
