@@ -215,6 +215,16 @@ def is_immutable_revision(value) -> bool:
     return (isinstance(value, str) and len(value) >= 40 and
             all(c in "0123456789abcdef" for c in value))
 
+
+def evidence_source_slug(repo: str, revision: str, subdir: str) -> str | None:
+    """Canonical, traversal-free name of a copied upstream evidence directory."""
+    if (not isinstance(subdir, str) or subdir.startswith("/") or
+            any(part in ("", ".", "..") for part in subdir.split("/")
+                if subdir)):
+        return None
+    suffix = f":{subdir.replace('/', '__')}" if subdir else ""
+    return f"{repo.lower().replace('/', '__')}@{revision[:12]}{suffix}"
+
 # load_attestation() states.  Only VERIFIED is evidence; NOT_CHECKED exists
 # solely because the operator passed --insecure-skip-signatures and asked to
 # be told nothing is proven.
@@ -999,7 +1009,6 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 span_sha256(seg, entry["body_offset"] + lo,
                             entry["body_offset"] + hi)
                 for eid, (lo, hi) in entry["experts"].items())
-            meta = segment_meta(fam, entry)
             parents = (payload or {}).get("parents") or []
             provenance_ok = ((payload or {}).get("predicate") == "derived-from" and
                              ((payload or {}).get("derivation") or {}).get("rule") ==
@@ -1010,6 +1019,8 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 repo, revision = parent_record.get("repo"), parent_record.get("revision")
                 parent_file = parent_record.get("file")
                 keyid = parent_record.get("keyid")
+                subdir = parent_record.get("subdir")
+                evidence_source = parent_record.get("evidence_source")
                 claimed_experts = parent_record.get("experts")
                 valid_experts = (isinstance(claimed_experts, list) and
                                  bool(claimed_experts) and
@@ -1017,16 +1028,17 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                                      for eid in claimed_experts))
                 if valid_experts:
                     covered_experts.extend(str(eid) for eid in claimed_experts)
-                valid_parent = (valid_experts and
-                                isinstance(repo, str) and bool(repo) and
-                                is_immutable_revision(revision) and
+                expected_source = (evidence_source_slug(repo, revision, subdir)
+                                   if isinstance(repo, str) and
+                                   is_immutable_revision(revision) else None)
+                valid_parent = (valid_experts and bool(expected_source) and
+                                evidence_source == expected_source and
                                 isinstance(parent_file, str) and bool(parent_file) and
                                 is_sha256(keyid))
                 parent_verifier = by_key.get(keyid) if valid_parent else None
-                copied = (fam / "attestations" /
-                          (f"{repo.replace('/', '__')}@{revision[:12]}"
-                           if valid_parent else "") /
-                          f"layer-{layer:03d}.k{k}.jsonl")
+                copied = (fam / "attestations" / evidence_source /
+                          f"layer-{layer:03d}.k{k}.jsonl"
+                          if parent_verifier is not None else Path(""))
                 upstream_payload, upstream_sig = (
                     load_attestation_path(copied, parent_verifier, parent_file)
                     if parent_verifier is not None else

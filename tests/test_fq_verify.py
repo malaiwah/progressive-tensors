@@ -597,6 +597,15 @@ def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False):
     if unsafe:
         argv += ["--header-trust", "unsafe"]
     assert fq_fetch.main(argv) == 0
+    # fq_fetch serializes this signed locator in current produced subsets.
+    # Keep this verifier fixture explicit while the synthetic legacy helper
+    # remains independent of the fetch implementation under test.
+    for att in (out / "attestations").glob("layer-*.k*.jsonl"):
+        resign(att, tmp_path / "local.key", lambda p: [
+            parent.update({
+                "subdir": "",
+                "evidence_source": f"test__pub@{REV[:12]}",
+            }) for parent in p["parents"]])
     return out, publisher
 
 
@@ -627,6 +636,26 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
                   "--upstream-trust-signer", unsafe_publisher]
     assert fq_verify.main(unsafe_argv) == 1
     assert fq_verify.main(unsafe_argv + ["--accept-unsafe-header-plan"]) == 0
+
+
+def test_identity_fetched_uses_signed_nested_evidence_locator(tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(tmp_path, monkeypatch)
+    local = signer_of(fam)
+    layer = LAYERS[0]
+    local_att = att_lines(fam, f"layer-{layer:03d}.k3")
+    nested = f"test__pub@{REV[:12]}:family__nested"
+    copied = next((fam / "attestations").glob(
+        f"test__pub@{REV[:12]}/layer-{layer:03d}.k3.jsonl"))
+    target = fam / "attestations" / nested / copied.name
+    target.parent.mkdir()
+    copied.rename(target)
+    resign(local_att, tmp_path / "local.key", lambda p: [
+        parent.update({"subdir": "family/nested", "evidence_source": nested})
+        for parent in p["parents"]])
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(fam),
+        "--layers", str(layer), "--trust-signer", local,
+        "--upstream-trust-signer", publisher]) == 0
 
 
 def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monkeypatch):
