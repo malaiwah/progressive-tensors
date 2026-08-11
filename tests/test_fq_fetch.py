@@ -1745,7 +1745,7 @@ def test_commit_ids_are_normalized_before_drift_checks(tmp_path, served):
     assert report["sources"][0]["requested_revision"] == REV.upper()
 
 
-def test_recursive_fetched_subset_preserves_family_count_and_parent_policy(
+def test_recursive_fetched_subset_is_refused_without_signed_nested_evidence(
         tmp_path, served, capsys):
     repo, _, pub = build_source(tmp_path, "pub")
     served["mount"]("test/pub", repo)
@@ -1756,16 +1756,9 @@ def test_recursive_fetched_subset_preserves_family_count_and_parent_policy(
          "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
     local_pub = json.loads((first / "fq-manifest.json").read_text())["signer_pubkey"]
     served["mount"]("test/first", first)
-    run(["--policy", policy, "--out", tmp_path / "second",
+    second = tmp_path / "second"
+    run(["--policy", policy, "--out", second,
          "--source", f"test/first@{REV}", "--trust-signer", local_pub,
-         "--trust-root", trust_root(tmp_path, local_pub)])
-
-    att = first / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
-    payload = _payload(att)
-    payload["parents"][0]["predicate"] = "equivalence-of"
-    att.write_text(fq_repack.Signer(first.parent / "local.key").sign_line(payload) + "\n")
-    run(["--policy", policy, "--out", tmp_path / "invalid-parent",
-         "--source", f"test/first@{REV}", "--trust-signer", local_pub,
-         "--trust-root", trust_root(tmp_path, local_pub)],
-        expect=1)
-    assert "parent 1: predicate" in capsys.readouterr().err
+         "--trust-root", trust_root(tmp_path, local_pub)], expect=1)
+    assert "recursively verifiable signed evidence chain" in capsys.readouterr().err
+    assert not list(second.glob("*.safetensors"))
