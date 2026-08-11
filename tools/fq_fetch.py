@@ -554,6 +554,12 @@ class Source:
     def _cached_authentication_fits(self, name: str, prov: dict, mode: str,
                                     frag: dict, covered: bool) -> bool:
         """A persisted proof is useful only when it binds these exact bytes."""
+        # A whole-file hash does not authenticate a separately cached prefix:
+        # an attacker can replace both prefix and its self-reported digest.
+        # Re-hash the pinned source on every process unless the publisher
+        # supplied a signed header digest.
+        if prov.get("method") == AUTH_FULL_FRAGMENT:
+            return False
         try:
             header, body_offset = self._headers[name]
             raw = self._header_bytes[name]
@@ -685,53 +691,57 @@ class Source:
                     f"{os.getpid()}-{time.time_ns()}")
                 path.write_bytes(b"")
                 retained[piece] = path
-        url = self.url(name)
-        digest = hashlib.sha256()
-        head = bytearray()
-        need = 8
-        off = 0
-        while off < size:
-            end = min(off + FULL_VERIFY_CHUNK, size)
-            data, meta = self.t.get_range(url, off, end)
-            if len(data) != end - off:
-                raise IOError(f"{self}:{name}: short read at {off}")
-            self.resolved_commit = self.resolved_commit or meta.get("commit")
-            digest.update(data)
-            if off == 0:
-                need = 8 + struct.unpack("<Q", data[:8])[0]
-                if not 8 < need <= size:
-                    raise IOError(
-                        f"{self}:{name}: implausible header length {need - 8}")
-            if len(head) < need:
-                head += data[:need - len(head)]
+        try:
+            url = self.url(name)
+            digest = hashlib.sha256()
+            head = bytearray()
+            need = 8
+            off = 0
+            while off < size:
+                end = min(off + FULL_VERIFY_CHUNK, size)
+                data, meta = self.t.get_range(url, off, end)
+                if len(data) != end - off:
+                    raise IOError(f"{self}:{name}: short read at {off}")
+                self.resolved_commit = self.resolved_commit or meta.get("commit")
+                digest.update(data)
+                if off == 0:
+                    need = 8 + struct.unpack("<Q", data[:8])[0]
+                    if not 8 < need <= size:
+                        raise IOError(
+                            f"{self}:{name}: implausible header length {need - 8}")
+                if len(head) < need:
+                    head += data[:need - len(head)]
+                for piece, path in retained.items():
+                    start = max(off, piece.remote_start)
+                    stop = min(end, piece.remote_end)
+                    if start < stop:
+                        with open(path, "ab") as f:
+                            f.write(data[start - off: stop - off])
+                off = end
+            got = digest.hexdigest()
+            if got != want:
+                raise TrustError(
+                    f"{self}: {name} hashes to {got[:16]}… over {size} bytes but "
+                    f"the signed attestation says {want[:16]}… — refusing to plan "
+                    f"from a fragment that is not the one that was signed")
+            raw = bytes(head[:need])
+            header = json.loads(raw[8:])
+            self._headers[name] = (header, need)
+            self._header_bytes[name] = raw
             for piece, path in retained.items():
-                start = max(off, piece.remote_start)
-                stop = min(end, piece.remote_end)
-                if start < stop:
-                    with open(path, "ab") as f:
-                        f.write(data[start - off: stop - off])
-            off = end
-        got = digest.hexdigest()
-        if got != want:
+                if path.stat().st_size == piece.size:
+                    self._verified_pieces[(name, piece.remote_start,
+                                           piece.remote_end)] = path
+                else:
+                    path.unlink(missing_ok=True)
+            return {"method": AUTH_FULL_FRAGMENT, "authenticated": True,
+                    "fragment_sha256": got, "body_offset": need,
+                    "header_sha256": hashlib.sha256(raw).hexdigest(),
+                    "bytes_read": size}
+        except BaseException:
             for path in retained.values():
                 path.unlink(missing_ok=True)
-            raise TrustError(
-                f"{self}: {name} hashes to {got[:16]}… over {size} bytes but "
-                f"the signed attestation says {want[:16]}… — refusing to plan "
-                f"from a fragment that is not the one that was signed")
-        raw = bytes(head[:need])
-        header = json.loads(raw[8:])
-        self._headers[name] = (header, need)
-        self._header_bytes[name] = raw
-        for piece, path in retained.items():
-            if path.stat().st_size == piece.size:
-                self._verified_pieces[(name, piece.remote_start, piece.remote_end)] = path
-            else:
-                path.unlink(missing_ok=True)
-        return {"method": AUTH_FULL_FRAGMENT, "authenticated": True,
-                "fragment_sha256": got, "body_offset": need,
-                "header_sha256": hashlib.sha256(raw).hexdigest(),
-                "bytes_read": size}
+            raise
 
     def take_verified_piece(self, name: str, piece) -> bytes | None:
         """Consume a current-run full-auth spool file, never a persisted cache."""
@@ -744,6 +754,13 @@ class Source:
         finally:
             path.unlink(missing_ok=True)
         return data if len(data) == piece.size else None
+
+    def discard_verified_pieces(self, name: str) -> None:
+        """Remove unconsumed current-run full-auth spools for one fragment."""
+        for key, path in list(self._verified_pieces.items()):
+            if key[0] == name:
+                self._verified_pieces.pop(key)
+                path.unlink(missing_ok=True)
 
 
 # ------------------------------------------------------------------- policy
@@ -1746,15 +1763,20 @@ def main(argv=None) -> int:
         for plan in plans:
             # Prove the header before a single byte of this file is fetched
             # or written: the draft plan above is not evidence of anything.
-            authenticate_plan(plan, args.header_trust)
-            entry = fetch_plan(
-                plan, out, state, transport,
-                max_chunk=max(1, int(args.chunk_mb * (1 << 20))),
-                max_gap=int(args.max_gap_mb * (1 << 20)),
-                verify_local=not args.no_verify_resumed)
-            entries[(plan.layer, plan.k)] = entry
-            if signer is not None:
-                write_local_attestation(out, plan, entry, signer, verifier)
+            parents = {p.source.slug: p.source for p in plan.pieces}.values()
+            try:
+                authenticate_plan(plan, args.header_trust)
+                entry = fetch_plan(
+                    plan, out, state, transport,
+                    max_chunk=max(1, int(args.chunk_mb * (1 << 20))),
+                    max_gap=int(args.max_gap_mb * (1 << 20)),
+                    verify_local=not args.no_verify_resumed)
+                entries[(plan.layer, plan.k)] = entry
+                if signer is not None:
+                    write_local_attestation(out, plan, entry, signer, verifier)
+            finally:
+                for src in parents:
+                    src.discard_verified_pieces(plan.name)
     except TrustError as e:
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
         return 1

@@ -684,9 +684,9 @@ def test_attested_header_digest_catches_a_tampered_header(tmp_path, served,
     assert not list(out.glob("*.safetensors"))
 
 
-def test_full_header_cache_is_bound_covered_and_reused_without_payload_retry(
+def test_full_header_fallback_reauthenticates_cache_and_reuses_pass_bytes(
         tmp_path, served):
-    """A full-proof cache is exact-byte-bound, release-complete, and cheap."""
+    """A cached full-file claim is never a substitute for re-hashing source."""
     key = tmp_path / "pub.key"
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
     drop_header_digests(repo, key)
@@ -694,8 +694,6 @@ def test_full_header_cache_is_bound_covered_and_reused_without_payload_retry(
         "build", "--dir", str(repo), "--release", "test 0.1.0",
         "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
     served["mount"]("test/pub", repo)
-    # Only expert 0 is available at K3; the others intentionally have no
-    # provider.  That gives a single selected range to account for.
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
     out = tmp_path / "fetched"
     argv = ["--policy", str(policy), "--out", str(out), "--source",
@@ -707,33 +705,63 @@ def test_full_header_cache_is_bound_covered_and_reused_without_payload_retry(
     body = 8 + struct.unpack("<Q", raw[:8])[0]
     segment_reads = [r for r in served["ranges"] if r[0] == seg.name]
     # Full authentication needs the source once, plus the tiny draft header:
-    # the selected bytes from that verified pass are spooled to disk instead
-    # of being fetched again.
+    # selected bytes from that verified pass are spooled to disk instead of
+    # being fetched again.
     assert sum(end - start for _, start, end in segment_reads) <= len(raw) + body
 
     cache = next((out / ".fq-fetch-cache").rglob(f"hdr-{seg.name}.json"))
     cached = json.loads(cache.read_text())
     assert cached["authentication"]["method"] == fq_fetch.AUTH_FULL_FRAGMENT
     assert cached["authentication"]["release_manifest"] is True
-    assert hashlib.sha256(base64.b64decode(cached["header_bytes"])).hexdigest() == (
-        cached["authentication"]["header_sha256"])
 
-    # A restarted dry run recognizes the validated proof and prices no extra
-    # full-fragment authentication.
+    # A full-file digest cannot authenticate a separately persisted prefix:
+    # it is self-reported and forgeable.  Restart pricing therefore includes
+    # a fresh full rehash, and a completed-output skip leaves no spool files.
     plan_path = tmp_path / "restart-plan.json"
     run([*argv, "--dry-run", "--json", plan_path])
     plan = json.loads(plan_path.read_text())
-    assert plan["header_authentication"]["extra_bytes"] == 0
-    cached["header"][next(n for n in cached["header"] if n != "__metadata__")][
-        "dtype"] = "U8"
-    # Editing the convenient parsed view is not enough to alter a proven
-    # header.  A new process discards that cache record and re-authenticates
-    # from the pinned source before it can reuse/sign the output.
+    assert plan["header_authentication"]["extra_bytes"] == len(raw)
+    assert plan["header_authentication"]["methods"][fq_fetch.AUTH_FULL_FRAGMENT] == 1
+    run(argv)
+    assert not list((out / ".fq-fetch-cache" / "test__pub@0123456789ab" /
+                     ".verified-pieces").glob("*"))
+
+    # Forge every field in a persisted full-proof record that is locally
+    # editable.  The next process still hashes the pinned fragment, detects
+    # the substituted header during re-planning, and cleans its error spool.
+    forged = bytearray(base64.b64decode(cached["header_bytes"]))
+    assert b'"I16"' in forged
+    forged = bytes(forged).replace(b'"I16"', b'"F16"', 1)
+    cached["header_bytes"] = base64.b64encode(forged).decode()
+    cached["header"] = json.loads(forged[8:])
+    cached["authentication"]["header_sha256"] = hashlib.sha256(forged).hexdigest()
     cache.write_text(json.dumps(cached))
     served["ranges"].clear()
-    run(argv)
+    run(argv, expect=1)
     reread = [r for r in served["ranges"] if r[0] == seg.name]
     assert sum(end - start for _, start, end in reread) >= len(raw)
+    assert not list((out / ".fq-fetch-cache" / "test__pub@0123456789ab" /
+                     ".verified-pieces").glob("*"))
+
+
+def test_signed_header_cache_reduces_restart_authentication_cost(tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    plan_path = tmp_path / "restart-plan.json"
+    run([*argv, "--dry-run", "--json", plan_path])
+    auth = json.loads(plan_path.read_text())["header_authentication"]
+    assert auth["extra_bytes"] == 0
+    assert auth["methods"]["cached"] == 1
 
 
 def test_done_output_is_rehashed_before_it_is_resigned(tmp_path, served):
