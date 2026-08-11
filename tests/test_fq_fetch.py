@@ -1631,9 +1631,8 @@ def test_absent_attestation_file_is_a_refusal(tmp_path, served, capsys):
     assert not list(out.glob("*.safetensors"))
 
 
-def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
-    """A signed line that omits an expert: those bytes are unverifiable, so
-    they are refused rather than fetched and signed."""
+def test_missing_expert_digest_rejects_the_complete_plan(tmp_path, served, capsys):
+    """A requested byte without a signed digest rejects the whole plan."""
     key = tmp_path / "pub.key"
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
     _resign(_att_path(repo, LAYERS[0], 3), key,
@@ -1642,15 +1641,16 @@ def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
-    assert "no attested digest" in capsys.readouterr().err
-    index = json.loads((out / "index-k3.json").read_text())
-    assert "1" not in index[str(LAYERS[0])]["experts"]
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    assert "incomplete fetch plan" in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))
 
 
 
-def test_sparse_unknown_family_cardinality_remains_materializable(
+def test_sparse_unknown_family_cardinality_requires_complete_plan(
         tmp_path, served, capsys):
+    """Sparse evidence cannot authorize omitting a requested expert."""
     key = tmp_path / "pub.key"
     repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
     _resign(_att_path(repo, LAYERS[0], 3), key,
@@ -1667,11 +1667,9 @@ def test_sparse_unknown_family_cardinality_remains_materializable(
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
          "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
-         "--header-trust", "unsafe"])
-    assert "no attested digest" in capsys.readouterr().err
-    payload = _payload(
-        out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
-    assert payload["num_experts"] == E - 1
+         "--header-trust", "unsafe"], expect=1)
+    assert "incomplete fetch plan" in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))
 
 def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
