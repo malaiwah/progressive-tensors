@@ -2180,17 +2180,43 @@ def release_evidence(src: Source) -> tuple[bytes, dict] | None:
     """
     if not src.release:
         return None
+    release_repo = src.release.get("repo")
+    signed_revisions = [
+        value for value in (src.release.get("revision"),
+                            src.release.get("parent_revision"))
+        if Source.is_immutable_commit(value)]
+    if not isinstance(release_repo, str) or not release_repo or release_repo != src.repo:
+        raise TrustError(
+            f"{src}: fq-release/1 repo must name this source before its "
+            "coverage can be preserved for offline verification")
+    source_matches_release = src.resolved_commit in signed_revisions
+    if not source_matches_release and src.release.get("parent_revision"):
+        # A publish commit cannot name itself in the signed bytes.  Preserve
+        # this form only after the same authenticated parent relation used by
+        # release_coverage_required has tied it to the selected commit.
+        if not src._published_release_parent_checked:
+            src._published_release_parent_checked = True
+            src._published_release_parent = hub_commit_parent(
+                src.repo, src.resolved_commit)
+        source_matches_release = (
+            src._published_release_parent == src.release["parent_revision"])
+    if not signed_revisions or not source_matches_release:
+        raise TrustError(
+            f"{src}: fq-release/1 needs an immutable signed revision or "
+            "publisher parent revision binding the selected source before "
+            "its coverage can be preserved offline")
     raw = src.small_file("fq-release.json")
     if raw is None:
         raise TrustError(f"{src}: verified fq-release.json disappeared from cache")
-    release_revision = (src.release.get("revision") or
-                        src.release.get("parent_revision"))
+    binding_revision = (src.resolved_commit
+                        if src.resolved_commit in signed_revisions else
+                        src.release["parent_revision"])
     return raw, {
         "file": "fq-release.json",
         "sha256": hashlib.sha256(raw).hexdigest(),
         "size": len(raw),
-        "repo": src.release.get("repo"),
-        "revision": release_revision,
+        "repo": release_repo,
+        "revision": binding_revision,
         "source_revision": src.resolved_commit,
     }
 
@@ -2207,10 +2233,11 @@ def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
             if raw is not None:
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 (evidence_dir / Path(name).name).write_bytes(raw)
-            if src.slug not in copied_sources:
-                copied_sources.add(src.slug)
+            if (src.slug not in copied_sources and
+                    src.expert_release_covered(plan.layer, plan.k)):
                 release = release_evidence(src)
                 if release is not None:
+                    copied_sources.add(src.slug)
                     raw_release, _ = release
                     evidence_dir.mkdir(parents=True, exist_ok=True)
                     (evidence_dir / "fq-release.json").write_bytes(raw_release)

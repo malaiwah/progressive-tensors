@@ -1006,12 +1006,14 @@ def verify_release_evidence(fam: Path, parent: dict, *, evidence_source: str,
             where=str(release_path))
     except (OSError, ValueError, TrustError):
         return False, "release-evidence-invalid"
-    release_revision = release.get("revision") or release.get("parent_revision")
+    signed_revisions = {
+        value for value in (release.get("revision"),
+                            release.get("parent_revision"))
+        if is_immutable_revision(value)}
     if (evidence.get("repo") != parent.get("repo") or
             evidence.get("source_revision") != parent.get("revision") or
-            evidence.get("revision") != release_revision or
-            release.get("repo") != parent.get("repo") or
-            not isinstance(release_revision, str) or not release_revision):
+            evidence.get("revision") not in signed_revisions or
+            release.get("repo") != parent.get("repo")):
         return False, "release-identity-mismatch"
     if not isinstance(parent_file, str) or not parent_file:
         return False, "release-parent-fragment-invalid"
