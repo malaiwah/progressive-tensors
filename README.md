@@ -141,7 +141,7 @@ ARTIFACT_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
 ARTIFACT_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
 RECIPE=recipes/glm52-3.0bpw-all-k3.json
 PUBLISHER_SIGNER=a58b7bb79ba58457
-FETCH_KEY=./fq-fetch.key
+export FETCH_KEY=./fq-fetch.key
 
 # Copy the exact policy from the same immutable artifact revision.
 uv run hf download "$ARTIFACT_REPO" "$RECIPE" --revision "$ARTIFACT_REV" \
@@ -164,7 +164,7 @@ uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
 # consumer-controlled seed. Derive its public fingerprint from that key — not
 # from the untrusted subset manifest — for verification and assembly.
 LOCAL_SIGNER="$(uv run python -c \
-  'import sys; from pathlib import Path; sys.path.insert(0, "tools"); from fq_repack import Signer; print(Signer(Path("fq-fetch.key")).pub_hex)')"
+  'import os, sys; from pathlib import Path; sys.path.insert(0, "tools"); from fq_repack import Signer; print(Signer(Path(os.environ["FETCH_KEY"])).pub_hex)')"
 uv run tools/fq_verify.py --identity --segments ./segments \
   --source ./source-quant --trust-signer "$LOCAL_SIGNER" \
   --json id.json --md id.md
@@ -454,9 +454,10 @@ warning, so it can gate a deploy.
 
 `fq_fetch` instead creates a **derived local subset** with a local signer and
 no copied publisher release envelope. Verify it with `fq_verify --identity`
-and the local signer from its generated `fq-manifest.json` (as in the
-quickstart), then use that same signer for assembly. Running release
-verification against it would answer the wrong question and must fail closed.
+and the public fingerprint derived from the consumer-controlled fetch key
+(`$FETCH_KEY` in the quickstart), then use that same signer for assembly.
+Running release verification against it would answer the wrong question and
+must fail closed.
 
 ### Publishing a release atomically
 
