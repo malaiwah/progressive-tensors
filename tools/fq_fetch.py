@@ -125,7 +125,7 @@ FETCH_BINDING_SCHEMA = "fq-fetch-binding/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
 ATTESTATION_SCHEMA = "fq-attestation/1"
 EVIDENCE_LOCATOR_SCHEMA = "fq-evidence-locator/1"
-ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of",))
+ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of", "encode-of"))
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
@@ -140,6 +140,33 @@ AUTH_HEADER_DIGEST = "attested-header-digest"
 AUTH_FULL_FRAGMENT = "full-fragment"
 AUTH_NONE = "NONE (--header-trust unsafe)"
 FULL_VERIFY_CHUNK = 1 << 26  # 64 MB per ranged GET when hashing a fragment
+
+def _is_sha256(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value.lower()))
+
+
+def encode_materials_identity(payload: dict, *, where: str) -> tuple[str, str]:
+    """Read the published ``encode-of`` evidence without repack aliases."""
+    materials = payload.get("materials")
+    if not isinstance(materials, dict):
+        raise TrustError(f"{where}: encode-of lacks materials")
+    for field in ("base_model", "base_revision", "encoder", "encoder_bundle"):
+        if not isinstance(materials.get(field), str) or not materials[field]:
+            raise TrustError(f"{where}: encode-of materials lacks {field}")
+    for field in ("capture_fingerprint", "encoder_sha256"):
+        if not _is_sha256(materials.get(field)):
+            raise TrustError(f"{where}: encode-of materials has invalid {field}")
+    base_model = materials["base_model"]
+    revision = materials["base_revision"]
+    if not Source.is_immutable_commit(revision):
+        raise TrustError(
+            f"{where}: encode-of base revision {revision!r} is not an immutable "
+            "commit")
+    for field in ("quant_args", "determinism_scope"):
+        if not isinstance(payload.get(field), dict) or not payload[field]:
+            raise TrustError(f"{where}: encode-of lacks {field}")
+    return base_model, revision.lower()
 
 
 # ---------------------------------------------------------------- transport
@@ -645,9 +672,10 @@ class Source:
             raise TrustError(
                 f"{where}: predicate {predicate!r} is not accepted for "
                 "range-fetched parents")
-        # Fetched-subset verification terminates at a publisher's
-        # source_fragment/repack-of attestation.  Other predicates require
-        # evidence chains that range fetching neither copies nor verifies.
+        # ``repack-of`` and the published root ``encode-of`` describe
+        # different provenance contracts.  The latter deliberately has no
+        # synthetic materials.repo/revision/file aliases: its base identity
+        # and encoder evidence live in ``materials`` instead.
         fragment = payload.get("fragment")
         if not isinstance(fragment, dict) or fragment.get("file") != segment_file:
             raise TrustError(f"{where}: fragment does not name {segment_file}")
@@ -657,12 +685,7 @@ class Source:
                 raise TrustError(
                     f"{where}: attests {field} {declared!r}, not requested "
                     f"{expected!r}")
-        base_model, layout = payload.get("base_model"), payload.get("layout")
         fragment_count = payload.get("num_experts")
-        if not isinstance(base_model, str) or not base_model:
-            raise TrustError(f"{where}: accepted predicate lacks base_model")
-        if not isinstance(layout, str) or not layout:
-            raise TrustError(f"{where}: accepted predicate lacks layout")
         if fragment_count is not None and (
                 not isinstance(fragment_count, int) or fragment_count <= 0):
             raise TrustError(f"{where}: num_experts is invalid")
@@ -673,26 +696,48 @@ class Source:
         digests = payload.get("expert_sha256")
         if not isinstance(digests, dict) or not digests:
             raise TrustError(f"{where}: accepted predicate lacks expert_sha256")
-        materials = payload.get("materials")
-        if not isinstance(materials, dict):
-            raise TrustError(f"{where}: {predicate} lacks materials")
-        for field in ("repo", "revision", "file"):
-            if not isinstance(materials.get(field), str) or not materials[field]:
-                raise TrustError(f"{where}: {predicate} materials lacks {field}")
-        revision = (payload.get("base_revision") or materials.get("revision")
-                    or self.manifest.get("revision"))
-        if not self.is_immutable_commit(revision):
-            raise TrustError(
-                f"{where}: base revision {revision!r} is not an immutable commit")
-        revision = revision.lower()
+        if predicate == "encode-of":
+            base_model, revision = encode_materials_identity(payload, where=where)
+            quant_k = payload["quant_args"].get("K")
+            if not isinstance(quant_k, int) or quant_k != k:
+                raise TrustError(
+                    f"{where}: encode-of quant_args.K {quant_k!r}, not requested "
+                    f"{k!r}")
+            # The fragment digest authenticates this header before it supplies
+            # its layout; root encode attestations intentionally omit layout.
+            layout = None
+        else:
+            base_model, layout = payload.get("base_model"), payload.get("layout")
+            if not isinstance(base_model, str) or not base_model:
+                raise TrustError(f"{where}: accepted predicate lacks base_model")
+            if not isinstance(layout, str) or not layout:
+                raise TrustError(f"{where}: accepted predicate lacks layout")
+            materials = payload.get("materials")
+            if not isinstance(materials, dict):
+                raise TrustError(f"{where}: {predicate} lacks materials")
+            for field in ("repo", "revision", "file"):
+                if not isinstance(materials.get(field), str) or not materials[field]:
+                    raise TrustError(f"{where}: {predicate} materials lacks {field}")
+            revision = (payload.get("base_revision") or materials.get("revision")
+                        or self.manifest.get("revision"))
+            if not self.is_immutable_commit(revision):
+                raise TrustError(
+                    f"{where}: base revision {revision!r} is not an immutable commit")
+            revision = revision.lower()
         manifest = self.manifest
-        for field, value in (("base_model", base_model), ("layout", layout),
-                             ("predicate", predicate)):
+        for field, value in (("base_model", base_model),):
             published = manifest.get(field)
             if published is not None and published != value:
                 raise TrustError(
                     f"{where}: signed {field} {value!r} disagrees with "
                     f"fq-manifest.json {published!r}")
+        if predicate == "repack-of":
+            for field, value in (("layout", layout), ("predicate", predicate)):
+                published = manifest.get(field)
+                if published is not None and published != value:
+                    raise TrustError(
+                        f"{where}: signed {field} {value!r} disagrees with "
+                        f"fq-manifest.json {published!r}")
         published_revision = manifest.get("revision")
         if (self.is_immutable_commit(published_revision)
                 and published_revision.lower() != revision):
@@ -1364,9 +1409,23 @@ def authenticate_policy_cardinality(policy: dict[int, dict[int, int]],
                                     plans: list[FilePlan], mode: str) -> None:
     """Authenticate headers and bind signed counts to their actual inventory."""
     counts: dict[int, set[int]] = {}
+    authenticated_family: dict | None = None
     seen: set[tuple[int, str, int]] = set()
     for plan in plans:
         authenticate_plan(plan, mode)
+        identity = getattr(plan, "identity", None)
+        if mode != HEADER_UNSAFE and isinstance(identity, dict):
+            current_family = {
+                field: identity.get(field)
+                for field in ("base_model", "base_revision", "layout")
+            }
+            if authenticated_family is None:
+                authenticated_family = current_family
+            elif authenticated_family != current_family:
+                raise TrustError(
+                    f"layer {plan.layer} K{plan.k}: authenticated family "
+                    f"{current_family} is incompatible with prior selected "
+                    f"family {authenticated_family}")
         for piece in plan.pieces:
             key = (plan.layer, piece.source.slug, plan.k)
             if key in seen:
@@ -1675,8 +1734,11 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             selected = {src.slug: src for _expert, src, _idx, _digest in chosen}
             identities = [(src, plan.atts[src.slug]["identity"])
                           for src in selected.values()]
-            canonical = identities[0][1]
-            contract_fields = ("base_model", "base_revision", "layout")
+            canonical = dict(identities[0][1])
+            # Root encode attestations intentionally defer layout to the
+            # authenticated fragment header.  Base identity is still signed
+            # now; any layout that is already signed must agree before I/O.
+            contract_fields = ("base_model", "base_revision")
             mismatch = next(
                 ((src, ident) for src, ident in identities
                  if any(ident[field] != canonical[field] for field in contract_fields)),
@@ -1686,6 +1748,13 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                 raise TrustError(
                     f"layer {layer} K{k}: {src} identity {ident} is "
                     f"incompatible with selected parent identity {canonical}")
+            known_layouts = {ident["layout"] for _src, ident in identities
+                             if ident["layout"] is not None}
+            if len(known_layouts) > 1:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected parent layout "
+                    f"{sorted(known_layouts)} is incompatible")
+            canonical["layout"] = next(iter(known_layouts), None)
             counts = {ident["num_experts"] for _src, ident in identities
                       if ident["num_experts"] is not None}
             if len(counts) > 1:
@@ -1694,18 +1763,30 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                     f"family_num_experts {sorted(counts)}")
             current_family = {field: canonical[field] for field in contract_fields}
             current_count = next(iter(counts), None)
-            prior_count = family.get("num_experts") if family else None
             if family is None:
-                family = {**current_family, "num_experts": current_count}
-            elif family != {**current_family, "num_experts": prior_count}:
+                family = {**current_family, "layout": canonical["layout"],
+                          "num_experts": current_count}
+            elif any(family[field] != current_family[field]
+                     for field in contract_fields):
                 raise TrustError(
                     f"layer {layer} K{k}: selected family {current_family} is "
                     f"incompatible with prior selected family {family}")
-            elif prior_count is not None and current_count is not None and prior_count != current_count:
+            elif (family["layout"] is not None and canonical["layout"] is not None
+                  and family["layout"] != canonical["layout"]):
+                raise TrustError(
+                    f"layer {layer} K{k}: selected family layout "
+                    f"{canonical['layout']!r} is incompatible with prior "
+                    f"{family['layout']!r}")
+            elif family["layout"] is None and canonical["layout"] is not None:
+                family["layout"] = canonical["layout"]
+            if (family is not None and family["num_experts"] is not None
+                    and current_count is not None
+                    and family["num_experts"] != current_count):
                 raise TrustError(
                     f"layer {layer} K{k}: selected family_num_experts "
-                    f"{current_count} is incompatible with prior {prior_count}")
-            elif prior_count is None and current_count is not None:
+                    f"{current_count} is incompatible with prior "
+                    f"{family['num_experts']}")
+            if family["num_experts"] is None and current_count is not None:
                 family["num_experts"] = current_count
             plan.identity = canonical
             _build_file_plan(plan, chosen, problems)
@@ -1765,19 +1846,28 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
     """Require every selected parent to describe the same tensor contract."""
     expected = plan.identity
     signatures: list[tuple[Source, tuple]] = []
+    authenticated_layouts: set[str] = set()
     for piece in plan.pieces:
         src = piece.source
         header, _body_offset = src.segment_header(plan.layer, plan.k)
         meta = header.get("__metadata__") or {}
         att = plan.atts[src.slug]["identity"]
         for field, want in (("base_model", att["base_model"]),
-                            ("layout", att["layout"]),
-                            ("predicate", att["predicate"]),
+                            ("predicate", "repack-of"),
                             ("layer", str(plan.layer)), ("k", str(plan.k))):
             if str(meta.get(field)) != str(want):
                 raise TrustError(
                     f"{plan.name}: {src} authenticated header {field}="
                     f"{meta.get(field)!r} disagrees with signed {want!r}")
+        layout = meta.get("layout")
+        if not isinstance(layout, str) or not layout:
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header lacks layout")
+        if att["layout"] is not None and layout != att["layout"]:
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header layout={layout!r} "
+                f"disagrees with signed {att['layout']!r}")
+        authenticated_layouts.add(layout)
         fragment_count = att["fragment_num_experts"]
         if (fragment_count is not None
                 and str(meta.get("num_experts")) != str(fragment_count)):
@@ -1785,20 +1875,32 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
                 f"{plan.name}: {src} authenticated header num_experts="
                 f"{meta.get('num_experts')!r} disagrees with signed "
                 f"{fragment_count!r}")
-        # Older fq-segment/1 headers do not repeat the base revision.  The
-        # signed attestation is still authoritative for it; when a header
-        # does declare one it must agree.
-        if (meta.get("revision") is not None
-                and str(meta["revision"]) != str(att["base_revision"])):
+        # Root encode attestations bind the encoded model revision in
+        # materials.base_revision.  Their storage header must repeat it as
+        # source_revision, so this locally signed subset never upgrades an
+        # unbound header field into parent identity.
+        if att["predicate"] == "encode-of":
+            header_revision = meta.get("source_revision")
+            if str(header_revision) != str(att["base_revision"]):
+                raise TrustError(
+                    f"{plan.name}: {src} authenticated header source_revision="
+                    f"{header_revision!r} disagrees with signed "
+                    f"{att['base_revision']!r}")
+        elif (meta.get("revision") is not None
+              and str(meta["revision"]) != str(att["base_revision"])):
             raise TrustError(
                 f"{plan.name}: {src} authenticated header revision="
                 f"{meta['revision']!r} disagrees with signed "
                 f"{att['base_revision']!r}")
         if any(att[field] != expected[field] for field in
-               ("base_model", "base_revision", "layout")):
+               ("base_model", "base_revision")):
             raise TrustError(
                 f"{plan.name}: {src} signed identity is incompatible with "
                 "the selected family")
+        if expected["layout"] is not None and layout != expected["layout"]:
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header layout={layout!r} "
+                f"is incompatible with selected family {expected['layout']!r}")
         template = []
         for name in piece.names:
             tensor = header[name]
@@ -1806,6 +1908,11 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
                 name.replace(f".experts.{piece.expert}.", ".experts.{{expert}}."),
                 tensor.get("dtype"), tuple(tensor.get("shape") or ())))
         signatures.append((src, tuple(template)))
+    if len(authenticated_layouts) != 1:
+        raise TrustError(
+            f"{plan.name}: selected parents disagree on authenticated layout "
+            f"{sorted(authenticated_layouts)}")
+    expected["layout"] = next(iter(authenticated_layouts))
     if signatures:
         source, canonical = signatures[0]
         for other, signature in signatures[1:]:
@@ -2284,6 +2391,13 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
         prov = plan.header_provenance.get(src.slug) or {}
         release_covered = src.expert_release_covered(plan.layer, plan.k)
         release = release_evidence(src) if release_covered else None
+        parent_identity = dict(att["identity"])
+        if (parent_identity["predicate"] == "encode-of"
+                and prov.get("authenticated")):
+            # ``layout`` is absent from the publisher's root encode claim.
+            # It becomes a locally signed statement only after the parent
+            # fragment has authenticated the header that supplied it.
+            parent_identity["layout"] = plan.identity.get("layout")
         parents.append({
             "role": "source_fragment",
             "repo": src.repo,
@@ -2300,7 +2414,7 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "keyid": verifier.fingerprint,
             "experts": experts,
             "predicate": att["identity"]["predicate"],
-            "identity": att["identity"],
+            "identity": parent_identity,
             "upstream_parents": att.get("parents"),
             # exactly which authenticated inputs this plan was computed from:
             # the layout (names, dtypes, shapes, offsets) came from the

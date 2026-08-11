@@ -22,7 +22,7 @@ import fq_verify  # noqa: E402
 from test_fq_prime import build_repo, prime, served  # noqa: E402,F401
 import fq_fetch  # noqa: E402
 import fq_release  # noqa: E402
-from test_fq_fetch import REV, build_source, write_policy  # noqa: E402
+from test_fq_fetch import REV, _publish_root_encode_attestation, build_source, write_policy  # noqa: E402
 from test_fq_repack import LAYERS, E, write_shard  # noqa: E402
 
 
@@ -583,8 +583,11 @@ def test_identity_derived_rejects_parent_metadata_repoint(served, tmp_path):
 
 
 def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False, strict_release=False,
-                       uppercase_release_revision=False):
+                       uppercase_release_revision=False, encode=False):
     repo, _, publisher = build_source(tmp_path, "pub", ks=(3,))
+    if encode:
+        for layer in LAYERS:
+            _publish_root_encode_attestation(repo, layer, 3, tmp_path / "pub.key")
     if strict_release:
         assert fq_release.main([
             "build", "--dir", str(repo), "--release", "test strict",
@@ -704,6 +707,23 @@ def test_identity_fetched_verifies_strict_release_evidence_offline(
             "size": len(wrong_signed)}))
     assert fq_verify.main(argv) == 1
 
+
+
+def test_identity_fetched_verifies_strict_release_encode_evidence_offline(
+        tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(
+        tmp_path, monkeypatch, strict_release=True, encode=True)
+    layer = LAYERS[0]
+    local_att = att_lines(fam, f"layer-{layer:03d}.k3")
+    parent = json.loads(base64.b64decode(
+        json.loads(local_att.read_text().splitlines()[0])["payload"]))["parents"][0]
+    assert parent["predicate"] == "encode-of"
+    assert parent["signed_release_manifest"] is True
+    assert parent["release_evidence"]["file"] == "fq-release.json"
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(fam),
+        "--layers", str(layer), "--trust-signer", signer_of(fam),
+        "--upstream-trust-signer", publisher]) == 0
 def test_identity_fetched_accepts_uppercase_signed_release_revision(
         tmp_path, monkeypatch):
     fam, publisher = _fetched_workspace(

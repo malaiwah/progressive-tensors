@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_assemble  # noqa: E402
 import fq_fetch  # noqa: E402
 import fq_release  # noqa: E402
+import fq_verify  # noqa: E402
 import fq_repack  # noqa: E402
 import fq_trust  # noqa: E402
 from test_fq_repack import E, LAYERS, write_shard  # noqa: E402
@@ -1229,6 +1230,36 @@ def _resign(att: Path, key: Path, mutate) -> None:
     att.write_text(fq_repack.Signer(key).sign_line(payload) + "\n")
 
 
+def _publish_root_encode_attestation(repo: Path, layer: int, k: int,
+                                     key: Path) -> None:
+    """Convert a fixture line to the published root ``encode-of`` shape."""
+    def convert(payload):
+        payload["predicate"] = "encode-of"
+        for field in ("base_model", "base_revision", "layout", "num_experts",
+                      "family_num_experts", "layer", "k"):
+            payload.pop(field, None)
+        payload["fragment"].pop("header_sha256", None)
+        payload["fragment"].pop("body_offset", None)
+        payload["materials"] = {
+            "base_model": "test/base",
+            "base_revision": REV,
+            "capture_fingerprint": hashlib.sha256(b"capture").hexdigest(),
+            "encoder": "encode_tr3_v31.py",
+            "encoder_bundle": f"test/encoder@{REV}:calibration_encoder",
+            "encoder_sha256": hashlib.sha256(b"encoder").hexdigest(),
+        }
+        payload["quant_args"] = {
+            "K": k, "codebook": "mcg", "out_scales": "auto",
+            "seed_base": 20260711, "tp": 4,
+        }
+        payload["determinism_scope"] = {
+            "capture_engine": "capture_stream.py",
+            "gpu_arch": "sm120",
+            "torch": "2.12.0+cu132",
+        }
+    _resign(_att_path(repo, layer, k), key, convert)
+
+
 def _attest_header_digests(repo: Path, key: Path, ks=KS) -> None:
     """Publish fragment.header_sha256 the way a publisher should, so the
     consumer can authenticate the header without reading the payload."""
@@ -1714,7 +1745,6 @@ def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys)
 @pytest.mark.parametrize(("field", "value", "needle"), [
     ("schema", "fq-attestation/0", "expected"),
     ("predicate", "equivalence-of", "not accepted"),
-    ("predicate", "encode-of", "not accepted"),
 ])
 def test_signed_upstream_schema_and_predicate_are_fail_closed(
         tmp_path, served, capsys, field, value, needle):
@@ -1731,6 +1761,74 @@ def test_signed_upstream_schema_and_predicate_are_fail_closed(
     assert needle in capsys.readouterr().err
     assert not list(out.glob("*.safetensors"))
 
+
+def test_published_root_encode_attestation_is_fetchable_and_offline_verifiable(
+        tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(2,), key=key)
+    _publish_root_encode_attestation(repo, LAYERS[0], 2, key)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [2] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+
+    payload = _payload(out / "attestations" / f"layer-{LAYERS[0]:03d}.k2.jsonl")
+    parent = payload["parents"][0]
+    assert parent["predicate"] == "encode-of"
+    assert parent["identity"] == {
+        "predicate": "encode-of", "base_model": "test/base",
+        "base_revision": REV, "layout": "rank_sliced_tp4",
+        "num_experts": None, "fragment_num_experts": None,
+        "layer": LAYERS[0], "k": 2,
+    }
+    copied = (out / "attestations" / parent["evidence_source"]
+              / f"layer-{LAYERS[0]:03d}.k2.jsonl")
+    assert _payload(copied)["materials"]["base_revision"] == REV
+    local = json.loads(
+        (out / "attestations" / f"layer-{LAYERS[0]:03d}.k2.jsonl").read_text()
+    )["keyid"]
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(out),
+        "--trust-signer", local, "--upstream-trust-signer", pub,
+        "--trust-root", str(trust_root(tmp_path, pub)),
+    ]) == 0
+
+
+def test_root_encode_dry_run_accepts_pinned_identity(tmp_path, served, capsys):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(2,), key=key)
+    _publish_root_encode_attestation(repo, LAYERS[0], 2, key)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [2] * E})
+    run(["--policy", policy, "--out", tmp_path / "dry-run",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub), "--dry-run"])
+    assert "dry run: no payload bytes fetched" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("missing", "needle"), [
+    ("base_revision", "materials lacks base_revision"),
+    ("capture_fingerprint", "materials has invalid capture_fingerprint"),
+    ("quant_args", "lacks quant_args"),
+])
+def test_root_encode_missing_required_evidence_is_refused(
+        tmp_path, served, capsys, missing, needle):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(2,), key=key)
+    _publish_root_encode_attestation(repo, LAYERS[0], 2, key)
+    def remove(payload):
+        if missing in ("base_revision", "capture_fingerprint"):
+            payload["materials"].pop(missing)
+        else:
+            payload.pop(missing)
+    _resign(_att_path(repo, LAYERS[0], 2), key, remove)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [2] * E})
+    run(["--policy", policy, "--out", tmp_path / "rejected",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert needle in capsys.readouterr().err
 
 def test_fetched_derivation_preserves_parent_predicate_and_identity(tmp_path, served):
     _, _, out, _, _ = _fetch_all(tmp_path, served)
