@@ -848,6 +848,47 @@ def test_no_release_report_does_not_claim_release_integrity(tmp_path, served,
         capsys.readouterr().out)
 
 
+def test_require_release_coverage_rejects_repository_without_release(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--require-release-coverage"], expect=1)
+    assert "--require-release-coverage needs a verified fq-release.json" in (
+        capsys.readouterr().err)
+    assert not served["ranges"]
+
+
+def test_expert_release_coverage_requires_segment_and_attestation(
+        tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "old",
+        "--repo", "test/pub", "--revision", "old-revision",
+        "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["files"].pop(f"attestations/layer-{LAYERS[0]:03d}.k3.jsonl")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["sources"][0]["release_coverage"][
+        f"layer-{LAYERS[0]:03d}.k3.safetensors"] is True
+    assert report["sources"][0]["release_coverage"][
+        f"attestations/layer-{LAYERS[0]:03d}.k3.jsonl"] is False
+    assert report["experts"][str(LAYERS[0])]["k3"]["0"]["release_covered"] is False
+
+
 def test_coalescing_merges_adjacent_experts_into_one_request(tmp_path, served):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
     served["mount"]("test/pub", repo)

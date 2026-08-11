@@ -424,6 +424,10 @@ class Source:
             raise TrustError(
                 f"{self}: could not retrieve fq-release.json: {e}") from e
         if raw is None:
+            if self.require_release_coverage:
+                raise TrustError(
+                    f"{self}: --require-release-coverage needs a verified "
+                    "fq-release.json, but the repository returned HTTP 404")
             return None
         import fq_release
 
@@ -489,6 +493,11 @@ class Source:
 
     def release_covered(self, name: str) -> bool:
         return self._release_coverage.get(name, False)
+
+    def expert_release_covered(self, layer: int, k: int) -> bool:
+        """An expert needs both its segment and attestation document covered."""
+        return (self.release_covered(self.segment_name(layer, k))
+                and self.release_covered(self.attestation_name(layer, k)))
 
     def cross_check_fragment(self, name: str, frag: dict) -> bool:
         """The signed release and the signed attestation must agree.
@@ -1482,8 +1491,8 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
             per_k[plan.k][str(plan.layer)] = entry
         provenance.setdefault(str(plan.layer), {})[f"k{plan.k}"] = {
             str(p.expert): {"source": str(p.source), "sha256": p.sha256,
-                            "release_covered": p.source.release_covered(
-                                Source.segment_name(plan.layer, plan.k))}
+                            "release_covered": p.source.expert_release_covered(
+                                plan.layer, plan.k)}
             for p in plan.pieces}
     index_names = {}
     for k, index in per_k.items():
