@@ -316,14 +316,11 @@ class Source:
         self._header_bytes: dict[str, bytes] = {}
         self._attestations: dict[str, dict] = {}
         self._header_auth: dict[str, dict] = {}
-1:         self._verified_pieces: dict[tuple[str, int, int], Path] = {}
+        self._verified_pieces: dict[tuple[str, int, int], Path] = {}
         self._release_coverage: dict[str, bool] = {}
         self._published_release_parent_checked = False
         self._published_release_parent: str | None = None
         self.require_release_coverage = False
-2:         prov["release_covered"] = covered
-        header, body_offset = self._headers[name]
-        self._write_header_cache(name, header, body_offset, prov)
         self.release: dict | None = None
         self.manifest: dict = {}
 
@@ -784,10 +781,7 @@ class Source:
         # a later process must not observe a half-recorded proof that lacks
         # the release coverage used in derived provenance.
         prov["release_manifest"] = covered
-1:         self._verified_pieces: dict[tuple[str, int, int], Path] = {}
-        self._release_coverage: dict[str, bool] = {}
-        self.require_release_coverage = False
-2:         prov["release_covered"] = covered
+        prov["release_covered"] = covered
         header, body_offset = self._headers[name]
         self._write_header_cache(name, header, body_offset, prov)
         return prov
