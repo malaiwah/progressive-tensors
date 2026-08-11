@@ -118,6 +118,7 @@ SEGMENT_SCHEMA = "fq-segment/1"
 MANIFEST_SCHEMA = "fq-manifest/1"
 POLICY_SCHEMA = "fq-policy/2"
 SELECT_SCHEMA = "fq-select/1"
+FETCH_BINDING_SCHEMA = "fq-fetch-binding/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
@@ -259,8 +260,9 @@ class Transport:
 
 # ------------------------------------------------------------------ sources
 
-def slugify(repo: str, revision: str) -> str:
-    return f"{repo.replace('/', '__')}@{revision[:12]}"
+def slugify(repo: str, revision: str, subdir: str = "") -> str:
+    slug = f"{repo.replace('/', '__')}@{revision[:12]}"
+    return f"{slug}:{subdir.replace('/', '__')}" if subdir else slug
 
 
 class Source:
@@ -272,13 +274,14 @@ class Source:
     """
 
     def __init__(self, repo: str, revision: str, transport: Transport,
-                 cache_root: Path, *, order: int = 0):
+                 cache_root: Path, *, subdir: str = "", order: int = 0):
         self.repo = repo
         self.revision = revision or "main"
         self.pinned = bool(revision)
+        self.subdir = subdir
         self.t = transport
         self.order = order
-        self.slug = slugify(repo, self.revision)
+        self.slug = slugify(repo, self.revision, subdir)
         self.cache = cache_root / self.slug
         self.cache.mkdir(parents=True, exist_ok=True)
         self.resolved_commit: str | None = None
@@ -294,16 +297,30 @@ class Source:
     @classmethod
     def parse(cls, spec: str, transport: Transport, cache_root: Path,
               order: int = 0) -> "Source":
-        repo, _, rev = spec.partition("@")
+        repo, marker, revision_path = spec.partition("@")
         if not repo:
             raise SystemExit(f"--source {spec!r}: empty repo id")
-        return cls(repo, rev, transport, cache_root, order=order)
+        revision, separator, subdir = revision_path.partition(":")
+        if separator:
+            if not revision or not subdir:
+                raise SystemExit(
+                    f"--source {spec!r}: nested sources require "
+                    "REPO@REV:relative/path")
+            parts = subdir.split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                raise SystemExit(
+                    f"--source {spec!r}: source path must be a clean relative path")
+        if not marker:
+            revision = ""
+        return cls(repo, revision, transport, cache_root, subdir=subdir, order=order)
 
     def __str__(self) -> str:
-        return f"{self.repo}@{self.revision}"
+        source = f"{self.repo}@{self.revision}"
+        return f"{source}:{self.subdir}" if self.subdir else source
 
     def url(self, name: str) -> str:
-        return hub_url(self.repo, self.revision, name)
+        path = f"{self.subdir}/{name}" if self.subdir else name
+        return hub_url(self.repo, self.revision, path)
 
     @staticmethod
     def index_name(k: int) -> str:
@@ -349,6 +366,11 @@ class Source:
     def load_manifest(self) -> dict:
         self.manifest = self.small_json("fq-manifest.json") or {}
         return self.manifest
+
+    def manifest_sha256(self) -> str | None:
+        """Digest of the exact manifest bytes that define this source family."""
+        raw = self._small.get("fq-manifest.json")
+        return hashlib.sha256(raw).hexdigest() if raw is not None else None
 
     def load_release(self, verifier: fq_trust.Verifier) -> dict | None:
         """Fetch and verify fq-release.json when the source publishes one.
@@ -686,6 +708,43 @@ def load_policy(path: Path, layers: str | None) -> dict[int, dict[int, int]]:
     return out
 
 
+def load_fetch_binding(path: Path) -> dict | None:
+    """Load a recipe's complete, immutable provider/content binding."""
+    binding = json.loads(Path(path).read_text()).get("fetch_binding")
+    if binding is None:
+        return None
+    if not isinstance(binding, dict) or binding.get("schema") != FETCH_BINDING_SCHEMA:
+        raise TrustError(
+            f"{path}: fetch_binding must declare schema {FETCH_BINDING_SCHEMA!r}")
+    providers = binding.get("providers")
+    content = binding.get("content")
+    if not isinstance(providers, dict) or providers.get("schema") != SELECT_SCHEMA:
+        raise TrustError(
+            f"{path}: fetch_binding.providers must be an {SELECT_SCHEMA} map")
+    if not isinstance(content, dict):
+        raise TrustError(f"{path}: fetch_binding.content must be an object")
+    if not isinstance(content.get("manifests"), dict):
+        raise TrustError(f"{path}: fetch_binding.content.manifests must be an object")
+    if not isinstance(content.get("experts"), dict):
+        raise TrustError(f"{path}: fetch_binding.content.experts must be an object")
+    return binding
+
+
+def binding_digest(binding: dict, layer: int, expert: int) -> str | None:
+    return ((binding["content"]["experts"].get(str(layer)) or {})
+            .get(str(expert)))
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def load_select(path: Path | None) -> dict:
     """fq-select/1 provider map: {"default": alias, "layers": {L: alias},
     "experts": {L: {E: alias}}}.  Aliases are repo ids or repo@rev."""
@@ -710,6 +769,53 @@ def select_preference(sel: dict, layer: int, expert: int) -> str | None:
 
 def source_matches(source: Source, alias: str) -> bool:
     return alias in (source.repo, str(source), source.slug)
+
+
+def validate_fetch_binding(binding: dict, policy: dict[int, dict[int, int]],
+                           sources: list[Source]) -> None:
+    """Prove every selected provider and manifest before payload planning."""
+    providers = binding["providers"]
+    manifests = binding["content"]["manifests"]
+    source_by_name = {str(source): source for source in sources}
+    selected: set[str] = set()
+    for layer, experts in policy.items():
+        for expert in experts:
+            alias = select_preference(providers, layer, expert)
+            digest = binding_digest(binding, layer, expert)
+            if not isinstance(alias, str):
+                raise TrustError(
+                    f"fetch binding has no provider for layer {layer} expert {expert}")
+            if not _is_sha256(digest):
+                raise TrustError(
+                    f"fetch binding has no valid digest for layer {layer} expert {expert}")
+            source = source_by_name.get(alias)
+            if source is None:
+                raise TrustError(
+                    f"fetch binding requires source {alias!r}, which was not supplied")
+            if (not source.pinned or len(source.revision) != 40
+                    or not all(c in "0123456789abcdefABCDEF"
+                               for c in source.revision)):
+                raise TrustError(
+                    f"fetch binding source {alias!r} is not pinned to a commit")
+            if source.resolved_commit and source.resolved_commit != source.revision:
+                raise TrustError(
+                    f"fetch binding source {alias!r} resolved to "
+                    f"{source.resolved_commit}, not its pinned commit")
+            selected.add(alias)
+    for alias in selected:
+        expected = manifests.get(alias)
+        source = source_by_name[alias]
+        actual = source.manifest_sha256()
+        if not _is_sha256(expected):
+            raise TrustError(
+                f"fetch binding has no valid manifest digest for {alias!r}")
+        if actual is None:
+            raise TrustError(
+                f"fetch binding source {alias!r} has no fq-manifest.json")
+        if actual != expected:
+            raise TrustError(
+                f"fetch binding manifest for {alias!r} hashes to {actual[:16]}… "
+                f"not {expected[:16]}…")
 
 
 # ------------------------------------------------------------------ planning
@@ -776,12 +882,13 @@ class FilePlan:
 
 
 def choose_source(candidates: list[tuple[Source, dict, dict]], layer: int,
-                  expert: int, *, prefer_sha: set[str], select: dict):
+                  expert: int, *, prefer_sha: set[str], select: dict,
+                  required_select: bool = False):
     """Pick the provider for one expert.
 
-    Order of authority: content hash (--prefer-sha) > explicit provider map
-    (--select) > source order on the command line.  Returns
-    (source, index_entry, attestation) or None.
+    A recipe binding makes its provider selection mandatory; unlike an
+    interactive preference, it never falls through to another available
+    source.
     """
     if prefer_sha:
         for src, idx, att in candidates:
@@ -790,14 +897,17 @@ def choose_source(candidates: list[tuple[Source, dict, dict]], layer: int,
     alias = select_preference(select, layer, expert)
     if alias:
         for src, idx, att in candidates:
-            if source_matches(src, alias):
+            matches = str(src) == alias if required_select else source_matches(src, alias)
+            if matches:
                 return src, idx, att
+        if required_select:
+            return None
     return candidates[0] if candidates else None
 
 
 def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                verifier: fq_trust.Verifier, *, prefer_sha: set[str],
-               select: dict) -> tuple[list[FilePlan], list[str]]:
+               select: dict, binding: dict | None = None) -> tuple[list[FilePlan], list[str]]:
     """Resolve every (layer, expert, K) to a provider and a byte range."""
     plans: list[FilePlan] = []
     problems: list[str] = []
@@ -832,8 +942,9 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             for expert in by_k[k]:
                 have = [(s, i, a) for s, i, a in cands
                         if str(expert) in (i.get("experts") or {})]
-                pick = choose_source(have, layer, expert,
-                                     prefer_sha=prefer_sha, select=select)
+                pick = choose_source(
+                    have, layer, expert, prefer_sha=prefer_sha, select=select,
+                    required_select=binding is not None)
                 if pick is None:
                     problems.append(
                         f"layer {layer} K{k} expert {expert}: no source carries it")
@@ -845,6 +956,12 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                         f"layer {layer} K{k} expert {expert}: {src} has the bytes "
                         f"but no attested digest — refusing to fetch unverifiable "
                         f"fragments")
+                    continue
+                expected = binding_digest(binding, layer, expert) if binding else None
+                if expected is not None and digest != expected:
+                    problems.append(
+                        f"layer {layer} K{k} expert {expert}: {src} attests "
+                        f"{digest[:16]}… but fetch binding requires {expected[:16]}…")
                     continue
                 chosen.append((expert, src, idx, digest))
             if not chosen:
@@ -1413,10 +1530,12 @@ def main(argv=None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--policy", required=True, type=Path,
                    help="recipe: fq-policy/2 JSON with bits_per_expert")
-    p.add_argument("--source", action="append", default=[], metavar="REPO[@REV]",
-                   help="artifact repo, repeatable and ORDERED (earlier wins "
-                        "ties).  Pin @<commit>: a bare repo id follows main "
-                        "and is a weaker pin.")
+    p.add_argument("--source", action="append", default=[],
+                   metavar="REPO[@REV[:SUBDIR]]",
+                   help="artifact repo or nested family, repeatable and ORDERED "
+                   "(earlier wins ties). Pin a nested family as "
+                   "REPO@40-hex-commit:relative/path; a bare repo follows main "
+                   "and is a weaker pin.")
     p.add_argument("--out", required=True, type=Path,
                    help="local segment tree to build (fq_assemble --segments)")
     p.add_argument("--layers", default=None, help="subset, e.g. 3-10 or 3,5,7")
@@ -1487,10 +1606,21 @@ def main(argv=None) -> int:
         for s in sources:
             s.load_release(verifier)
         policy = load_policy(args.policy, args.layers)
-        select = load_select(args.select)
+        binding = load_fetch_binding(args.policy)
+        if binding and (args.select or args.prefer_sha):
+            raise TrustError(
+                "a recipe fetch_binding is authoritative; do not pass "
+                "--select or --prefer-sha")
+        if binding:
+            validate_fetch_binding(binding, policy, sources)
+            select = binding["providers"]
+            prefer_sha: set[str] = set()
+        else:
+            select = load_select(args.select)
+            prefer_sha = set(args.prefer_sha)
         plans, problems = plan_fetch(policy, sources, verifier,
-                                     prefer_sha=set(args.prefer_sha),
-                                     select=select)
+                                     prefer_sha=prefer_sha, select=select,
+                                     binding=binding)
     except TrustError as e:
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
         return 1
@@ -1500,6 +1630,10 @@ def main(argv=None) -> int:
 
     for msg in problems:
         print(f"  ! {msg}", file=sys.stderr)
+    if binding and problems:
+        print("bound recipe has unsatisfied providers or content digests; "
+              "nothing fetched", file=sys.stderr)
+        return 1
     if not plans:
         print("nothing to fetch: no source carries the experts this recipe asks "
               "for", file=sys.stderr)
