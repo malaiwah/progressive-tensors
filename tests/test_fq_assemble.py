@@ -162,6 +162,47 @@ def test_segment_trellis_axes_must_match_source_before_hashing(repacked):
     with pytest.raises(fq_assemble.AssemblyError, match="rotation axes"):
         assemble(segments, snap, ppath, out)
     assert not out.exists()
+def _write_cardinality_source(path: Path, experts: int = 256) -> Path:
+    """Small but structurally valid 256-expert source-header fixture."""
+    header, blobs, offset = {}, [], 0
+    for expert in range(experts):
+        name = f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis"
+        header[name] = {"dtype": "F16", "shape": [1],
+                        "data_offsets": [offset, offset + 2]}
+        blobs.append(b"\0\0")
+        offset += 2
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
+    return path
+
+
+@pytest.mark.parametrize(("supplied", "valid"),
+                         [(0, False), (1, False), (255, False),
+                          (256, True), (257, False)])
+def test_assembly_preflight_requires_dense_256_expert_policy(
+        tmp_path, supplied, valid):
+    source = _write_cardinality_source(tmp_path / "model-layer-003.safetensors")
+    jobs = [(source, 3, [3] * supplied)]
+    if valid:
+        fq_assemble.validate_policy_cardinality(jobs, {"num_experts": 256})
+    else:
+        with pytest.raises(
+                fq_assemble.VerificationError,
+                match=fr"layer 3 policy has {supplied} entries; source/family "
+                      r"requires 256"):
+            fq_assemble.validate_policy_cardinality(jobs, {"num_experts": 256})
+
+
+def test_assembly_preflight_rejects_manifest_source_cardinality_disagreement(tmp_path):
+    source = _write_cardinality_source(tmp_path / "model-layer-003.safetensors")
+    with pytest.raises(
+            fq_assemble.VerificationError,
+            match=r"layer 3: source shard holds 256 experts but the family "
+                  r"manifest declares 255"):
+        fq_assemble.validate_policy_cardinality(
+            [(source, 3, [3] * 256)], {"num_experts": 255})
+
 @pytest.fixture()
 def repacked(tmp_path):
     snap, out = _build_k3_workspace(tmp_path)
