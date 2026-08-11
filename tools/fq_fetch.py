@@ -124,6 +124,7 @@ SELECT_SCHEMA = "fq-select/1"
 FETCH_BINDING_SCHEMA = "fq-fetch-binding/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
 ATTESTATION_SCHEMA = "fq-attestation/1"
+EVIDENCE_LOCATOR_SCHEMA = "fq-evidence-locator/1"
 ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of",))
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
@@ -289,8 +290,16 @@ class Transport:
 # ------------------------------------------------------------------ sources
 
 def slugify(repo: str, revision: str, subdir: str = "") -> str:
-    """Injective local evidence locator for one resolved source family."""
-    return (f"{urllib.parse.quote(repo, safe='')}@{revision[:12]}:"
+    """Internal cache key; evidence uses evidence_source_slug instead."""
+    slug = f"{repo.replace('/', '__')}@{revision[:12]}"
+    return f"{slug}:{subdir.replace('/', '__')}" if subdir else slug
+
+
+def evidence_source_slug(repo: str, revision: str, subdir: str = "") -> str:
+    """Canonical, injective signed locator for copied source evidence."""
+    if not Source.is_immutable_commit(revision):
+        raise ValueError("evidence source revision must be a full commit")
+    return (f"{urllib.parse.quote(repo, safe='')}@{revision.lower()}:"
             f"{urllib.parse.quote(subdir, safe='')}")
 
 
@@ -2047,6 +2056,7 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                      else "none (no verified release)")
     report = {
         "schema": REPORT_SCHEMA,
+        "evidence_locator_schema": EVIDENCE_LOCATOR_SCHEMA,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "policy": str(policy_path),
         "trust": {"rung": verifier.rung, "signer": verifier.fingerprint,
@@ -2063,6 +2073,8 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "header_authentication": headers,
         "sources": [{"repo": s.repo, "revision": s.revision,
                      "requested_revision": s.requested_revision,
+                     "evidence_source": evidence_source_slug(
+                         s.repo, s.resolved_commit, s.subdir),
                      "pinned": s.pinned, "resolved_commit": s.resolved_commit,
                      "release_manifest": bool(s.release),
                      "release_coverage_required": s.release_coverage_required(),
@@ -2084,7 +2096,8 @@ def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
             raw = src.small_file(name)
             if raw is None:
                 continue
-            dst = out / "attestations" / src.slug / Path(name).name
+            dst = out / "attestations" / evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir) / Path(name).name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(raw)
 
@@ -2127,9 +2140,10 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "revision": src.resolved_commit,
             "requested_revision": src.requested_revision,
             "subdir": src.subdir,
-            # Signed locator for the copied evidence.  It is canonicalized
-            # from repo, resolved commit, and subdirectory—not user input.
-            "evidence_source": src.slug,
+            # Signed locator for copied evidence, canonically derived from
+            # repo, resolved commit, and subdirectory—not user input.
+            "evidence_source": evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir),
             "file": frag.get("file"),
             "sha256": frag.get("sha256"),
             "size": frag.get("size"),

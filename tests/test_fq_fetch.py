@@ -1747,10 +1747,11 @@ def test_commit_ids_are_normalized_before_drift_checks(tmp_path, served):
     report = json.loads((out / "fq-fetch-report.json").read_text())
     assert report["sources"][0]["revision"] == REV
     assert report["sources"][0]["requested_revision"] == REV.upper()
+    assert report["evidence_locator_schema"] == fq_fetch.EVIDENCE_LOCATOR_SCHEMA
     payload = _payload(
         out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
     parent = payload["parents"][0]
-    slug = fq_fetch.slugify("test/pub", REV)
+    slug = fq_fetch.evidence_source_slug("test/pub", REV)
     assert parent["subdir"] == ""
     assert parent["evidence_source"] == slug
     assert (out / "attestations" / slug
@@ -1837,7 +1838,7 @@ def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
 
 def test_evidence_locator_is_injective_and_preserves_repo_case():
     revision = REV
-    assert fq_fetch.slugify("Owner__Name/repo", revision, "a/b") == (
-        "Owner__Name%2Frepo@0123456789ab:a%2Fb")
-    assert fq_fetch.slugify("Owner__Name/repo", revision, "a/b") != (
-        fq_fetch.slugify("Owner/Name__repo", revision, "a__b"))
+    assert fq_fetch.evidence_source_slug("Owner__Name/repo", revision, "a/b") == (
+        f"Owner__Name%2Frepo@{REV}:a%2Fb")
+    assert fq_fetch.evidence_source_slug("Owner__Name/repo", revision, "a/b") != (
+        fq_fetch.evidence_source_slug("Owner/Name__repo", revision, "a__b"))
