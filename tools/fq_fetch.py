@@ -2507,9 +2507,12 @@ def main(argv=None) -> int:
 
     for msg in problems:
         print(f"  ! {msg}", file=sys.stderr)
-    if problems:
+    if problems and (binding or args.select or args.prefer_sha):
         if binding:
             print("bound recipe has unsatisfied providers or content digests; "
+                  "nothing fetched", file=sys.stderr)
+        else:
+            print("explicit provider or content constraints were unsatisfied; "
                   "nothing fetched", file=sys.stderr)
         return 1
     if not plans:

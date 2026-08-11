@@ -897,10 +897,10 @@ def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsy
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 5, 3, 3]})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
-        expect=1)
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
     assert "no source carries it" in capsys.readouterr().err
-    assert not list(out.glob("*.safetensors"))
+    assert set(json.loads((out / "index-k3.json").read_text())
+               [str(LAYERS[0])]["experts"]) == {"0", "2", "3"}
 
 def test_published_commit_is_strict_via_signed_parent_relation(
         tmp_path, served, monkeypatch, capsys):
@@ -1518,10 +1518,10 @@ def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
-        expect=1)
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
     assert "no attested digest" in capsys.readouterr().err
-    assert not list(out.glob("*.safetensors"))
+    index = json.loads((out / "index-k3.json").read_text())
+    assert "1" not in index[str(LAYERS[0])]["experts"]
 
 
 def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
