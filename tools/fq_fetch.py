@@ -97,6 +97,7 @@ consumer needs no hub client at all.
 from __future__ import annotations
 
 import argparse
+import binascii
 import base64
 import hashlib
 import json
@@ -284,8 +285,10 @@ class Source:
         self.resolved_commit: str | None = None
         self._small: dict[str, bytes | None] = {}
         self._headers: dict[str, tuple[dict, int]] = {}
+        self._header_bytes: dict[str, bytes] = {}
         self._attestations: dict[str, dict] = {}
         self._header_auth: dict[str, dict] = {}
+        self._verified_pieces: dict[tuple[str, int, int], Path] = {}
         self.release: dict | None = None
         self.manifest: dict = {}
 
@@ -490,12 +493,31 @@ class Source:
         if name in self._headers:
             return self._headers[name]
         cache = self.cache / f"hdr-{name}.json"
+        obj = None
         if cache.exists():
-            obj = json.loads(cache.read_text())
-            out = (obj["header"], obj["body_offset"])
-            if obj.get("authentication"):
-                self._header_auth.setdefault(name, obj["authentication"])
-        else:
+            try:
+                candidate = json.loads(cache.read_text())
+                raw = base64.b64decode(candidate["header_bytes"], validate=True)
+                body_offset = candidate["body_offset"]
+                if (not isinstance(body_offset, int) or len(raw) != body_offset
+                        or len(raw) < 8
+                        or 8 + struct.unpack("<Q", raw[:8])[0] != body_offset):
+                    raise ValueError("header length")
+                header = json.loads(raw[8:])
+                if not isinstance(header, dict) or header != candidate["header"]:
+                    raise ValueError("header representation")
+                obj = candidate
+                out = (header, body_offset)
+                self._header_bytes[name] = raw
+                if isinstance(obj.get("authentication"), dict):
+                    self._header_auth[name] = obj["authentication"]
+            except (binascii.Error, KeyError, TypeError, ValueError,
+                    json.JSONDecodeError, struct.error):
+                # A cache is an optimization, never an authority.  In
+                # particular, old cache entries did not retain the exact
+                # bytes their authentication record claims to prove.
+                obj = None
+        if obj is None:
             url = self.url(name)
             d, meta = self.t.get_range(url, 0, 8)
             hlen = struct.unpack("<Q", d)[0]
@@ -505,19 +527,54 @@ class Source:
             self.resolved_commit = self.resolved_commit or meta.get("commit")
             header = json.loads(hj)
             out = (header, 8 + hlen)
-            self._write_header_cache(name, header, out[1], None)
+            self._write_header_cache(name, header, out[1], None,
+                                     bytes(d) + bytes(hj))
         self._headers[name] = out
         return out
 
     def _write_header_cache(self, name: str, header: dict, body_offset: int,
-                            auth: dict | None) -> None:
-        (self.cache / f"hdr-{name}.json").write_text(json.dumps(
-            {"header": header, "body_offset": body_offset,
-             "authentication": auth}))
+                            auth: dict | None, raw: bytes | None = None) -> None:
+        raw = raw if raw is not None else self._header_bytes.get(name)
+        if raw is None or len(raw) != body_offset:
+            raise ValueError(f"{self}:{name}: refusing incomplete header cache")
+        cache = self.cache / f"hdr-{name}.json"
+        tmp = cache.with_name(f"{cache.name}.tmp-{os.getpid()}-{time.time_ns()}")
+        tmp.write_text(json.dumps({
+            "header": header,
+            "header_bytes": base64.b64encode(raw).decode(),
+            "body_offset": body_offset,
+            "authentication": auth,
+        }, sort_keys=True))
+        os.replace(tmp, cache)
         self._headers[name] = (header, body_offset)
+        self._header_bytes[name] = raw
+        if auth is not None:
+            self._header_auth[name] = auth
+
+    def _cached_authentication_fits(self, name: str, prov: dict, mode: str,
+                                    frag: dict, covered: bool) -> bool:
+        """A persisted proof is useful only when it binds these exact bytes."""
+        try:
+            header, body_offset = self._headers[name]
+            raw = self._header_bytes[name]
+            raw_header = json.loads(raw[8:])
+            raw_digest = hashlib.sha256(raw).hexdigest()
+            valid = (
+                bool(prov.get("authenticated"))
+                and len(raw) == body_offset
+                and 8 + struct.unpack("<Q", raw[:8])[0] == body_offset
+                and raw_header == header
+                and prov.get("body_offset") == body_offset
+                and prov.get("header_sha256") == raw_digest
+                and bool(prov.get("release_manifest")) == covered
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError,
+                struct.error):
+            return False
+        return valid and self._auth_fits(prov, mode, frag)
 
     def authenticate_header(self, layer: int, k: int, att: dict,
-                            mode: str) -> dict:
+                            mode: str, *, retain=None) -> dict:
         """Prove a segment's safetensors header before planning from it.
 
         The header carries tensor names, dtypes, shapes and offsets — the
@@ -537,10 +594,13 @@ class Source:
                     "note": "the plan came from an unverified ranged read"}
             self._header_auth[name] = prov
             return prov
+        self.segment_header(layer, k)
         cached = self._header_auth.get(name)
-        if cached and cached.get("authenticated") and self._auth_fits(cached, mode, frag):
+        if (cached and cached.get("authenticated")
+                and self._cached_authentication_fits(
+                    name, cached, mode, frag, covered)):
             return cached
-        if frag.get("header_sha256"):
+        if frag.get("header_sha256") and mode != HEADER_FULL:
             prov = self._auth_by_header_digest(name, frag)
         elif mode == HEADER_ATTESTED:
             raise TrustError(
@@ -552,9 +612,13 @@ class Source:
                 f"--header-trust unsafe plans from the unverified header and "
                 f"says so in the output tree.")
         else:
-            prov = self._auth_by_full_fragment(name, frag)
+            prov = self._auth_by_full_fragment(name, frag, retain=retain)
+        # This is deliberately before the only proof-bearing cache write:
+        # a later process must not observe a half-recorded proof that lacks
+        # the release coverage used in derived provenance.
         prov["release_manifest"] = covered
-        self._header_auth[name] = prov
+        header, body_offset = self._headers[name]
+        self._write_header_cache(name, header, body_offset, prov)
         return prov
 
     @staticmethod
@@ -567,7 +631,8 @@ class Source:
                     and prov.get("fragment_sha256") == frag.get("sha256"))
         if prov.get("method") == AUTH_FULL_FRAGMENT:
             return prov.get("fragment_sha256") == frag.get("sha256")
-        return prov.get("header_sha256") == frag.get("header_sha256")
+        return (prov.get("method") == AUTH_HEADER_DIGEST
+                and prov.get("header_sha256") == frag.get("header_sha256"))
 
     def _auth_by_header_digest(self, name: str, frag: dict) -> dict:
         """Cheap path: the publisher signed a digest of the header bytes."""
@@ -578,7 +643,8 @@ class Source:
             raise IOError(f"{self}:{name}: implausible header length {hlen}")
         hj, meta = self.t.get_range(url, 8, 8 + hlen)
         self.resolved_commit = self.resolved_commit or meta.get("commit")
-        got = hashlib.sha256(bytes(d) + bytes(hj)).hexdigest()
+        raw = bytes(d) + bytes(hj)
+        got = hashlib.sha256(raw).hexdigest()
         want = frag["header_sha256"]
         if got != want:
             raise TrustError(
@@ -591,16 +657,14 @@ class Source:
                 f"{self}: {name} body starts at {body_offset}, the signed "
                 f"attestation says {frag['body_offset']}")
         header = json.loads(hj)
-        prov = {"method": AUTH_HEADER_DIGEST, "authenticated": True,
+        self._headers[name] = (header, body_offset)
+        self._header_bytes[name] = raw
+        return {"method": AUTH_HEADER_DIGEST, "authenticated": True,
                 "header_sha256": got, "body_offset": body_offset,
                 "bytes_read": body_offset}
-        self._write_header_cache(name, header, body_offset, prov)
-        return prov
 
-    def _auth_by_full_fragment(self, name: str, frag: dict) -> dict:
-        """Fallback: no signed header digest, so verify the whole fragment
-        against the signed file digest and read the header out of bytes that
-        are then known to be the publisher's."""
+    def _auth_by_full_fragment(self, name: str, frag: dict, *, retain=None) -> dict:
+        """Verify a whole fragment, retaining selected verified bytes on disk."""
         size, want = frag.get("size"), frag.get("sha256")
         if not want:
             raise TrustError(
@@ -611,6 +675,16 @@ class Source:
                 f"{self}: {name} has neither a signed header digest nor a "
                 f"signed size, so the fragment cannot be verified in full. "
                 f"Ask the publisher for fragment.header_sha256.")
+        retained = {}
+        if retain:
+            spool = self.cache / ".verified-pieces"
+            spool.mkdir(exist_ok=True)
+            for piece in retain:
+                path = spool / (
+                    f"{name}.{piece.remote_start}-{piece.remote_end}."
+                    f"{os.getpid()}-{time.time_ns()}")
+                path.write_bytes(b"")
+                retained[piece] = path
         url = self.url(name)
         digest = hashlib.sha256()
         head = bytearray()
@@ -630,20 +704,46 @@ class Source:
                         f"{self}:{name}: implausible header length {need - 8}")
             if len(head) < need:
                 head += data[:need - len(head)]
+            for piece, path in retained.items():
+                start = max(off, piece.remote_start)
+                stop = min(end, piece.remote_end)
+                if start < stop:
+                    with open(path, "ab") as f:
+                        f.write(data[start - off: stop - off])
             off = end
         got = digest.hexdigest()
         if got != want:
+            for path in retained.values():
+                path.unlink(missing_ok=True)
             raise TrustError(
                 f"{self}: {name} hashes to {got[:16]}… over {size} bytes but "
                 f"the signed attestation says {want[:16]}… — refusing to plan "
                 f"from a fragment that is not the one that was signed")
-        header = json.loads(bytes(head[8:need]))
-        prov = {"method": AUTH_FULL_FRAGMENT, "authenticated": True,
+        raw = bytes(head[:need])
+        header = json.loads(raw[8:])
+        self._headers[name] = (header, need)
+        self._header_bytes[name] = raw
+        for piece, path in retained.items():
+            if path.stat().st_size == piece.size:
+                self._verified_pieces[(name, piece.remote_start, piece.remote_end)] = path
+            else:
+                path.unlink(missing_ok=True)
+        return {"method": AUTH_FULL_FRAGMENT, "authenticated": True,
                 "fragment_sha256": got, "body_offset": need,
-                "header_sha256": hashlib.sha256(bytes(head[:need])).hexdigest(),
+                "header_sha256": hashlib.sha256(raw).hexdigest(),
                 "bytes_read": size}
-        self._write_header_cache(name, header, need, prov)
-        return prov
+
+    def take_verified_piece(self, name: str, piece) -> bytes | None:
+        """Consume a current-run full-auth spool file, never a persisted cache."""
+        path = self._verified_pieces.pop(
+            (name, piece.remote_start, piece.remote_end), None)
+        if path is None:
+            return None
+        try:
+            data = path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+        return data if len(data) == piece.size else None
 
 
 # ------------------------------------------------------------------- policy
@@ -873,7 +973,8 @@ def authenticate_plan(plan: FilePlan, mode: str) -> dict:
                       key=lambda s: s.slug):
         att = plan.atts.get(src.slug) or {}
         provenance[src.slug] = src.authenticate_header(
-            plan.layer, plan.k, att, mode)
+            plan.layer, plan.k, att, mode,
+            retain=[p for p in plan.pieces if p.source is src])
     if mode == HEADER_UNSAFE:
         plan.header_provenance = provenance
         return provenance
@@ -902,9 +1003,15 @@ def authentication_cost(plans: list[FilePlan], mode: str) -> dict:
     for plan in plans:
         for src in {p.source.slug: p.source for p in plan.pieces}.values():
             frag = (plan.atts.get(src.slug) or {}).get("fragment") or {}
-            if mode == HEADER_UNSAFE:
+            name = Source.segment_name(plan.layer, plan.k)
+            cached = src._cached_authentication_fits(
+                name, src._header_auth.get(name) or {}, mode, frag,
+                bool(src.release_entry(name)))
+            if cached:
+                methods["cached"] = methods.get("cached", 0) + 1
+            elif mode == HEADER_UNSAFE:
                 methods[AUTH_NONE] = methods.get(AUTH_NONE, 0) + 1
-            elif frag.get("header_sha256"):
+            elif frag.get("header_sha256") and mode != HEADER_FULL:
                 methods[AUTH_HEADER_DIGEST] = methods.get(AUTH_HEADER_DIGEST, 0) + 1
             elif mode == HEADER_ATTESTED:
                 methods["refused (no signed header digest)"] = methods.get(
@@ -1319,6 +1426,55 @@ def save_state(out: Path, state: dict) -> None:
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, out / "state.json")
 
+def _completed_entry(plan: FilePlan, target: Path) -> dict:
+    """Re-establish every claim a done-state entry is allowed to make."""
+    expected_header = {"__metadata__": plan.meta, **plan.header}
+    size = target.stat().st_size
+    digest = hashlib.sha256()
+    with open(target, "rb") as f:
+        prefix = f.read(8)
+        if len(prefix) != 8:
+            raise TrustError(f"{plan.name}: completed file has no safetensors header")
+        hlen = struct.unpack("<Q", prefix)[0]
+        if not 0 < hlen < (1 << 31):
+            raise TrustError(f"{plan.name}: completed file has an implausible header")
+        hj = f.read(hlen)
+        if len(hj) != hlen:
+            raise TrustError(f"{plan.name}: completed file has a short header")
+        body_offset = 8 + hlen
+        try:
+            header = json.loads(hj)
+        except json.JSONDecodeError as e:
+            raise TrustError(f"{plan.name}: completed file header is invalid JSON") from e
+        if header != expected_header:
+            raise TrustError(
+                f"{plan.name}: completed file header no longer matches the "
+                "authenticated plan")
+        if size != body_offset + plan.body_size:
+            raise TrustError(
+                f"{plan.name}: completed file size no longer matches the plan")
+        digest.update(prefix)
+        digest.update(hj)
+        for block in iter(lambda: f.read(1 << 22), b""):
+            digest.update(block)
+        for piece in plan.pieces:
+            f.seek(body_offset + piece.local_off)
+            got = hashlib.sha256(f.read(piece.size)).hexdigest()
+            if got != piece.sha256:
+                raise TrustError(
+                    f"{plan.name}: completed expert {piece.expert} no longer "
+                    "matches its signed digest")
+    return {
+        "file": plan.name,
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "body_offset": body_offset,
+        "header_sha256": hashlib.sha256(prefix + hj).hexdigest(),
+        "experts": {str(p.expert): [p.local_off, p.local_off + p.size]
+                    for p in sorted(plan.pieces, key=lambda x: x.expert)},
+        "sources": getattr(plan, "sources_used", {}),
+    }
+
 
 def fetch_plan(plan: FilePlan, out: Path, state: dict, transport: Transport,
                *, max_chunk: int, max_gap: int, verify_local: bool) -> dict:
@@ -1329,9 +1485,19 @@ def fetch_plan(plan: FilePlan, out: Path, state: dict, transport: Transport,
     digest = plan.digest()
     if (st.get("plan") == digest and st.get("status") == "done"
             and target.exists() and st.get("entry")):
-        print(f"  {plan.name}: complete ({len(plan.pieces)} experts) — skipped",
-              flush=True)
-        return st["entry"]
+        try:
+            entry = _completed_entry(plan, target)
+        except TrustError as e:
+            print(f"  {plan.name}: {e} — refetching", flush=True)
+            st = {"plan": digest, "done": [], "status": "partial"}
+            target.unlink()
+        else:
+            st["entry"] = entry
+            state["files"][key] = st
+            save_state(out, state)
+            print(f"  {plan.name}: complete ({len(plan.pieces)} experts) — skipped",
+                  flush=True)
+            return entry
     if st.get("plan") != digest:
         st = {"plan": digest, "done": [], "status": "partial"}
         stale = target.with_name(target.name + ".part")
@@ -1359,23 +1525,38 @@ def fetch_plan(plan: FilePlan, out: Path, state: dict, transport: Transport,
         by_source: dict[str, list[Piece]] = {}
         for p in todo:
             by_source.setdefault(p.source.slug, []).append(p)
-        for slug, pieces in by_source.items():
+        for pieces in by_source.values():
             src = pieces[0].source
+
+            def accept(piece: Piece, blob: bytes) -> None:
+                got = hashlib.sha256(blob).hexdigest()
+                if got != piece.sha256:
+                    raise TrustError(
+                        f"{plan.name}: expert {piece.expert} from {piece.source} "
+                        f"hashes to {got[:16]}… but the signed attestation "
+                        f"says {piece.sha256[:16]}… — refusing these bytes")
+                writer.pwrite(piece.local_off, blob)
+                done.add(piece.expert)
+
+            remaining = []
+            for piece in pieces:
+                blob = src.take_verified_piece(plan.name, piece)
+                if blob is None:
+                    remaining.append(piece)
+                else:
+                    accept(piece, blob)
+            if len(remaining) != len(pieces):
+                st["done"] = sorted(done)
+                state["files"][key] = st
+                save_state(out, state)
             url = src.url(plan.name)
-            for start, end, group in coalesce(pieces, max_chunk, max_gap):
+            for start, end, group in coalesce(remaining, max_chunk, max_gap):
                 data, _ = transport.get_range(url, start, end)
                 fetched += len(data)
                 wasted += len(data) - sum(p.size for p in group)
-                for p in group:
-                    blob = data[p.remote_start - start: p.remote_end - start]
-                    got = hashlib.sha256(blob).hexdigest()
-                    if got != p.sha256:
-                        raise TrustError(
-                            f"{plan.name}: expert {p.expert} from {p.source} "
-                            f"hashes to {got[:16]}… but the signed attestation "
-                            f"says {p.sha256[:16]}… — refusing these bytes")
-                    writer.pwrite(p.local_off, blob)
-                    done.add(p.expert)
+                for piece in group:
+                    accept(piece, data[piece.remote_start - start:
+                                       piece.remote_end - start])
                 st["done"] = sorted(done)
                 state["files"][key] = st
                 save_state(out, state)
@@ -1447,8 +1628,8 @@ def main(argv=None) -> int:
                    help="do not sign the fetched subset — the tree will then "
                         "need fq_assemble --insecure")
     p.add_argument("--no-verify-resumed", action="store_true",
-                   help="trust bytes already on disk from an earlier run "
-                        "instead of re-hashing them")
+                   help="skip re-hashing partial .part expert bytes; completed "
+                        "files are always revalidated before reuse")
     p.add_argument("--header-trust", choices=HEADER_TRUST_MODES,
                    default=HEADER_AUTO,
                    help="how the remote segment HEADER (tensor names, dtypes, "

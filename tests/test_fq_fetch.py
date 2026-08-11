@@ -7,6 +7,7 @@ multi-source selection, resume, and — the end-to-end property that matters —
 a fetched subset tree assembles to bytes identical to a tree that was
 downloaded whole.
 """
+import base64
 import hashlib
 import json
 import shutil
@@ -681,6 +682,89 @@ def test_attested_header_digest_catches_a_tampered_header(tmp_path, served,
     err = capsys.readouterr().err
     assert "not the header the publisher signed" in err
     assert not list(out.glob("*.safetensors"))
+
+
+def test_full_header_cache_is_bound_covered_and_reused_without_payload_retry(
+        tmp_path, served):
+    """A full-proof cache is exact-byte-bound, release-complete, and cheap."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    drop_header_digests(repo, key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    served["mount"]("test/pub", repo)
+    # Only expert 0 is available at K3; the others intentionally have no
+    # provider.  That gives a single selected range to account for.
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    seg = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    run(argv)
+    raw = seg.read_bytes()
+    body = 8 + struct.unpack("<Q", raw[:8])[0]
+    segment_reads = [r for r in served["ranges"] if r[0] == seg.name]
+    # Full authentication needs the source once, plus the tiny draft header:
+    # the selected bytes from that verified pass are spooled to disk instead
+    # of being fetched again.
+    assert sum(end - start for _, start, end in segment_reads) <= len(raw) + body
+
+    cache = next((out / ".fq-fetch-cache").rglob(f"hdr-{seg.name}.json"))
+    cached = json.loads(cache.read_text())
+    assert cached["authentication"]["method"] == fq_fetch.AUTH_FULL_FRAGMENT
+    assert cached["authentication"]["release_manifest"] is True
+    assert hashlib.sha256(base64.b64decode(cached["header_bytes"])).hexdigest() == (
+        cached["authentication"]["header_sha256"])
+
+    # A restarted dry run recognizes the validated proof and prices no extra
+    # full-fragment authentication.
+    plan_path = tmp_path / "restart-plan.json"
+    run([*argv, "--dry-run", "--json", plan_path])
+    plan = json.loads(plan_path.read_text())
+    assert plan["header_authentication"]["extra_bytes"] == 0
+    cached["header"][next(n for n in cached["header"] if n != "__metadata__")][
+        "dtype"] = "U8"
+    # Editing the convenient parsed view is not enough to alter a proven
+    # header.  A new process discards that cache record and re-authenticates
+    # from the pinned source before it can reuse/sign the output.
+    cache.write_text(json.dumps(cached))
+    served["ranges"].clear()
+    run(argv)
+    reread = [r for r in served["ranges"] if r[0] == seg.name]
+    assert sum(end - start for _, start, end in reread) >= len(raw)
+
+
+def test_done_output_is_rehashed_before_it_is_resigned(tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    _retag_header(seg, b'"I16"', b'"F16"')
+    raw = bytearray(seg.read_bytes())
+    body = 8 + struct.unpack("<Q", raw[:8])[0]
+    # State is attacker controlled too: even a matching forged digest must
+    # not let a modified completed file bypass the per-expert/header checks.
+    state_path = out / "state.json"
+    state = json.loads(state_path.read_text())
+    entry = state["files"][seg.name]["entry"]
+    entry["sha256"] = hashlib.sha256(raw).hexdigest()
+    entry["header_sha256"] = hashlib.sha256(raw[:body]).hexdigest()
+    state_path.write_text(json.dumps(state))
+
+    served["ranges"].clear()
+    run(argv)
+    fixed = seg.read_bytes()
+    assert fixed != bytes(raw)
+    entry = json.loads((out / "index-k3.json").read_text())[str(LAYERS[0])]
+    assert hashlib.sha256(fixed).hexdigest() == entry["sha256"]
+    assert any(name == seg.name for name, _, _ in served["ranges"])
 
 
 def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
