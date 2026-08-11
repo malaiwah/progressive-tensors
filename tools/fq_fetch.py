@@ -2221,8 +2221,9 @@ def release_evidence(src: Source) -> tuple[bytes, dict] | None:
     }
 
 
-def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
-    """Keep verified publisher evidence so a fetched tree is checkable offline."""
+def copy_attestations(out: Path, plans: list[FilePlan], *,
+                      preserve_release: bool) -> None:
+    """Keep publisher evidence; copy release envelopes only for local hops."""
     copied_sources: set[str] = set()
     for plan in plans:
         for src in {p.source.slug: p.source for p in plan.pieces}.values():
@@ -2233,7 +2234,7 @@ def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
             if raw is not None:
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 (evidence_dir / Path(name).name).write_bytes(raw)
-            if (src.slug not in copied_sources and
+            if (preserve_release and src.slug not in copied_sources and
                     src.expert_release_covered(plan.layer, plan.k)):
                 release = release_evidence(src)
                 if release is not None:
@@ -2774,7 +2775,7 @@ def main(argv=None) -> int:
               "resume", file=sys.stderr)
         return 130
 
-    copy_attestations(out, plans)
+    copy_attestations(out, plans, preserve_release=signer is not None)
     stats = {**summary, "transport": transport.stats(),
              "elapsed_s": round(time.time() - t0, 1)}
     local_fp = signer.pub_hex if signer is not None else None

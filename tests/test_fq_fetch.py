@@ -770,6 +770,20 @@ def test_release_without_signed_source_repo_cannot_claim_offline_coverage(
          "--trust-root", trust_root(tmp_path, pub)], expect=1)
     assert "fq-release/1 repo must name this source" in capsys.readouterr().err
 
+def test_no_attest_skips_unbound_release_evidence(tmp_path, served):
+    repo, _, pub = build_source(tmp_path, "pub")
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--revision", REV, "--sign-key", str(key)]) == 0
+    served["mount"]("test/pub", repo)
+    out = tmp_path / "fetched"
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--no-attest"])
+    assert not list((out / "attestations").rglob("fq-release.json"))
+
 
 @pytest.mark.parametrize("status", (403, 429, 500))
 def test_release_retrieval_errors_fail_closed(tmp_path, served, monkeypatch,
