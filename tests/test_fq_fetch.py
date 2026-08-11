@@ -394,20 +394,20 @@ def test_only_needed_bytes_are_fetched(tmp_path, served):
             assert set(entry["experts"]) <= set(published["experts"])
 
 
-def test_derived_subset_remains_a_dense_fetch_source(tmp_path, served):
-    """Its local attestations carry the full family count, not subset size."""
+def test_derived_subset_retains_dense_count_but_is_not_a_range_source(
+        tmp_path, served, capsys):
+    """Its local headers retain the full family count; its nonterminal
+    provenance is deliberately refused as a subsequent range source."""
     _repo, _snap, subset, policy, _pub = _fetch_all(tmp_path, served)
     local = json.loads((subset / "fq-manifest.json").read_text())["signer_pubkey"]
     for segment in subset.glob("layer-*.safetensors"):
         assert fq_repack.read_header(segment)[0]["__metadata__"]["num_experts"] == str(E)
     served["mount"]("test/subset", subset)
-    refetched = tmp_path / "refetched"
-
-    run(["--policy", policy, "--out", refetched,
+    run(["--policy", policy, "--out", tmp_path / "refetched",
          "--source", f"test/subset@{REV}",
-         "--trust-signer", local, "--trust-root", trust_root(tmp_path, local)])
-
-    assert list(refetched.glob("layer-*.safetensors"))
+         "--trust-signer", local, "--trust-root", trust_root(tmp_path, local)],
+        expect=1)
+    assert "not accepted" in capsys.readouterr().err
 
 
 def test_local_tree_is_self_describing(tmp_path, served):
@@ -506,16 +506,17 @@ def test_select_map_chooses_provider_per_expert(tmp_path, served):
     served["mount"]("test/a", repo_a)
     served["mount"]("test/b", repo_b)
     sel = tmp_path / "select.json"
-    sel.write_text(json.dumps({"schema": "fq-select/1",
-                               "experts": {str(LAYERS[0]): {"2": "test/b"}}}))
+    sel.write_text(json.dumps(
+        {"schema": "fq-select/1",
+         "experts": {str(LAYERS[0]): {"1": "test/b"}}}))
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/a@{REV}",
          "--source", f"test/b@{REV}", "--select", sel,
          "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
-    experts = json.loads((out / "fq-fetch-report.json").read_text())["experts"]
-    per_expert = experts[str(LAYERS[0])]["k3"]
-    assert per_expert["2"]["source"] == f"test/b@{REV}"
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    per_expert = report["experts"][str(LAYERS[0])]["k3"]
+    assert per_expert["1"]["source"] == f"test/b@{REV}"
     assert per_expert["0"]["source"] == f"test/a@{REV}"
 
 
@@ -1054,8 +1055,10 @@ def test_subset_is_attested_as_derived_from_its_parents(tmp_path, served):
     # verbatim even though the containing file is not
     for eid, digest in payload["expert_sha256"].items():
         assert digest == published_payload["expert_sha256"][eid]
-    # and the publisher's own line is kept for offline re-checking
-    kept = out / "attestations" / f"test__pub@{REV[:12]}" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    # and the publisher's own line is kept under the signed locator for
+    # offline re-checking.
+    kept = (out / "attestations" / parent["evidence_source"]
+            / f"layer-{LAYERS[0]:03d}.k3.jsonl")
     assert json.loads(kept.read_text())["keyid"] == pub
 
 
@@ -1830,3 +1833,11 @@ def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
     report = json.loads((out / "fq-fetch-report.json").read_text())
     source = report["experts"][str(LAYERS[0])]["k4"]["0"]["source"]
     assert source == f"test/pub@{REV}:{subdir}"
+
+
+def test_evidence_locator_is_injective_and_preserves_repo_case():
+    revision = REV
+    assert fq_fetch.slugify("Owner__Name/repo", revision, "a/b") == (
+        "Owner__Name%2Frepo@0123456789ab:a%2Fb")
+    assert fq_fetch.slugify("Owner__Name/repo", revision, "a/b") != (
+        fq_fetch.slugify("Owner/Name__repo", revision, "a__b"))

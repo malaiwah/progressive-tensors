@@ -289,8 +289,9 @@ class Transport:
 # ------------------------------------------------------------------ sources
 
 def slugify(repo: str, revision: str, subdir: str = "") -> str:
-    slug = f"{repo.replace('/', '__')}@{revision[:12]}"
-    return f"{slug}:{subdir.replace('/', '__')}" if subdir else slug
+    """Injective local evidence locator for one resolved source family."""
+    return (f"{urllib.parse.quote(repo, safe='')}@{revision[:12]}:"
+            f"{urllib.parse.quote(subdir, safe='')}")
 
 
 class Source:
