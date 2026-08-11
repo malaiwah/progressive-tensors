@@ -1067,21 +1067,30 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     upstream_frag.get("size") == parent_record.get("size") and
                     claims_ok and release_ok)
                 authenticated = header_evidence and parent_ok
-                if not authenticated:
+                explicit_unsafe = (
+                    header_method == "NONE (--header-trust unsafe)" and
+                    parent_record.get("header_authenticated") is False and parent_ok)
+                header_status = ("authenticated" if authenticated else
+                                 "unsafe" if explicit_unsafe else "invalid")
+                if header_status == "unsafe":
                     unsafe += 1
                 parent_rows.append({
                     "repo": repo, "revision": revision, "file": parent_file,
                     "signature": upstream_sig, "match": parent_ok,
-                    "experts": claimed_experts, "header_authenticated": authenticated,
+                    "experts": claimed_experts, "header_status": header_status,
+                    "header_authenticated": authenticated,
                     "release_coverage": release})
             expected_experts = set(entry["experts"])
             coverage_ok = (bool(parent_rows) and set(covered_experts) == expected_experts and
                            len(covered_experts) == len(set(covered_experts)))
             parents_ok = coverage_ok and all(p["match"] for p in parent_rows)
-            headers_ok = parents_ok and all(p["header_authenticated"] for p in parent_rows)
+            headers_ok = parents_ok and all(
+                p["header_status"] == "authenticated" or
+                (p["header_status"] == "unsafe" and args.accept_unsafe_header_plan)
+                for p in parent_rows)
             ok = (bool(binding) and binding_ok(binding) and digest_bad == 0 and
-                  provenance_ok and parents_ok and attestation_ok(sig) and
-                  (headers_ok or args.accept_unsafe_header_plan))
+                  provenance_ok and parents_ok and headers_ok and
+                  attestation_ok(sig))
             failures += 0 if ok else 1
             rows.append({
                 "layer": layer, "k": k, "file": entry["file"], **binding,
