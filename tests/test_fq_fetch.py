@@ -7,6 +7,7 @@ multi-source selection, resume, and — the end-to-end property that matters —
 a fetched subset tree assembles to bytes identical to a tree that was
 downloaded whole.
 """
+import base64
 import hashlib
 import json
 import shutil
@@ -158,10 +159,13 @@ def trust_root(tmp_path: Path, pub: str) -> Path:
     return root
 
 
-def write_policy(path: Path, mapping: dict) -> Path:
-    path.write_text(json.dumps({
+def write_policy(path: Path, mapping: dict, **extra) -> Path:
+    policy = {
         "schema": "fq-policy/2",
-        "bits_per_expert": {str(l): list(ks) for l, ks in mapping.items()}}))
+        "bits_per_expert": {str(l): list(ks) for l, ks in mapping.items()},
+        **extra,
+    }
+    path.write_text(json.dumps(policy))
     return path
 
 
@@ -177,6 +181,50 @@ def run(argv, expect=0):
     rc = fq_fetch.main(argv)
     assert rc == expect, f"fq_fetch returned {rc}, expected {expect}"
     return rc
+
+
+def _attested_digests(repo: Path, layer: int, k: int) -> dict[str, str]:
+    line = json.loads(
+        (repo / "attestations" / f"layer-{layer:03d}.k{k}.jsonl").read_text())
+    return json.loads(base64.b64decode(line["payload"]))["expert_sha256"]
+
+
+def _copy_k_family(repo: Path, family: Path, subdir: str, k: int) -> Path:
+    """Publish family documents below a root that has another K family."""
+    nested = repo / subdir
+    nested.mkdir(parents=True)
+    shutil.copy2(family / "fq-manifest.json", nested / "fq-manifest.json")
+    shutil.copy2(family / f"index-k{k}.json", nested / f"index-k{k}.json")
+    (nested / "attestations").mkdir()
+    for layer in LAYERS:
+        name = f"layer-{layer:03d}.k{k}.safetensors"
+        shutil.copy2(family / name, nested / name)
+        shutil.copy2(family / "attestations" / f"{name[:-12]}.jsonl",
+                     nested / "attestations" / f"{name[:-12]}.jsonl")
+    return nested
+
+
+def _bound_policy(path: Path, *, source: str, nested: Path,
+                  family: Path) -> Path:
+    layer = LAYERS[0]
+    digests = _attested_digests(family, layer, 4)
+    return write_policy(
+        path, {layer: [4] * E},
+        fetch_binding={
+            "schema": "fq-fetch-binding/1",
+            "providers": {
+                "schema": "fq-select/1",
+                "default": source,
+            },
+            "content": {
+                "manifests": {
+                    source: hashlib.sha256(
+                        (nested / "fq-manifest.json").read_bytes()).hexdigest(),
+                },
+                "experts": {str(layer): digests},
+            },
+        },
+    )
 
 
 # --------------------------------------------------------------------- tests
@@ -358,6 +406,90 @@ def test_select_map_chooses_provider_per_expert(tmp_path, served):
     per_expert = experts[str(LAYERS[0])]["k3"]
     assert per_expert["2"]["source"] == f"test/b@{REV}"
     assert per_expert["0"]["source"] == f"test/a@{REV}"
+
+
+def test_fetch_binding_selects_nested_family_not_root_k4(tmp_path, served):
+    """A bound primed K4 recipe cannot silently take same-K root bytes."""
+    key = tmp_path / "shared.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3, 4), key=key, salt="root")
+    family, _, _ = build_source(
+        tmp_path, "willfalco", ks=(4,), key=key, salt="willfalco")
+    subdir = "sources/willfalco-3.42bpw/expanded"
+    nested = _copy_k_family(repo, family, subdir, 4)
+    nested_source = f"test/pub@{REV}:{subdir}"
+    policy = _bound_policy(
+        tmp_path / "recipe.json", source=nested_source, nested=nested, family=family)
+    served["mount"]("test/pub", repo)
+
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--source", nested_source, "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)])
+
+    expected = _attested_digests(family, LAYERS[0], 4)
+    root = _attested_digests(repo, LAYERS[0], 4)
+    assert root["0"] != expected["0"]  # the root K4 is deliberately unrelated
+    fetched = json.loads((out / "fq-fetch-report.json").read_text())["experts"]
+    selected = fetched[str(LAYERS[0])]["k4"]
+    assert {record["source"] for record in selected.values()} == {nested_source}
+    assert {expert: record["sha256"] for expert, record in selected.items()} == expected
+
+
+def test_fetch_binding_missing_source_or_digest_fails_before_payload(
+        tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3, 4), key=key, salt="root")
+    family, _, _ = build_source(
+        tmp_path, "willfalco", ks=(4,), key=key, salt="willfalco")
+    subdir = "sources/willfalco-3.42bpw/expanded"
+    nested = _copy_k_family(repo, family, subdir, 4)
+    nested_source = f"test/pub@{REV}:{subdir}"
+    policy = _bound_policy(
+        tmp_path / "recipe.json", source=nested_source, nested=nested, family=family)
+    served["mount"]("test/pub", repo)
+
+    run(["--policy", policy, "--out", tmp_path / "missing-source",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "requires source" in capsys.readouterr().err
+    assert not [r for r in served["ranges"] if r[0].endswith(".safetensors")]
+
+    broken = json.loads(policy.read_text())
+    broken["fetch_binding"]["content"]["experts"][str(LAYERS[0])].pop("0")
+    policy.write_text(json.dumps(broken))
+    served["ranges"].clear()
+    run(["--policy", policy, "--out", tmp_path / "missing-digest",
+         "--source", nested_source, "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "no valid digest" in capsys.readouterr().err
+    assert not [r for r in served["ranges"] if r[0].endswith(".safetensors")]
+
+
+def test_fetch_binding_content_mismatch_aborts_other_experts_before_payload(
+        tmp_path, served, capsys):
+    """One bad bound digest makes the whole multi-expert recipe fail closed."""
+    key = tmp_path / "shared.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3, 4), key=key, salt="root")
+    family, _, _ = build_source(
+        tmp_path, "willfalco", ks=(4,), key=key, salt="willfalco")
+    subdir = "sources/willfalco-3.42bpw/expanded"
+    nested = _copy_k_family(repo, family, subdir, 4)
+    nested_source = f"test/pub@{REV}:{subdir}"
+    policy = _bound_policy(
+        tmp_path / "recipe.json", source=nested_source, nested=nested, family=family)
+    binding = json.loads(policy.read_text())
+    binding["fetch_binding"]["content"]["experts"][str(LAYERS[0])]["0"] = (
+        _attested_digests(repo, LAYERS[0], 4)["0"])
+    policy.write_text(json.dumps(binding))
+    served["mount"]("test/pub", repo)
+
+    run(["--policy", policy, "--out", tmp_path / "mismatch",
+         "--source", f"test/pub@{REV}", "--source", nested_source,
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    assert "bound recipe has unsatisfied" in capsys.readouterr().err
+    assert not [r for r in served["ranges"]
+                if r[0].endswith(".safetensors") and r[1] > 8]
 
 
 def test_resume_after_interruption_refetches_only_the_rest(tmp_path, served,
