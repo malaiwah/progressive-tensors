@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_repack  # noqa: E402
 import fq_assemble  # noqa: E402
+import fq_trust  # noqa: E402
 from test_fq_repack import LAYERS, E, write_shard, tensor_bytes  # noqa: E402
 
 
@@ -43,6 +44,13 @@ def _build_k3_workspace(root: Path) -> tuple[Path, Path]:
 
 def signer_of(segments: Path) -> str:
     return json.loads((segments / "fq-manifest.json").read_text())["signer_pubkey"]
+
+
+def write_trust_root(path: Path, *records: tuple[str, str, str]) -> Path:
+    path.write_text("".join(
+        f"{fingerprint}  {key_id}  {status}  2026-08-10  test\n"
+        for fingerprint, key_id, status in records))
+    return path
 
 
 def assemble(segments, snap, policy, out, *extra):
@@ -344,6 +352,75 @@ def test_trust_file_reads_the_project_trust_root_format(repacked):
                  "--trust-file", str(root))  # revoked pins nobody: fail closed
 
 
+@pytest.mark.parametrize("kind", ("full", "prefix", "key-id", "pub-path"))
+def test_trust_signer_tokens_match_shared_resolver(repacked, kind):
+    """Assembler pins resolve exactly as fq_trust does, then verify normally."""
+    snap, segments, tmp = repacked
+    pub = signer_of(segments)
+    root = write_trust_root(
+        tmp / "FINGERPRINTS", (pub, "assemble-test-signer", "active"))
+    pub_path = tmp / "assemble-test-signer.pub"
+    pub_path.write_text(pub + "\n")
+    token = {
+        "full": pub,
+        "prefix": pub[:16],
+        "key-id": "assemble-test-signer",
+        "pub-path": str(pub_path),
+    }[kind]
+    expected = fq_trust.Verifier.resolve(
+        trust_signer=token, trust_root=root).fingerprint
+    assert expected == pub
+
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    assert assemble(segments, snap, ppath, tmp / f"asm-{kind}",
+                    "--trust-root", str(root),
+                    "--trust-signer", token) == 0
+
+
+def test_trust_signer_rejections_match_shared_resolver(repacked):
+    """Short, ambiguous, unknown, and revoked pins fail with fq_trust's text."""
+    snap, segments, tmp = repacked
+    pub = signer_of(segments)
+    other_tail = "0" * 48 if pub[16:] != "0" * 48 else "1" * 48
+    root = write_trust_root(
+        tmp / "FINGERPRINTS",
+        (pub, "assemble-test-signer", "active"),
+        (pub[:16] + other_tail, "ambiguous-signer", "active"))
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+
+    for name, token in (("short", pub[:15]), ("ambiguous", pub[:16]),
+                        ("unknown", "missing-signer")):
+        with pytest.raises(fq_trust.TrustError) as expected:
+            fq_trust.Verifier.resolve(trust_signer=token, trust_root=root)
+        with pytest.raises(fq_assemble.VerificationError) as actual:
+            assemble(segments, snap, ppath, tmp / f"asm-{name}",
+                     "--trust-root", str(root), "--trust-signer", token)
+        assert str(actual.value) == str(expected.value)
+
+    revoked = write_trust_root(
+        tmp / "REVOKED", (pub, "assemble-test-signer", "revoked"))
+    with pytest.raises(fq_trust.TrustError) as expected:
+        fq_trust.Verifier.resolve(trust_signer=pub, trust_root=revoked)
+    with pytest.raises(fq_assemble.VerificationError) as actual:
+        assemble(segments, snap, ppath, tmp / "asm-revoked-explicit",
+                 "--trust-root", str(revoked), "--trust-signer", pub)
+    assert str(actual.value) == str(expected.value)
+
+
+def test_short_publisher_pin_does_not_trust_local_subset(repacked):
+    """Resolving a publisher prefix cannot bless a subset signed by local key."""
+    snap, segments, tmp = repacked
+    publisher = fq_repack.Signer(tmp / "publisher.key").pub_hex
+    root = write_trust_root(
+        tmp / "FINGERPRINTS", (publisher, "publisher-signer", "active"))
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    with pytest.raises(fq_assemble.VerificationError,
+                       match="no attestation line signed"):
+        assemble(segments, snap, ppath, tmp / "asm-local-subset",
+                 "--trust-root", str(root),
+                 "--trust-signer", publisher[:16])
+
+
 def test_corrupted_segment_byte_fails(repacked):
     """One flipped payload byte must stop the assembly (finding 1's core)."""
     snap, segments, tmp = repacked
@@ -479,9 +556,9 @@ def test_insecure_warns_loudly_and_records_it(repacked, capsys):
 def test_bad_trust_fingerprint_rejected(repacked):
     snap, segments, tmp = repacked
     ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
-    with pytest.raises(fq_assemble.VerificationError, match="not hex"):
+    with pytest.raises(fq_assemble.VerificationError, match="not a fingerprint"):
         assemble(segments, snap, ppath, tmp / "asm-hex", "--trust-signer", "zz")
-    with pytest.raises(fq_assemble.VerificationError, match="expected 32"):
+    with pytest.raises(fq_assemble.VerificationError, match="no key with that prefix"):
         assemble(segments, snap, ppath, tmp / "asm-len", "--trust-signer", "ab" * 16)
 
 

@@ -120,6 +120,7 @@ from fq_repack import (  # noqa: E402
     read_header,
     sha256_file,
 )
+from fq_trust import TrustError, Verifier as TrustVerifier  # noqa: E402
 
 TOOL_VERSION = "fq_assemble/2"
 ATTESTATION_SCHEMA = "fq-attestation/2"
@@ -346,33 +347,31 @@ def digest_file_and_spans(path: Path, spans: dict[str, tuple[int, int]]
             return digest_view_and_spans(mm, path.stat().st_size, spans)
 
 
-def _normalize_fingerprint(token: str) -> str:
-    t = token.strip().lower()
-    if t.startswith("ed25519:"):
-        t = t.split(":", 1)[1]
+def _resolve_explicit_signer(token: str, trust_root: Path | None) -> str:
+    """Resolve one explicit pin with the shared trust-root contract."""
     try:
-        raw = bytes.fromhex(t)
-    except ValueError:
-        raise VerificationError(
-            f"trusted signer {token!r} is not hex — expected a 64-char ed25519 "
-            f"public key fingerprint")
-    if len(raw) != 32:
-        raise VerificationError(
-            f"trusted signer {token!r} is {len(raw)} bytes, expected 32")
-    return t
+        verifier = TrustVerifier.resolve(
+            trust_signer=token, trust_root=trust_root)
+    except TrustError as e:
+        raise VerificationError(str(e)) from e
+    assert verifier.fingerprint is not None
+    return verifier.fingerprint
 
 
-def load_trusted_signers(values, files) -> list[str]:
+def load_trusted_signers(values, files, *, trust_root: Path | None = None) -> list[str]:
     """Pinned ed25519 fingerprints from --trust-signer and --trust-file.
 
-    A --trust-file line may be a bare fingerprint or a record in the project
-    trust-root format (`<fingerprint> <key-id> <status> ...`, as in
-    keys/FINGERPRINTS), so a checkout of the trust root can be pinned
-    directly; records marked `revoked` are never trusted.
+    Explicit signer values use fq_trust's resolution contract: a full
+    fingerprint, an unambiguous >=16-hex prefix, a trust-root key id, or a
+    .pub path.  This remains an explicit pin: every accepted attestation must
+    verify under one of these exact resolved keys.  A --trust-file line may be
+    a bare fingerprint or a project trust-root record
+    (`<fingerprint> <key-id> <status> ...`); records marked revoked are never
+    trusted.
     """
     out = []
     for raw in values or []:
-        out.extend(_normalize_fingerprint(tok)
+        out.extend(_resolve_explicit_signer(tok, trust_root)
                    for tok in raw.replace(",", " ").split())
     for path in files or []:
         path = Path(path)
@@ -386,7 +385,7 @@ def load_trusted_signers(values, files) -> list[str]:
                 print(f"note: {path.name}: skipping revoked signer "
                       f"{fields[0][:16]}…", file=sys.stderr)
                 continue
-            out.append(_normalize_fingerprint(fields[0]))
+            out.append(_resolve_explicit_signer(fields[0], trust_root))
     return sorted(set(out))
 
 
@@ -1092,10 +1091,15 @@ def main(argv=None) -> int:
              "line next to the checkpoint (attestations/assembly-of.jsonl)")
     trust = p.add_argument_group("verification (mandatory unless --insecure)")
     trust.add_argument(
-        "--trust-signer", action="append", metavar="HEX",
-        help="pin an expected ed25519 signer fingerprint (repeatable); the "
-             "family's fq-manifest.json names its signer as signer_pubkey — "
-             "confirm that value out of band before pinning it")
+        "--trust-signer", action="append", metavar="FINGERPRINT",
+        help="pin an expected ed25519 signer (repeatable): a 64-hex "
+             "fingerprint, an unambiguous >=16-hex prefix, a key id from "
+             "keys/FINGERPRINTS, or a .pub path. Signatures must validate "
+             "under exactly this key; confirm it out of band before pinning")
+    trust.add_argument(
+        "--trust-root", type=Path, metavar="PATH",
+        help="keys/FINGERPRINTS (or keys/ dir) used to resolve --trust-signer "
+             "prefixes and key ids (default: shipped root or $FQ_TRUST_ROOT)")
     trust.add_argument(
         "--trust-file", action="append", type=Path, metavar="PATH",
         help="file of pinned signer fingerprints, one per line ('#' "
@@ -1135,16 +1139,19 @@ def main(argv=None) -> int:
 
     policy = json.loads(args.policy.read_text())
     bpe = policy["bits_per_expert"]
-    trusted = load_trusted_signers(args.trust_signer, args.trust_file)
+    trusted = load_trusted_signers(args.trust_signer, args.trust_file,
+                                   trust_root=args.trust_root)
     allowed = set(args.allow_predicate or DEFAULT_ALLOWED_PREDICATES)
     if not trusted and not args.insecure:
         raise VerificationError(
             "refusing to assemble unverified segments. Pin the signer(s) you "
-            "expect with --trust-signer <64-hex fingerprint> (repeatable) or "
-            "--trust-file <path>; the segment family's fq-manifest.json "
-            "publishes its signer as \"signer_pubkey\", so confirm that "
-            "fingerprint out of band and pin it. --insecure assembles without "
-            "any verification and is for local development only.")
+            "expect with --trust-signer <fingerprint> (64-hex, an "
+            "unambiguous >=16-hex prefix, a key id, or a .pub path; "
+            "repeatable) or --trust-file <path>; the segment family's "
+            "fq-manifest.json publishes its signer as \"signer_pubkey\", so "
+            "confirm that fingerprint out of band and pin it. --insecure "
+            "assembles without any verification and is for local development "
+            "only.")
     if args.insecure:
         print("!" * 72 + "\n"
               "!! --insecure: segment attestations are NOT being verified.\n"
