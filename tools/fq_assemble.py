@@ -355,15 +355,22 @@ def _resolve_explicit_signer(token: str, trust_root: Path | None) -> str:
     key id always wins over a same-named local file.
     """
     spec = token.strip()
+    root = None
     if spec.lower().startswith("ed25519:"):
-        spec = spec.split(":", 1)[1]
-    pub_path = Path(spec)
-    if (pub_path.suffix.lower() == ".pub" and pub_path.is_file()
-            and os.sep not in spec):
         try:
             root = TrustRoot.load(trust_root)
         except TrustError as e:
             raise VerificationError(str(e)) from e
+        if not any(record["key_id"] == spec for record in root.records):
+            spec = spec.split(":", 1)[1]
+    pub_path = Path(spec)
+    if (pub_path.suffix.lower() == ".pub" and pub_path.is_file()
+            and os.sep not in spec):
+        if root is None:
+            try:
+                root = TrustRoot.load(trust_root)
+            except TrustError as e:
+                raise VerificationError(str(e)) from e
         if not any(record["key_id"] == spec for record in root.records):
             spec = f".{os.sep}{spec}"
     try:
@@ -388,8 +395,20 @@ def load_trusted_signers(values, files, *, trust_root: Path | None = None) -> li
     """
     out = []
     for raw in values or []:
-        out.extend(_resolve_explicit_signer(tok, trust_root)
-                   for tok in raw.replace(",", " ").split())
+        try:
+            out.append(_resolve_explicit_signer(raw, trust_root))
+            continue
+        except VerificationError as single_error:
+            tokens = raw.replace(",", " ").split()
+            if len(tokens) <= 1:
+                raise
+            try:
+                root = TrustRoot.load(trust_root)
+            except TrustError:
+                raise single_error
+            if any(record["key_id"] == raw.strip() for record in root.records):
+                raise single_error
+        out.extend(_resolve_explicit_signer(tok, trust_root) for tok in tokens)
     for path in files or []:
         path = Path(path)
         if not path.exists():

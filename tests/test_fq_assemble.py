@@ -377,6 +377,21 @@ def test_trust_signer_tokens_match_shared_resolver(repacked, kind):
                     "--trust-signer", token) == 0
 
 
+@pytest.mark.parametrize("key_id", ("ed25519:publisher", "publisher,release"))
+def test_punctuated_key_ids_match_shared_resolver(repacked, key_id):
+    """Legacy syntax cannot steal a literal trust-root key ID."""
+    snap, segments, tmp = repacked
+    pub = signer_of(segments)
+    root = write_trust_root(tmp / "FINGERPRINTS", (pub, key_id, "active"))
+    assert fq_trust.Verifier.resolve(
+        trust_signer=key_id, trust_root=root).fingerprint == pub
+
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    assert assemble(segments, snap, ppath, tmp / f"asm-{key_id[-7:]}",
+                    "--trust-root", str(root),
+                    "--trust-signer", key_id) == 0
+
+
 @pytest.mark.parametrize("kind", ("ed25519-prefix", "bare-pub-path"))
 def test_legacy_trust_signer_tokens_remain_supported(repacked, monkeypatch, kind):
     """Legacy assembler spellings retain the same explicit-key verification."""
