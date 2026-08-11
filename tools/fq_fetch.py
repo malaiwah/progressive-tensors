@@ -339,6 +339,11 @@ class Source:
         return (isinstance(value, str) and len(value) == 40
                 and all(c in "0123456789abcdefABCDEF" for c in value))
 
+    @staticmethod
+    def is_immutable_sha256(value: object) -> bool:
+        return (isinstance(value, str) and len(value) == 64
+                and all(c in "0123456789abcdefABCDEF" for c in value))
+
     def observe_response_commit(self, meta: dict, where: str) -> str:
         """Require every consumed response to identify the resolved commit."""
         commit = meta.get("commit")
@@ -613,6 +618,47 @@ class Source:
             return None
         self.check_against_release(name, raw)
         return json.loads(raw)
+    def validate_derived_parents(self, parents: list, *, base_model: str,
+                                 base_revision: str, layout: str,
+                                 family_num_experts: int, where: str,
+                                 depth: int = 0) -> None:
+        """Validate the semantic chain a derived parent carries forward."""
+        if depth > 16:
+            raise TrustError(f"{where}: derived parent chain is too deep")
+        for n, parent in enumerate(parents, 1):
+            prefix = f"{where}: parent {n}"
+            if not isinstance(parent, dict):
+                raise TrustError(f"{prefix} is not an object")
+            if parent.get("role") != "source_fragment":
+                raise TrustError(f"{prefix} has unsupported role {parent.get('role')!r}")
+            predicate = parent.get("predicate")
+            if predicate not in ALLOWED_UPSTREAM_PREDICATES:
+                raise TrustError(
+                    f"{prefix}: predicate {predicate!r} is not accepted")
+            if (not isinstance(parent.get("repo"), str)
+                    or not self.is_immutable_commit(parent.get("revision"))
+                    or not isinstance(parent.get("file"), str)
+                    or not self.is_immutable_sha256(parent.get("sha256"))):
+                raise TrustError(
+                    f"{prefix}: source binding lacks immutable repo/revision/file/digest")
+            identity = parent.get("identity")
+            if not isinstance(identity, dict) or identity.get("predicate") != predicate:
+                raise TrustError(f"{prefix}: predicate is not bound to an identity")
+            if (identity.get("base_model") != base_model
+                    or identity.get("base_revision") != base_revision
+                    or identity.get("layout") != layout
+                    or identity.get("num_experts") != family_num_experts):
+                raise TrustError(
+                    f"{prefix}: identity is incompatible with its derived child")
+            if predicate == "derived-from":
+                nested = parent.get("upstream_parents")
+                if not isinstance(nested, list) or not nested:
+                    raise TrustError(f"{prefix}: derived parent lacks upstream parents")
+                self.validate_derived_parents(
+                    nested, base_model=base_model, base_revision=base_revision,
+                    layout=layout, family_num_experts=family_num_experts,
+                    where=prefix, depth=depth + 1)
+
 
     def attestation_identity(self, payload: dict, *, layer: int, k: int,
                              segment_file: str, where: str) -> dict:
@@ -641,6 +687,9 @@ class Source:
             raise TrustError(f"{where}: accepted predicate lacks layout")
         if not isinstance(count, int) or count <= 0:
             raise TrustError(f"{where}: accepted predicate lacks num_experts")
+        family_count = payload.get("family_num_experts", count)
+        if not isinstance(family_count, int) or family_count <= 0:
+            raise TrustError(f"{where}: family_num_experts is invalid")
         digests = payload.get("expert_sha256")
         if not isinstance(digests, dict) or not digests:
             raise TrustError(f"{where}: accepted predicate lacks expert_sha256")
@@ -661,6 +710,7 @@ class Source:
         if not self.is_immutable_commit(revision):
             raise TrustError(
                 f"{where}: base revision {revision!r} is not an immutable commit")
+        revision = revision.lower()
         manifest = self.manifest
         for field, value in (("base_model", base_model), ("layout", layout),
                              ("predicate", predicate)):
@@ -669,13 +719,20 @@ class Source:
                 raise TrustError(
                     f"{where}: signed {field} {value!r} disagrees with "
                     f"fq-manifest.json {published!r}")
-        if manifest.get("revision") not in (None, revision):
+        published_revision = manifest.get("revision")
+        if (self.is_immutable_commit(published_revision)
+                and published_revision.lower() != revision):
             raise TrustError(
                 f"{where}: signed base revision {revision!r} disagrees with "
-                f"fq-manifest.json {manifest['revision']!r}")
+                f"fq-manifest.json {published_revision!r}")
+        if predicate == "derived-from":
+            self.validate_derived_parents(
+                payload["parents"], base_model=base_model, base_revision=revision,
+                layout=layout, family_num_experts=family_count, where=where)
         return {"predicate": predicate, "base_model": base_model,
                 "base_revision": revision, "layout": layout,
-                "num_experts": count, "layer": layer, "k": k}
+                "num_experts": family_count, "fragment_num_experts": count,
+                "layer": layer, "k": k}
 
     def attestation(self, layer: int, k: int, verifier: fq_trust.Verifier,
                     segment_file: str) -> dict:
@@ -1661,7 +1718,7 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
                             ("layout", att["layout"]),
                             ("predicate", att["predicate"]),
                             ("layer", str(plan.layer)), ("k", str(plan.k)),
-                            ("num_experts", str(att["num_experts"]))):
+                            ("num_experts", str(att["fragment_num_experts"]))):
             if str(meta.get(field)) != str(want):
                 raise TrustError(
                     f"{plan.name}: {src} authenticated header {field}="

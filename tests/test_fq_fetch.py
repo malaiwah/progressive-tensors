@@ -1717,3 +1717,55 @@ def test_layer_k_and_authenticated_header_predicate_must_match(
          "--source", f"test/header@{REV}", "--trust-signer", pub,
          "--trust-root", trust_root(tmp_path, pub)], expect=1)
     assert "header predicate" in capsys.readouterr().err
+
+
+def test_unrelated_trusted_jsonl_line_does_not_poison_fragment(tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    att = _att_path(repo, LAYERS[0], 3)
+    unrelated = _payload(att)
+    unrelated["fragment"]["file"] = "unrelated.safetensors"
+    att.write_text(att.read_text() + fq_repack.Signer(key).sign_line(unrelated) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)])
+
+
+def test_commit_ids_are_normalized_before_drift_checks(tmp_path, served):
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV.upper()}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["sources"][0]["revision"] == REV
+    assert report["sources"][0]["requested_revision"] == REV.upper()
+
+
+def test_recursive_fetched_subset_preserves_family_count_and_parent_policy(
+        tmp_path, served, capsys):
+    repo, _, pub = build_source(tmp_path, "pub")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json",
+                          {LAYERS[0]: [3, 4, 4, 4]})
+    first = tmp_path / "first"
+    run(["--policy", policy, "--out", first, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    local_pub = json.loads((first / "fq-manifest.json").read_text())["signer_pubkey"]
+    served["mount"]("test/first", first)
+    run(["--policy", policy, "--out", tmp_path / "second",
+         "--source", f"test/first@{REV}", "--trust-signer", local_pub,
+         "--trust-root", trust_root(tmp_path, local_pub)])
+
+    att = first / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl"
+    payload = _payload(att)
+    payload["parents"][0]["predicate"] = "equivalence-of"
+    att.write_text(fq_repack.Signer(first.parent / "local.key").sign_line(payload) + "\n")
+    run(["--policy", policy, "--out", tmp_path / "invalid-parent",
+         "--source", f"test/first@{REV}", "--trust-signer", local_pub,
+         "--trust-root", trust_root(tmp_path, local_pub)],
+        expect=1)
+    assert "parent 1: predicate" in capsys.readouterr().err
