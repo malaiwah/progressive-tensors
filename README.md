@@ -143,9 +143,13 @@ RECIPE=recipes/glm52-3.0bpw-all-k3.json
 PUBLISHER_SIGNER=a58b7bb79ba58457
 export FETCH_KEY=./fq-fetch.key
 
-# Copy the exact policy from the same immutable artifact revision.
-uv run hf download "$ARTIFACT_REPO" "$RECIPE" --revision "$ARTIFACT_REV" \
-  --local-dir ./artifact
+# Copy the policy and its publisher release envelope from the same immutable
+# revision, then verify the policy's signed digest before using it.
+uv run hf download "$ARTIFACT_REPO" "$RECIPE" fq-release.json \
+  --revision "$ARTIFACT_REV" --local-dir ./artifact
+# This is a partial tree: it authenticates the recipe; do not add --complete.
+uv run tools/fq_release.py verify --dir ./artifact \
+  --release ./artifact/fq-release.json --trust-signer "$PUBLISHER_SIGNER"
 
 # fq_assemble needs the original non-expert tensors and header layout.
 uv run hf download brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw \
