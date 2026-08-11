@@ -1194,19 +1194,20 @@ def _manifest_expert_count(source: Source, *, layer: int) -> int | None:
 
 
 def _signed_expert_count(attestation: dict, *, layer: int, source: Source) -> int:
-    """Read the cardinality from the trusted signed attestation payload."""
-    value = attestation.get("num_experts")
+    """Read the signed *family* cardinality, never a fragment's count."""
+    identity = attestation.get("identity") or {}
+    value = identity.get("num_experts")
     try:
         count = int(value)
     except (TypeError, ValueError) as e:
         raise TrustError(
             f"layer {layer}: {source} signed attestation has no valid "
-            "num_experts; refusing to transfer a payload before a dense "
-            "fq-policy/2 can be checked") from e
+            "family_num_experts; refusing to transfer a payload before a "
+            "dense fq-policy/2 can be checked") from e
     if count < 0:
         raise TrustError(
             f"layer {layer}: {source} signed attestation declares invalid "
-            f"num_experts={value!r}")
+            f"family_num_experts={value!r}")
     return count
 
 
@@ -1214,10 +1215,11 @@ def _attested_cardinality(source: Source, layer: int, k: int,
                           verifier: fq_trust.Verifier) -> int:
     """Get a trusted family cardinality without reading segment payload bytes.
 
-    New producers sign ``num_experts`` directly.  Older primed families sign
-    the per-expert digest map instead; unioning those signed maps across their
-    advertised K files supplies the same dense inventory without trusting a
-    ranged header or fetching a parent body.
+    New producers sign ``family_num_experts`` directly. Older primed
+    families omit it and sign the per-expert digest map instead; unioning
+    those signed maps across their advertised K files supplies the same
+    dense inventory without trusting a ranged header or fetching a parent
+    body.
     """
     index = source.index(k) or {}
     entry = index.get(str(layer))
@@ -1226,7 +1228,7 @@ def _attested_cardinality(source: Source, layer: int, k: int,
             f"layer {layer}: {source} has no K{k} segment with a signed "
             "expert cardinality")
     attestation = source.attestation(layer, k, verifier, entry["file"])
-    if attestation.get("num_experts") is not None:
+    if (attestation.get("identity") or {}).get("num_experts") is not None:
         return _signed_expert_count(attestation, layer=layer, source=source)
 
     experts: set[int] = set()

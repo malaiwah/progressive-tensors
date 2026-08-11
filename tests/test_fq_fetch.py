@@ -1857,6 +1857,21 @@ def test_mixed_sources_must_share_concrete_family_cardinality(
         capsys.readouterr().err)
 
 
+
+def test_policy_preflight_uses_signed_family_not_fragment_count(
+        tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    for layer in LAYERS:
+        _resign(_att_path(repo, layer, 3), key,
+                lambda payload: payload.update(
+                    {"num_experts": 1, "family_num_experts": E}))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "planned",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub), "--dry-run"])
+
 def test_explicit_symbolic_nested_source_alias_is_exact(tmp_path, served):
     key = tmp_path / "shared.key"
     repo, _, pub = build_source(tmp_path, "pub", ks=(4,), key=key,
