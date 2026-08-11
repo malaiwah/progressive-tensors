@@ -21,6 +21,7 @@ import fq_trust  # noqa: E402
 import fq_verify  # noqa: E402
 from test_fq_prime import build_repo, prime, served  # noqa: E402,F401
 import fq_fetch  # noqa: E402
+import fq_release  # noqa: E402
 from test_fq_fetch import REV, build_source, write_policy  # noqa: E402
 from test_fq_repack import LAYERS, E, write_shard  # noqa: E402
 
@@ -581,9 +582,20 @@ def test_identity_derived_rejects_parent_metadata_repoint(served, tmp_path):
         "layers"][0]["metadata_matches_attestation"]
 
 
-def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False):
+def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False, strict_release=False,
+                       uppercase_release_revision=False):
     repo, _, publisher = build_source(tmp_path, "pub", ks=(3,))
-
+    if strict_release:
+        assert fq_release.main([
+            "build", "--dir", str(repo), "--release", "test strict",
+            "--repo", "test/pub", "--revision", REV,
+            "--sign-key", str(tmp_path / "pub.key")]) == 0
+        if uppercase_release_revision:
+            envelope = json.loads((repo / "fq-release.json").read_text())
+            payload = json.loads(base64.b64decode(envelope["payload"]))
+            payload["revision"] = payload["revision"].upper()
+            (repo / "fq-release.json").write_text(
+                fq_repack.Signer(tmp_path / "pub.key").sign_line(payload) + "\n")
     def local_path(url):
         marker = f"/test/pub/resolve/{REV}/"
         assert marker in url
@@ -646,6 +658,61 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
                   "--upstream-trust-signer", unsafe_publisher]
     assert fq_verify.main(unsafe_argv) == 1
     assert fq_verify.main(unsafe_argv + ["--accept-unsafe-header-plan"]) == 0
+
+def test_identity_fetched_verifies_strict_release_evidence_offline(
+        tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(tmp_path, monkeypatch, strict_release=True)
+    local = signer_of(fam)
+    layer = LAYERS[0]
+    argv = ["--identity", "--check", "fetched", "--segments", str(fam),
+            "--layers", str(layer), "--trust-signer", local,
+            "--upstream-trust-signer", publisher]
+    source = fq_fetch.evidence_source_slug("test/pub", REV)
+    release = fam / "attestations" / source / "fq-release.json"
+    local_att = att_lines(fam, f"layer-{layer:03d}.k3")
+    parent = json.loads(base64.b64decode(
+        json.loads(local_att.read_text().splitlines()[0])["payload"]))["parents"][0]
+    assert parent["signed_release_manifest"] is True
+    assert parent["release_evidence"]["file"] == "fq-release.json"
+    assert release.exists()
+    assert fq_verify.main(argv) == 0
+
+    saved = release.read_bytes()
+    release.write_bytes(b"not a signed release")
+    assert fq_verify.main(argv) == 1
+    release.write_bytes(saved)
+    release.unlink()
+    assert fq_verify.main(argv) == 1
+    release.write_bytes(saved)
+
+    envelope = json.loads(saved)
+    payload = json.loads(base64.b64decode(envelope["payload"]))
+    payload["files"][parent["file"]]["sha256"] = "0" * 64
+    replaced = fq_repack.Signer(tmp_path / "pub.key").sign_line(payload).encode() + b"\n"
+    release.write_bytes(replaced)
+    resign(local_att, tmp_path / "local.key", lambda p: p["parents"][0][
+        "release_evidence"].update({
+            "sha256": hashlib.sha256(replaced).hexdigest(), "size": len(replaced)}))
+    assert fq_verify.main(argv) == 1
+    original_payload = json.loads(base64.b64decode(json.loads(saved)["payload"]))
+    wrong_signed = (fq_repack.Signer(tmp_path / "wrong-release.key").sign_line(
+        original_payload).encode() + b"\n")
+    release.write_bytes(wrong_signed)
+    resign(local_att, tmp_path / "local.key", lambda p: p["parents"][0][
+        "release_evidence"].update({
+            "sha256": hashlib.sha256(wrong_signed).hexdigest(),
+            "size": len(wrong_signed)}))
+    assert fq_verify.main(argv) == 1
+
+def test_identity_fetched_accepts_uppercase_signed_release_revision(
+        tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(
+        tmp_path, monkeypatch, strict_release=True,
+        uppercase_release_revision=True)
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(fam),
+        "--trust-signer", signer_of(fam),
+        "--upstream-trust-signer", publisher]) == 0
 
 
 def test_identity_fetched_uses_signed_nested_evidence_locator(tmp_path, monkeypatch):

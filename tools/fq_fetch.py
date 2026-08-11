@@ -521,7 +521,11 @@ class Source:
         selected = {self.requested_revision, self.revision}
         if self.resolved_commit:
             selected.add(self.resolved_commit)
-        if any(value and str(value) in selected
+
+        def canonical_revision(value: object) -> str:
+            return value.lower() if self.is_immutable_commit(value) else str(value)
+
+        if any(value and canonical_revision(value) in selected
                for value in (self.release.get("revision"),
                              self.release.get("parent_revision"),
                              self.release.get("release"))):
@@ -533,7 +537,8 @@ class Source:
             self._published_release_parent_checked = True
             self._published_release_parent = hub_commit_parent(
                 self.repo, self.resolved_commit or self.revision)
-        return self._published_release_parent == signed_parent
+        return (self._published_release_parent ==
+                canonical_revision(signed_parent))
 
     def _uncovered_release_name(self, name: str, *, kind: str) -> bool:
         self._release_coverage[name] = False
@@ -2170,19 +2175,79 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         json.dumps(report, indent=1, sort_keys=True) + "\n")
 
 
-def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
-    """Keep the (verified) attestation lines that justify these bytes, one
-    directory per source, so the fetched tree can be re-checked offline."""
+def release_evidence(src: Source) -> tuple[bytes, dict] | None:
+    """Return the exact verified release envelope and its signed locator.
+
+    The payload in ``src.release`` is useful while fetching, but an offline
+    verifier must re-check the publisher's *envelope* under its own pin.  Keep
+    that byte-for-byte envelope beside the copied publisher JSONL evidence and
+    bind both the artifact source and the release's signed identity.
+    """
+    if not src.release:
+        return None
+    release_repo = src.release.get("repo")
+    signed_revisions = [
+        value.lower() for value in (src.release.get("revision"),
+                                    src.release.get("parent_revision"))
+        if Source.is_immutable_commit(value)]
+    if not isinstance(release_repo, str) or not release_repo or release_repo != src.repo:
+        raise TrustError(
+            f"{src}: fq-release/1 repo must name this source before its "
+            "coverage can be preserved for offline verification")
+    source_matches_release = src.resolved_commit in signed_revisions
+    if not source_matches_release and src.release.get("parent_revision"):
+        # A publish commit cannot name itself in the signed bytes.  Preserve
+        # this form only after the same authenticated parent relation used by
+        # release_coverage_required has tied it to the selected commit.
+        if not src._published_release_parent_checked:
+            src._published_release_parent_checked = True
+            src._published_release_parent = hub_commit_parent(
+                src.repo, src.resolved_commit)
+        source_matches_release = (
+            src._published_release_parent ==
+            src.release["parent_revision"].lower())
+    if not signed_revisions or not source_matches_release:
+        raise TrustError(
+            f"{src}: fq-release/1 needs an immutable signed revision or "
+            "publisher parent revision binding the selected source before "
+            "its coverage can be preserved offline")
+    raw = src.small_file("fq-release.json")
+    if raw is None:
+        raise TrustError(f"{src}: verified fq-release.json disappeared from cache")
+    binding_revision = (src.resolved_commit
+                        if src.resolved_commit in signed_revisions else
+                        src.release["parent_revision"].lower())
+    return raw, {
+        "file": "fq-release.json",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "repo": release_repo,
+        "revision": binding_revision,
+        "source_revision": src.resolved_commit,
+    }
+
+
+def copy_attestations(out: Path, plans: list[FilePlan], *,
+                      preserve_release: bool) -> None:
+    """Keep publisher evidence; copy release envelopes only for local hops."""
+    copied_sources: set[str] = set()
     for plan in plans:
         for src in {p.source.slug: p.source for p in plan.pieces}.values():
+            evidence_dir = out / "attestations" / evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir)
             name = Source.attestation_name(plan.layer, plan.k)
             raw = src.small_file(name)
-            if raw is None:
-                continue
-            dst = out / "attestations" / evidence_source_slug(
-                src.repo, src.resolved_commit, src.subdir) / Path(name).name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(raw)
+            if raw is not None:
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                (evidence_dir / Path(name).name).write_bytes(raw)
+            if (preserve_release and src.slug not in copied_sources and
+                    src.expert_release_covered(plan.layer, plan.k)):
+                release = release_evidence(src)
+                if release is not None:
+                    copied_sources.add(src.slug)
+                    raw_release, _ = release
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    (evidence_dir / "fq-release.json").write_bytes(raw_release)
 
 
 def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
@@ -2217,6 +2282,8 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
                               Source.segment_name(plan.layer, plan.k))
         frag = att.get("fragment") or {}
         prov = plan.header_provenance.get(src.slug) or {}
+        release_covered = src.expert_release_covered(plan.layer, plan.k)
+        release = release_evidence(src) if release_covered else None
         parents.append({
             "role": "source_fragment",
             "repo": src.repo,
@@ -2241,8 +2308,12 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "header_authentication": prov.get("method"),
             "header_authenticated": bool(prov.get("authenticated")),
             "header_sha256": prov.get("header_sha256"),
-            "signed_release_manifest": bool(prov.get("release_manifest")),
-            "release_covered": bool(prov.get("release_covered")),
+            # This stronger claim means the exact source fragment *and* its
+            # copied publisher JSONL are release-listed.  The envelope itself
+            # is named below for independent offline verification.
+            "signed_release_manifest": release_covered,
+            "release_covered": release_covered,
+            **({"release_evidence": release[1]} if release else {}),
         })
     payload = {
         "schema": "fq-attestation/1",
@@ -2710,7 +2781,7 @@ def main(argv=None) -> int:
               "resume", file=sys.stderr)
         return 130
 
-    copy_attestations(out, plans)
+    copy_attestations(out, plans, preserve_release=signer is not None)
     stats = {**summary, "transport": transport.stats(),
              "elapsed_s": round(time.time() - t0, 1)}
     local_fp = signer.pub_hex if signer is not None else None
