@@ -123,6 +123,9 @@ POLICY_SCHEMA = "fq-policy/2"
 SELECT_SCHEMA = "fq-select/1"
 FETCH_BINDING_SCHEMA = "fq-fetch-binding/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
+ATTESTATION_SCHEMA = "fq-attestation/1"
+EVIDENCE_LOCATOR_SCHEMA = "fq-evidence-locator/1"
+ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of",))
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
@@ -287,8 +290,17 @@ class Transport:
 # ------------------------------------------------------------------ sources
 
 def slugify(repo: str, revision: str, subdir: str = "") -> str:
+    """Internal cache key; evidence uses evidence_source_slug instead."""
     slug = f"{repo.replace('/', '__')}@{revision[:12]}"
     return f"{slug}:{subdir.replace('/', '__')}" if subdir else slug
+
+
+def evidence_source_slug(repo: str, revision: str, subdir: str = "") -> str:
+    """Canonical, injective signed locator for copied source evidence."""
+    if not Source.is_immutable_commit(revision):
+        raise ValueError("evidence source revision must be a full commit")
+    return (f"{urllib.parse.quote(repo, safe='')}@{revision.lower()}:"
+            f"{urllib.parse.quote(subdir, safe='')}")
 
 
 class Source:
@@ -302,15 +314,24 @@ class Source:
     def __init__(self, repo: str, revision: str, transport: Transport,
                  cache_root: Path, *, subdir: str = "", order: int = 0):
         self.repo = repo
-        self.revision = revision or "main"
-        self.pinned = bool(revision)
+        self.requested_revision = revision or "main"
+        self.revision = (self.requested_revision.lower()
+                         if self.is_immutable_commit(self.requested_revision)
+                         else self.requested_revision)
+        self.pinned = self.is_immutable_commit(self.revision)
         self.subdir = subdir
         self.t = transport
         self.order = order
-        self.slug = slugify(repo, self.revision, subdir)
+        # Immutable commit spellings identify the same revision irrespective
+        # of case.  Evidence and cache paths must use that canonical spelling
+        # because locally signed parents serialize the normalized commit.
+        self.cache_root = cache_root
+        self.slug = slugify(
+            repo, self.revision if self.pinned else self.requested_revision,
+            subdir)
         self.cache = cache_root / self.slug
         self.cache.mkdir(parents=True, exist_ok=True)
-        self.resolved_commit: str | None = None
+        self.resolved_commit: str | None = (self.revision if self.pinned else None)
         self._small: dict[str, bytes | None] = {}
         self._headers: dict[str, tuple[dict, int]] = {}
         self._header_bytes: dict[str, bytes] = {}
@@ -325,6 +346,43 @@ class Source:
         self.manifest: dict = {}
 
     # -- naming ------------------------------------------------------------
+
+    @staticmethod
+    def is_immutable_commit(value: object) -> bool:
+        return (isinstance(value, str) and len(value) == 40
+                and all(c in "0123456789abcdefABCDEF" for c in value))
+
+
+    def observe_response_commit(self, meta: dict, where: str) -> str:
+        """Require every consumed response to identify the resolved commit."""
+        commit = meta.get("commit")
+        if isinstance(commit, str):
+            commit = commit.lower()
+        if not self.is_immutable_commit(commit):
+            raise TrustError(
+                f"{self.repo}@{self.revision}: {where} did not identify an "
+                "immutable X-Repo-Commit; refusing an unverifiable revision")
+        if self.resolved_commit and commit != self.resolved_commit:
+            raise TrustError(
+                f"{self.repo}@{self.resolved_commit}: {where} came from "
+                f"commit {commit}, not the resolved commit — repository drift")
+        self.resolved_commit = commit
+        return commit
+
+    def resolve_revision(self) -> None:
+        """Resolve a mutable ref once, before following it for any artifact."""
+        if self.pinned:
+            return
+        # A manifest response is the resolver request.  It is retained in
+        # memory, then every later URL uses its immutable commit.
+        data, meta = self.t.get_full(self.url("fq-manifest.json"))
+        commit = self.observe_response_commit(meta, "revision resolution")
+        self.revision = commit
+        self.pinned = True
+        self.slug = slugify(self.repo, commit, self.subdir)
+        self.cache = self.cache_root / self.slug
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self._small["fq-manifest.json"] = data
 
     @classmethod
     def parse(cls, spec: str, transport: Transport, cache_root: Path,
@@ -389,7 +447,7 @@ class Source:
                 print(f"  {self}: {name} absent (HTTP 404)", flush=True)
                 self._small[name] = None
                 return None
-            self.resolved_commit = self.resolved_commit or meta.get("commit")
+            self.observe_response_commit(meta, name)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(data)
         self._small[name] = data
@@ -460,7 +518,7 @@ class Source:
             return False
         if self.require_release_coverage:
             return True
-        selected = {self.revision}
+        selected = {self.requested_revision, self.revision}
         if self.resolved_commit:
             selected.add(self.resolved_commit)
         if any(value and str(value) in selected
@@ -570,6 +628,78 @@ class Source:
         self.check_against_release(name, raw)
         return json.loads(raw)
 
+    def attestation_identity(self, payload: dict, *, layer: int, k: int,
+                             segment_file: str, where: str) -> dict:
+        """Validate the signed claim before it can authorize range reads."""
+        if payload.get("schema") != ATTESTATION_SCHEMA:
+            raise TrustError(
+                f"{where}: schema {payload.get('schema')!r}, expected "
+                f"{ATTESTATION_SCHEMA!r}")
+        predicate = payload.get("predicate")
+        if predicate not in ALLOWED_UPSTREAM_PREDICATES:
+            raise TrustError(
+                f"{where}: predicate {predicate!r} is not accepted for "
+                "range-fetched parents")
+        # Fetched-subset verification terminates at a publisher's
+        # source_fragment/repack-of attestation.  Other predicates require
+        # evidence chains that range fetching neither copies nor verifies.
+        fragment = payload.get("fragment")
+        if not isinstance(fragment, dict) or fragment.get("file") != segment_file:
+            raise TrustError(f"{where}: fragment does not name {segment_file}")
+        for field, expected in (("layer", layer), ("k", k)):
+            declared = payload.get(field)
+            if declared is not None and declared != expected:
+                raise TrustError(
+                    f"{where}: attests {field} {declared!r}, not requested "
+                    f"{expected!r}")
+        base_model, layout = payload.get("base_model"), payload.get("layout")
+        fragment_count = payload.get("num_experts")
+        if not isinstance(base_model, str) or not base_model:
+            raise TrustError(f"{where}: accepted predicate lacks base_model")
+        if not isinstance(layout, str) or not layout:
+            raise TrustError(f"{where}: accepted predicate lacks layout")
+        if fragment_count is not None and (
+                not isinstance(fragment_count, int) or fragment_count <= 0):
+            raise TrustError(f"{where}: num_experts is invalid")
+        family_count = payload.get("family_num_experts")
+        if family_count is not None and (
+                not isinstance(family_count, int) or family_count <= 0):
+            raise TrustError(f"{where}: family_num_experts is invalid")
+        digests = payload.get("expert_sha256")
+        if not isinstance(digests, dict) or not digests:
+            raise TrustError(f"{where}: accepted predicate lacks expert_sha256")
+        materials = payload.get("materials")
+        if not isinstance(materials, dict):
+            raise TrustError(f"{where}: {predicate} lacks materials")
+        for field in ("repo", "revision", "file"):
+            if not isinstance(materials.get(field), str) or not materials[field]:
+                raise TrustError(f"{where}: {predicate} materials lacks {field}")
+        revision = (payload.get("base_revision") or materials.get("revision")
+                    or self.manifest.get("revision"))
+        if not self.is_immutable_commit(revision):
+            raise TrustError(
+                f"{where}: base revision {revision!r} is not an immutable commit")
+        revision = revision.lower()
+        manifest = self.manifest
+        for field, value in (("base_model", base_model), ("layout", layout),
+                             ("predicate", predicate)):
+            published = manifest.get(field)
+            if published is not None and published != value:
+                raise TrustError(
+                    f"{where}: signed {field} {value!r} disagrees with "
+                    f"fq-manifest.json {published!r}")
+        published_revision = manifest.get("revision")
+        if (self.is_immutable_commit(published_revision)
+                and published_revision.lower() != revision):
+            raise TrustError(
+                f"{where}: signed base revision {revision!r} disagrees with "
+                f"fq-manifest.json {published_revision!r}")
+        return {"predicate": predicate, "base_model": base_model,
+                "base_revision": revision, "layout": layout,
+                "num_experts": family_count,
+                "fragment_num_experts": fragment_count,
+                "layer": layer, "k": k}
+
     def attestation(self, layer: int, k: int, verifier: fq_trust.Verifier,
                     segment_file: str) -> dict:
         """Verified, merged attestation payload for one segment file.
@@ -607,12 +737,27 @@ class Source:
                 continue
             merged["inner_signatures_verified"] += 1
             frag = payload.get("fragment") or {}
+            # JSONL files may carry trusted lines for other fragments. They
+            # do not authorize this file and must not poison its validation.
             if frag.get("file") != segment_file:
                 continue
+            where = f"{self}:{name}:{n}"
+            identity = self.attestation_identity(
+                payload, layer=layer, k=k, segment_file=segment_file, where=where)
+            if merged["fragment"] not in (None, frag):
+                raise TrustError(f"{where}: trusted lines disagree about fragment")
+            if "identity" in merged and merged["identity"] != identity:
+                raise TrustError(f"{where}: trusted lines disagree about identity")
             merged["fragment"] = frag
+            merged["identity"] = identity
+            merged["parents"] = payload.get("parents")
             merged["lines"] += 1
-            for eid, digest in (payload.get("expert_sha256") or {}).items():
-                merged["expert_sha256"][str(eid)] = digest
+            for eid, digest in payload["expert_sha256"].items():
+                eid = str(eid)
+                if eid in merged["expert_sha256"] and merged["expert_sha256"][eid] != digest:
+                    raise TrustError(
+                        f"{where}: trusted lines disagree about expert {eid} digest")
+                merged["expert_sha256"][eid] = digest
             count = payload.get("num_experts")
             if count is not None:
                 previous = merged.get("num_experts")
@@ -685,11 +830,12 @@ class Source:
         if obj is None:
             url = self.url(name)
             d, meta = self.t.get_range(url, 0, 8)
+            self.observe_response_commit(meta, f"{name} header prefix")
             hlen = struct.unpack("<Q", d)[0]
             if not 0 < hlen < (1 << 31):
                 raise IOError(f"{self}:{name}: implausible header length {hlen}")
             hj, meta = self.t.get_range(url, 8, 8 + hlen)
-            self.resolved_commit = self.resolved_commit or meta.get("commit")
+            self.observe_response_commit(meta, f"{name} header")
             header = json.loads(hj)
             out = (header, 8 + hlen)
             self._write_header_cache(name, header, out[1], None,
@@ -811,11 +957,12 @@ class Source:
         """Cheap path: the publisher signed a digest of the header bytes."""
         url = self.url(name)
         d, meta = self.t.get_range(url, 0, 8)
+        self.observe_response_commit(meta, f"{name} header prefix")
         hlen = struct.unpack("<Q", d)[0]
         if not 0 < hlen < (1 << 31):
             raise IOError(f"{self}:{name}: implausible header length {hlen}")
         hj, meta = self.t.get_range(url, 8, 8 + hlen)
-        self.resolved_commit = self.resolved_commit or meta.get("commit")
+        self.observe_response_commit(meta, f"{name} header")
         raw = bytes(d) + bytes(hj)
         got = hashlib.sha256(raw).hexdigest()
         want = frag["header_sha256"]
@@ -869,7 +1016,7 @@ class Source:
                 data, meta = self.t.get_range(url, off, end)
                 if len(data) != end - off:
                     raise IOError(f"{self}:{name}: short read at {off}")
-                self.resolved_commit = self.resolved_commit or meta.get("commit")
+                self.observe_response_commit(meta, f"{name} bytes {off}-{end}")
                 digest.update(data)
                 if off == 0:
                     need = 8 + struct.unpack("<Q", data[:8])[0]
@@ -1047,30 +1194,37 @@ def _manifest_expert_count(source: Source, *, layer: int) -> int | None:
 
 
 def _signed_expert_count(attestation: dict, *, layer: int, source: Source) -> int:
-    """Read the cardinality from the trusted signed attestation payload."""
-    value = attestation.get("num_experts")
+    """Read the signed *family* cardinality, never a fragment's count."""
+    identity = attestation.get("identity")
+    value = (identity or {}).get("num_experts")
+    # The compatibility form is used only by callers that supplied no
+    # validated identity at all; fq_fetch's own parsed attestations always
+    # have one and must use family_num_experts instead.
+    if identity is None:
+        value = attestation.get("num_experts")
     try:
         count = int(value)
     except (TypeError, ValueError) as e:
         raise TrustError(
             f"layer {layer}: {source} signed attestation has no valid "
-            "num_experts; refusing to transfer a payload before a dense "
-            "fq-policy/2 can be checked") from e
+            "family_num_experts; refusing to transfer a payload before a "
+            "dense fq-policy/2 can be checked") from e
     if count < 0:
         raise TrustError(
             f"layer {layer}: {source} signed attestation declares invalid "
-            f"num_experts={value!r}")
+            f"family_num_experts={value!r}")
     return count
 
 
 def _attested_cardinality(source: Source, layer: int, k: int,
-                          verifier: fq_trust.Verifier) -> int:
+                          verifier: fq_trust.Verifier) -> int | None:
     """Get a trusted family cardinality without reading segment payload bytes.
 
-    New producers sign ``num_experts`` directly.  Older primed families sign
-    the per-expert digest map instead; unioning those signed maps across their
-    advertised K files supplies the same dense inventory without trusting a
-    ranged header or fetching a parent body.
+    New producers sign ``family_num_experts`` directly. Older primed
+    families omit it and sign the per-expert digest map instead; unioning
+    those signed maps across their advertised K files supplies the same
+    dense inventory without trusting a ranged header or fetching a parent
+    body. A sparse map establishes no dense cardinality.
     """
     index = source.index(k) or {}
     entry = index.get(str(layer))
@@ -1079,7 +1233,9 @@ def _attested_cardinality(source: Source, layer: int, k: int,
             f"layer {layer}: {source} has no K{k} segment with a signed "
             "expert cardinality")
     attestation = source.attestation(layer, k, verifier, entry["file"])
-    if attestation.get("num_experts") is not None:
+    identity = attestation.get("identity")
+    if ((identity or {}).get("num_experts") is not None
+            or (identity is None and attestation.get("num_experts") is not None)):
         return _signed_expert_count(attestation, layer=layer, source=source)
 
     experts: set[int] = set()
@@ -1100,7 +1256,7 @@ def _attested_cardinality(source: Source, layer: int, k: int,
         if not isinstance(digests, dict):
             raise TrustError(
                 f"layer {layer}: {source} K{variant} signed attestation has "
-                "neither num_experts nor an expert_sha256 map")
+                "neither family_num_experts nor an expert_sha256 map")
         try:
             experts.update(int(expert) for expert in digests)
         except (TypeError, ValueError) as e:
@@ -1109,9 +1265,7 @@ def _attested_cardinality(source: Source, layer: int, k: int,
                 "not integers") from e
     count = len(experts)
     if experts != set(range(count)):
-        raise TrustError(
-            f"layer {layer}: {source} signed expert digest maps are not dense "
-            f"0..{count - 1}")
+        return None
     return count
 
 
@@ -1155,10 +1309,11 @@ def validate_policy_cardinality(policy: dict[int, dict[int, int]],
                     "attestation for its planned segment")
             count = _attested_cardinality(
                 piece.source, plan.layer, plan.k, verifier)
-            known = getattr(plan, "attested_expert_counts", {})
-            known[piece.source.slug] = count
-            plan.attested_expert_counts = known
-            counts.setdefault(plan.layer, set()).add(count)
+            if count is not None:
+                known = getattr(plan, "attested_expert_counts", {})
+                known[piece.source.slug] = count
+                plan.attested_expert_counts = known
+                counts.setdefault(plan.layer, set()).add(count)
 
     # An empty list routes no K and creates no plan.  Its cardinality still
     # comes from an attestation, never from an unauthenticated header.
@@ -1170,6 +1325,8 @@ def validate_policy_cardinality(policy: dict[int, dict[int, int]],
                 try:
                     count = _attested_cardinality(source, layer, int(k), verifier)
                 except (TypeError, ValueError):
+                    continue
+                if count is None:
                     continue
                 counts.setdefault(layer, set()).add(count)
                 break
@@ -1194,19 +1351,24 @@ def authenticate_policy_cardinality(policy: dict[int, dict[int, int]],
                 continue
             seen.add(key)
             header = piece.source.segment_header(plan.layer, plan.k)[0]
-            attestation = plan.atts[piece.source.slug]
             expected_count = getattr(plan, "attested_expert_counts", {}).get(
                 piece.source.slug)
-            if expected_count is None:
-                raise TrustError(
-                    f"layer {plan.layer}: {piece.source} has no preflight "
-                    "signed family cardinality")
             held = _header_expert_ids(header)
-            if any(expert < 0 or expert >= expected_count for expert in held):
+            if (expected_count is not None
+                    and any(expert < 0 or expert >= expected_count
+                            for expert in held)):
                 raise TrustError(
                     f"layer {plan.layer}: {piece.source} authenticated header "
                     f"contains expert ids outside signed family cardinality "
                     f"{expected_count}")
+            if expected_count is None:
+                # Sparse signed digests establish no family size. Once the
+                # header itself is authenticated, a complete dense inventory
+                # is a safe compatibility fallback for ordinary partial
+                # fetches, but never participates in the preflight.
+                if held != set(range(len(held))):
+                    continue
+                expected_count = len(held)
             declared = (header.get("__metadata__") or {}).get("num_experts")
             if declared is not None:
                 try:
@@ -1267,7 +1429,13 @@ def select_preference(sel: dict, layer: int, expert: int) -> str | None:
 
 
 def source_matches(source: Source, alias: str) -> bool:
-    return alias in (source.repo, str(source), source.slug)
+    aliases = {source.repo, str(source), source.slug,
+               f"{source.repo}@{source.requested_revision}"}
+    if source.subdir:
+        aliases.add(
+            f"{source.repo}@{source.requested_revision}:{source.subdir}")
+        aliases.add(f"{source.repo}@{source.revision}:{source.subdir}")
+    return alias in aliases
 
 
 def validate_fetch_binding(binding: dict, policy: dict[int, dict[int, int]],
@@ -1358,6 +1526,7 @@ class FilePlan:
         self.chosen: list = []
         self.atts: dict[str, dict] = {}
         self.header_provenance: dict[str, dict] = {}
+        self.identity: dict = {}
 
     def shape(self) -> tuple:
         """Everything about this plan that the remote header decides."""
@@ -1380,27 +1549,36 @@ class FilePlan:
         return hashlib.sha256(spec.encode()).hexdigest()
 
 
+class SelectionError(ValueError):
+    """An explicit content/provider request could not be honored."""
+
+
 def choose_source(candidates: list[tuple[Source, dict, dict]], layer: int,
                   expert: int, *, prefer_sha: set[str], select: dict,
                   required_select: bool = False):
-    """Pick the provider for one expert.
-
-    A recipe binding makes its provider selection mandatory; unlike an
-    interactive preference, it never falls through to another available
-    source.
-    """
-    if prefer_sha:
-        for src, idx, att in candidates:
-            if att["expert_sha256"].get(str(expert)) in prefer_sha:
-                return src, idx, att
+    """Pick a provider without weakening explicit recipe constraints."""
     alias = select_preference(select, layer, expert)
+    scoped = candidates
     if alias:
-        for src, idx, att in candidates:
-            matches = str(src) == alias if required_select else source_matches(src, alias)
-            if matches:
-                return src, idx, att
-        if required_select:
-            return None
+        scoped = [candidate for candidate in candidates if (
+            str(candidate[0]) == alias if required_select
+            else source_matches(candidate[0], alias))]
+        if not scoped:
+            available = ", ".join(str(src) for src, _idx, _att in candidates) or "none"
+            raise SelectionError(
+                f"layer {layer} expert {expert}: requested provider {alias!r} is "
+                f"unavailable (available: {available})")
+        if len(scoped) > 1:
+            raise SelectionError(
+                f"layer {layer} expert {expert}: provider {alias!r} is "
+                "ambiguous; select an immutable repo@commit")
+    digest_matches = [candidate for candidate in scoped
+                      if candidate[2]["expert_sha256"].get(str(expert))
+                      in prefer_sha]
+    if digest_matches:
+        return digest_matches[0]
+    if alias:
+        return scoped[0]
     return candidates[0] if candidates else None
 
 
@@ -1411,6 +1589,8 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
     plans: list[FilePlan] = []
     problems: list[str] = []
     indexes: dict[tuple[int, int], dict] = {}
+    matched_prefer_sha: set[str] = set()
+    family: dict | None = None
 
     def index_for(src: Source, k: int):
         key = (id(src), k)
@@ -1424,8 +1604,6 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             by_k.setdefault(k, []).append(expert)
         for k in sorted(by_k):
             plan = FilePlan(layer, k)
-            # Which sources carry this (layer, K) at all, with their verified
-            # attestation — resolved once per file, then filtered per expert.
             cands: list[tuple[Source, dict, dict]] = []
             for src in sources:
                 idx = index_for(src, k).get(str(layer))
@@ -1441,9 +1619,13 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             for expert in by_k[k]:
                 have = [(s, i, a) for s, i, a in cands
                         if str(expert) in (i.get("experts") or {})]
-                pick = choose_source(
-                    have, layer, expert, prefer_sha=prefer_sha, select=select,
-                    required_select=binding is not None)
+                try:
+                    pick = choose_source(
+                        have, layer, expert, prefer_sha=prefer_sha, select=select,
+                        required_select=binding is not None)
+                except SelectionError as e:
+                    problems.append(str(e))
+                    continue
                 if pick is None:
                     problems.append(
                         f"layer {layer} K{k} expert {expert}: no source carries it")
@@ -1462,15 +1644,110 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
                         f"layer {layer} K{k} expert {expert}: {src} attests "
                         f"{digest[:16]}… but fetch binding requires {expected[:16]}…")
                     continue
+                if digest in prefer_sha:
+                    matched_prefer_sha.add(digest)
                 chosen.append((expert, src, idx, digest))
             if not chosen:
                 continue
+            plan.atts = {src.slug: att for src, _idx, att in cands}
+            selected = {src.slug: src for _expert, src, _idx, _digest in chosen}
+            identities = [(src, plan.atts[src.slug]["identity"])
+                          for src in selected.values()]
+            canonical = identities[0][1]
+            contract_fields = ("base_model", "base_revision", "layout")
+            mismatch = next(
+                ((src, ident) for src, ident in identities
+                 if any(ident[field] != canonical[field] for field in contract_fields)),
+                None)
+            if mismatch:
+                src, ident = mismatch
+                raise TrustError(
+                    f"layer {layer} K{k}: {src} identity {ident} is "
+                    f"incompatible with selected parent identity {canonical}")
+            counts = {ident["num_experts"] for _src, ident in identities
+                      if ident["num_experts"] is not None}
+            if len(counts) > 1:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected parents disagree on "
+                    f"family_num_experts {sorted(counts)}")
+            current_family = {field: canonical[field] for field in contract_fields}
+            current_count = next(iter(counts), None)
+            prior_count = family.get("num_experts") if family else None
+            if family is None:
+                family = {**current_family, "num_experts": current_count}
+            elif family != {**current_family, "num_experts": prior_count}:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected family {current_family} is "
+                    f"incompatible with prior selected family {family}")
+            elif prior_count is not None and current_count is not None and prior_count != current_count:
+                raise TrustError(
+                    f"layer {layer} K{k}: selected family_num_experts "
+                    f"{current_count} is incompatible with prior {prior_count}")
+            elif prior_count is None and current_count is not None:
+                family["num_experts"] = current_count
+            plan.identity = canonical
             _build_file_plan(plan, chosen, problems)
             if plan.pieces:
                 plan.chosen = chosen
-                plan.atts = {src.slug: att for src, _idx, att in cands}
                 plans.append(plan)
+    for digest in sorted(prefer_sha - matched_prefer_sha):
+        problems.append(
+            f"--prefer-sha {digest[:16]}… matched no requested expert; refusing "
+            "to substitute a different fragment")
     return plans, problems
+
+def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
+    """Require every selected parent to describe the same tensor contract."""
+    expected = plan.identity
+    signatures: list[tuple[Source, tuple]] = []
+    for piece in plan.pieces:
+        src = piece.source
+        header, _body_offset = src.segment_header(plan.layer, plan.k)
+        meta = header.get("__metadata__") or {}
+        att = plan.atts[src.slug]["identity"]
+        for field, want in (("base_model", att["base_model"]),
+                            ("layout", att["layout"]),
+                            ("predicate", att["predicate"]),
+                            ("layer", str(plan.layer)), ("k", str(plan.k))):
+            if str(meta.get(field)) != str(want):
+                raise TrustError(
+                    f"{plan.name}: {src} authenticated header {field}="
+                    f"{meta.get(field)!r} disagrees with signed {want!r}")
+        fragment_count = att["fragment_num_experts"]
+        if (fragment_count is not None
+                and str(meta.get("num_experts")) != str(fragment_count)):
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header num_experts="
+                f"{meta.get('num_experts')!r} disagrees with signed "
+                f"{fragment_count!r}")
+        # Older fq-segment/1 headers do not repeat the base revision.  The
+        # signed attestation is still authoritative for it; when a header
+        # does declare one it must agree.
+        if (meta.get("revision") is not None
+                and str(meta["revision"]) != str(att["base_revision"])):
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header revision="
+                f"{meta['revision']!r} disagrees with signed "
+                f"{att['base_revision']!r}")
+        if any(att[field] != expected[field] for field in
+               ("base_model", "base_revision", "layout")):
+            raise TrustError(
+                f"{plan.name}: {src} signed identity is incompatible with "
+                "the selected family")
+        template = []
+        for name in piece.names:
+            tensor = header[name]
+            template.append((
+                name.replace(f".experts.{piece.expert}.", ".experts.{{expert}}."),
+                tensor.get("dtype"), tuple(tensor.get("shape") or ())))
+        signatures.append((src, tuple(template)))
+    if signatures:
+        source, canonical = signatures[0]
+        for other, signature in signatures[1:]:
+            if signature != canonical:
+                raise TrustError(
+                    f"{plan.name}: {other} authenticated tensor names/dtypes/"
+                    f"shapes are incompatible with {source}")
 
 
 def authenticate_plan(plan: FilePlan, mode: str) -> dict:
@@ -1492,10 +1769,16 @@ def authenticate_plan(plan: FilePlan, mode: str) -> dict:
             plan.layer, plan.k, att, mode,
             retain=[p for p in plan.pieces if p.source is src])
     if mode == HEADER_UNSAFE:
+        if len(provenance) > 1:
+            raise TrustError(
+                f"{plan.name}: --header-trust unsafe cannot authenticate tensor "
+                "compatibility across multiple selected sources")
         plan.header_provenance = provenance
         return provenance
     before = plan.shape()
     fresh = FilePlan(plan.layer, plan.k)
+    fresh.atts = plan.atts
+    fresh.identity = plan.identity
     problems: list[str] = []
     _build_file_plan(fresh, plan.chosen, problems)
     if problems:
@@ -1508,6 +1791,7 @@ def authenticate_plan(plan: FilePlan, mode: str) -> dict:
             f"ranged header this plan was drafted from — tensor names, "
             f"dtypes, shapes or offsets were substituted between the two "
             f"reads; refusing")
+    validate_authenticated_plan_compatibility(plan)
     plan.header_provenance = provenance
     return provenance
 
@@ -1589,8 +1873,12 @@ def _build_file_plan(plan: FilePlan, chosen, problems: list[str]) -> None:
     if not pieces:
         return
     meta = {k: str(v) for k, v in (meta_src or {}).items()}
+    parent_predicates = sorted({plan.atts[p.source.slug]["identity"]["predicate"]
+                                for p in pieces})
     meta.update({
         "fq_schema": SEGMENT_SCHEMA,
+        "predicate": "derived-from",
+        "fq_parent_predicates": ",".join(parent_predicates),
         "k": str(plan.k),
         "layer": str(plan.layer),
         "num_experts": str(len(pieces)),
@@ -1729,9 +2017,12 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         if entry:
             per_k[plan.k][str(plan.layer)] = entry
         provenance.setdefault(str(plan.layer), {})[f"k{plan.k}"] = {
-            str(p.expert): {"source": str(p.source), "sha256": p.sha256,
-                            "release_covered": p.source.expert_release_covered(
-                                plan.layer, plan.k)}
+            str(p.expert): {
+                "source": str(p.source), "sha256": p.sha256,
+                "release_covered": p.source.expert_release_covered(
+                    plan.layer, plan.k),
+                "identity": plan.atts[p.source.slug]["identity"],
+            }
             for p in plan.pieces}
     index_names = {}
     for k, index in per_k.items():
@@ -1741,16 +2032,21 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         (out / name).write_text(json.dumps(index, indent=1, sort_keys=True) + "\n")
         index_names[str(k)] = name
 
-    base = sources[0].manifest if sources else {}
+    base = plans[0].identity if plans else {}
     layers = sorted({p.layer for p in plans})
+    parent_predicates = sorted({
+        plan.atts[p.source.slug]["identity"]["predicate"]
+        for plan in plans for p in plan.pieces
+    })
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "kind": "fetched-subset",
         "base_model": base.get("base_model"),
-        "revision": base.get("revision"),
-        "predicate": base.get("predicate", "repack-of"),
+        "revision": base.get("base_revision"),
+        "predicate": "derived-from",
+        "parent_predicates": parent_predicates,
         "layout": base.get("layout", "rank_sliced_tp4"),
-        "hessian_id": base.get("hessian_id"),
+        "hessian_id": None,
         "k_variants": ks,
         "moe_layers": [min(layers), max(layers)] if layers else [],
         "num_experts": max(
@@ -1789,6 +2085,7 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                      else "none (no verified release)")
     report = {
         "schema": REPORT_SCHEMA,
+        "evidence_locator_schema": EVIDENCE_LOCATOR_SCHEMA,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "policy": str(policy_path),
         "trust": {"rung": verifier.rung, "signer": verifier.fingerprint,
@@ -1804,6 +2101,9 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                       for h in per_file.values()) if headers else False},
         "header_authentication": headers,
         "sources": [{"repo": s.repo, "revision": s.revision,
+                     "requested_revision": s.requested_revision,
+                     "evidence_source": evidence_source_slug(
+                         s.repo, s.resolved_commit, s.subdir),
                      "pinned": s.pinned, "resolved_commit": s.resolved_commit,
                      "release_manifest": bool(s.release),
                      "release_coverage_required": s.release_coverage_required(),
@@ -1825,7 +2125,8 @@ def copy_attestations(out: Path, plans: list[FilePlan]) -> None:
             raw = src.small_file(name)
             if raw is None:
                 continue
-            dst = out / "attestations" / src.slug / Path(name).name
+            dst = out / "attestations" / evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir) / Path(name).name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(raw)
 
@@ -1865,12 +2166,21 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
         parents.append({
             "role": "source_fragment",
             "repo": src.repo,
-            "revision": src.revision,
+            "revision": src.resolved_commit,
+            "requested_revision": src.requested_revision,
+            "subdir": src.subdir,
+            # Signed locator for copied evidence, canonically derived from
+            # repo, resolved commit, and subdirectory—not user input.
+            "evidence_source": evidence_source_slug(
+                src.repo, src.resolved_commit, src.subdir),
             "file": frag.get("file"),
             "sha256": frag.get("sha256"),
             "size": frag.get("size"),
             "keyid": verifier.fingerprint,
             "experts": experts,
+            "predicate": att["identity"]["predicate"],
+            "identity": att["identity"],
+            "upstream_parents": att.get("parents"),
             # exactly which authenticated inputs this plan was computed from:
             # the layout (names, dtypes, shapes, offsets) came from the
             # parent's header, so say how that header was proven
@@ -1891,10 +2201,12 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
                           for p in sorted(plan.pieces, key=lambda x: x.expert)},
         "layer": plan.layer,
         "k": plan.k,
-        # This is the authenticated full family count, not len(plan.pieces):
-        # a mixed-K recipe distributes one dense layer across multiple
-        # derived subset files, each of which must remain usable as a source.
-        "num_experts": plan.family_num_experts,
+        "base_model": plan.identity.get("base_model"),
+        "base_revision": plan.identity.get("base_revision"),
+        "layout": plan.identity.get("layout"),
+        # Unknown family cardinality remains explicit: the local fragment's
+        # count is still true, while no unsound full-family claim is made.
+        "num_experts": getattr(plan, "family_num_experts", len(plan.pieces)),
         "derivation": {
             "rule": "range_subset_v1",
             "description": (
@@ -2086,7 +2398,8 @@ def fetch_plan(plan: FilePlan, out: Path, state: dict, transport: Transport,
                 save_state(out, state)
             url = src.url(plan.name)
             for start, end, group in coalesce(remaining, max_chunk, max_gap):
-                data, _ = transport.get_range(url, start, end)
+                data, meta = transport.get_range(url, start, end)
+                src.observe_response_commit(meta, f"{plan.name} bytes {start}-{end}")
                 fetched += len(data)
                 wasted += len(data) - sum(p.size for p in group)
                 for piece in group:
@@ -2132,18 +2445,17 @@ def main(argv=None) -> int:
     p.add_argument("--source", action="append", default=[],
                    metavar="REPO[@REV[:SUBDIR]]",
                    help="artifact repo or nested family, repeatable and ORDERED "
-                   "(earlier wins ties). Pin a nested family as "
-                   "REPO@40-hex-commit:relative/path; a bare repo follows main "
-                   "and is a weaker pin.")
+                        "(earlier wins ties). Symbolic refs are resolved once to "
+                        "a commit; @<commit>:relative/path avoids that resolver "
+                        "request.")
     p.add_argument("--out", required=True, type=Path,
                    help="local segment tree to build (fq_assemble --segments)")
     p.add_argument("--layers", default=None, help="subset, e.g. 3-10 or 3,5,7")
     p.add_argument("--dry-run", action="store_true",
                    help="plan and print byte counts, fetch nothing")
     p.add_argument("--prefer-sha", action="append", default=[], metavar="SHA256",
-                   help="content-hash selection: prefer the source whose "
-                        "attested expert digest is this, whoever publishes it. "
-                        "Repeatable.")
+                   help="require an attested requested expert digest; every "
+                        "supplied digest must match (repeatable).")
     p.add_argument("--select", type=Path, default=None, metavar="MAP.json",
                    help="fq-select/1 provider map: per-expert or per-layer "
                         "source choice ({'experts': {'3': {'137': 'repo'}}})")
@@ -2199,15 +2511,11 @@ def main(argv=None) -> int:
                for i, s in enumerate(args.source)]
     for s in sources:
         s.require_release_coverage = args.require_release_coverage
-    for s in sources:
-        if not s.pinned:
-            print(f"warning: {s.repo} is not pinned to a revision — following "
-                  f"'main' means the bytes can change under you; pass "
-                  f"{s.repo}@<commit>", file=sys.stderr)
-        s.load_manifest()
-
-    manifest0 = sources[0].manifest
     try:
+        for s in sources:
+            s.resolve_revision()
+            s.load_manifest()
+        manifest0 = sources[0].manifest
         verifier = fq_trust.Verifier.from_args(args, manifest=manifest0)
         for s in sources:
             s.load_release(verifier)
@@ -2237,9 +2545,13 @@ def main(argv=None) -> int:
 
     for msg in problems:
         print(f"  ! {msg}", file=sys.stderr)
-    if binding and problems:
-        print("bound recipe has unsatisfied providers or content digests; "
-              "nothing fetched", file=sys.stderr)
+    if problems and (binding or args.select or args.prefer_sha):
+        if binding:
+            print("bound recipe has unsatisfied providers or content digests; "
+                  "nothing fetched", file=sys.stderr)
+        else:
+            print("explicit provider or content constraints were unsatisfied; "
+                  "nothing fetched", file=sys.stderr)
         return 1
     if not plans:
         print("nothing to fetch: no source carries the experts this recipe asks "
