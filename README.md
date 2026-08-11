@@ -65,7 +65,7 @@ Think progressive JPEG, for quants.
   [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments)
   is live. An unattended encode campaign publishes new K2/K5 windows to it,
   so `main` moves: **pin `--revision`/`@<commit>`**, and read layer coverage
-  from `fq-manifest.json` `per_k[K].layer_coverage`
+  from `fq-manifest.json` `per_k[K].layer_coverage.layers`
   (`fq-layer-coverage/1`). On an older manifest without that field, use the
   signed `index-kK.json` layer keys; `per_k[K].layers` is legacy extrema, not
   sparse-coverage authority.
@@ -107,7 +107,7 @@ at pinned commit `9297b9f1`) live at
 | Location | Where it came from |
 |---|---|
 | root **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
-| root **K2 / K4 / K5** | fresh `encode-of` tiers from `zai-org/GLM-5.2`; their exact current coverage is `fq-manifest.json` `per_k[K].layer_coverage` (`fq-layer-coverage/1`), or signed `index-kK.json` keys when the field is absent — never legacy `per_k[K].layers` extrema |
+| root **K2 / K4 / K5** | fresh `encode-of` tiers from `zai-org/GLM-5.2`; their exact current coverage is `fq-manifest.json` `per_k[K].layer_coverage.layers` (`fq-layer-coverage/1`), or signed `index-kK.json` keys when the field is absent — never legacy `per_k[K].layers` extrema |
 | `sources/willfalco-*` | nested, community-primed families: ranged-read `repack-of` / `derived-from` material over layers 3–10; not the root K4 tier and not a direct `fq_fetch --source` provider |
 
 **Inventory changes.** The artifact-card snapshot at commit `c64a3f60`, measured
@@ -135,7 +135,7 @@ release:
 ```bash
 git clone https://github.com/malaiwah/progressive-tensors
 cd progressive-tensors
-uv venv && uv pip install -r requirements-dev.txt
+uv venv && uv pip install -e '.[hub]'
 
 ARTIFACT_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
 ARTIFACT_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
@@ -263,53 +263,64 @@ content-hash and explicit provider selection.
 
 ### Verify provenance without downloading anything big
 
-Each `attestations/layer-LLL.kK.jsonl` file is **JSON Lines** — one signed
-line per fragment covered, and more lines later as countersignatures land —
-so iterate lines, never `json.loads` the whole file:
+The spot check below is for an **original publisher fragment**, not the local
+subset that `fq_fetch` materializes. Its index offsets and JSONL signature
+must come from the same immutable publisher revision as the `resolve` URL:
+
+```bash
+PUBLISHER_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
+PUBLISHER_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
+hf download "$PUBLISHER_REPO" index-k3.json \
+  attestations/layer-030.k3.jsonl --revision "$PUBLISHER_REV" \
+  --local-dir ./publisher-metadata
+```
+
+Each `attestations/layer-LLL.kK.jsonl` file is **JSON Lines**. This program
+verifies the publisher's signature, derives expert 137's range from that
+publisher index, and proves the remote server returned exactly that bounded
+span. If `./publisher-release/` contains a complete local publisher tree, it
+also performs the equivalent `seek`/bounded `read`; it never reads a full
+segment into memory.
 
 ```python
 import base64, hashlib, json
+from pathlib import Path
+from urllib.request import Request, urlopen
 from nacl.signing import VerifyKey
 
-# The fingerprint comes from keys/FINGERPRINTS in the GIT repo, NOT from
-# the download being checked. That is the entire point (see TRUST.md).
-TRUSTED = "a58b7bb79ba5845716aa6fee7d54e714ef243c2875f23a617e1ef3247c565525"
-verify_key = VerifyKey(bytes.fromhex(TRUSTED))
+repo = "malaiwah/GLM-5.2-EXL3-FQ-segments"
+revision = "64e582a19a97d87236d98c03da26e1ed2a32be16"
+metadata = Path("publisher-metadata")
+trusted = "a58b7bb79ba5845716aa6fee7d54e714ef243c2875f23a617e1ef3247c565525"
+verify_key = VerifyKey(bytes.fromhex(trusted))
 
 digests = {}
-for line in open("segments/attestations/layer-030.k3.jsonl"):
+for line in (metadata / "attestations/layer-030.k3.jsonl").open():
     if not line.strip():
         continue
     env = json.loads(line)
-    assert env["keyid"] == TRUSTED, f"unexpected signer: {env['keyid']}"
+    assert env["keyid"] == trusted, f"unexpected signer: {env['keyid']}"
     raw = base64.b64decode(env["payload"])
     verify_key.verify(raw, base64.b64decode(env["signature"]))  # raises if bad
     payload = json.loads(raw)
     if payload["fragment"]["file"] == "layer-030.k3.safetensors":
         digests.update(payload["expert_sha256"])
 
-# Local spot-check: seek and read only this expert's [lo, hi) bytes.
-idx = json.load(open("segments/index-k3.json"))["30"]
+idx = json.loads((metadata / "index-k3.json").read_text())["30"]
 lo, hi = idx["experts"]["137"]
 start, size = idx["body_offset"] + lo, hi - lo
-with open(f"segments/{idx['file']}", "rb") as segment:
-    segment.seek(start)
-    blob = segment.read(size)
-assert len(blob) == size
-assert hashlib.sha256(blob).hexdigest() == digests["137"]
-```
-
-For a remote spot-check, request those exact bytes from an immutable
-`resolve/<commit>` URL and require an HTTP range response. This checks both
-that the server honored the bounded request and that only the indexed expert
-span was hashed:
-
-```python
-from urllib.request import Request, urlopen
-
-repo = "malaiwah/GLM-5.2-EXL3-FQ-segments"
-revision = "64e582a19a97d87236d98c03da26e1ed2a32be16"
 end = start + size - 1
+
+# Optional local publisher-tree check: seek, then read exactly size bytes.
+local_file = Path("publisher-release") / idx["file"]
+if local_file.is_file():
+    with local_file.open("rb") as segment:
+        segment.seek(start)
+        blob = segment.read(size)
+    assert len(blob) == size
+    assert hashlib.sha256(blob).hexdigest() == digests["137"]
+
+# Remote publisher check: immutable URL and exact HTTP Range response.
 url = f"https://huggingface.co/{repo}/resolve/{revision}/{idx['file']}"
 request = Request(url, headers={"Range": f"bytes={start}-{end}"})
 with urlopen(request) as response:
@@ -324,8 +335,8 @@ assert hashlib.sha256(blob).hexdigest() == digests["137"]
 
 The attestation `materials` block separately pins the upstream source repo,
 commit, and file sha256. A matching source-layout span can be range-checked
-there too; the immutable artifact request above is the literal bounded
-HTTP-range proof for the published fragment.
+there too; the immutable artifact request above proves the published fragment
+without an accidental whole-file allocation.
 
 ## Prime segments from a community quant (`fq_prime`)
 
@@ -535,7 +546,7 @@ they are not a supported runtime component of this repository.
 | K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
 | `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
 | Mixed-size (true mixed-K) assembly + loader metadata | offline assembly is working and tested; serving an output remains subject to the runtime's TP4-only / EP-and-DP refusal and hardware constraints |
-| Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, use `per_k[K].layer_coverage` (`fq-layer-coverage/1`) or signed index keys for older manifests; `per_k[K].layers` is legacy extrema only |
+| Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, use `per_k[K].layer_coverage.layers` (`fq-layer-coverage/1`) or signed index keys for older manifests; `per_k[K].layers` is legacy extrema only |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | separate experimental research, TP-only and not wired as an end-to-end supported workflow; no live-reallocation claim is made by these tools |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 
