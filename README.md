@@ -65,8 +65,10 @@ Think progressive JPEG, for quants.
   [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments)
   is live. An unattended encode campaign publishes new K2/K5 windows to it,
   so `main` moves: **pin `--revision`/`@<commit>`**, and read layer coverage
-  out of `fq-manifest.json` (`per_k[K].layers`) rather than out of any
-  document that can go stale — including this one.
+  from `fq-manifest.json` `per_k[K].layer_coverage`
+  (`fq-layer-coverage/1`). On an older manifest without that field, use the
+  signed `index-kK.json` layer keys; `per_k[K].layers` is legacy extrema, not
+  sparse-coverage authority.
 - **Schemas: v1, versioned, not frozen** — additive changes only, freezing
   once CI and verification have been exercised against published artifacts
   ([`schemas/`](schemas/)).
@@ -105,7 +107,7 @@ at pinned commit `9297b9f1`) live at
 | Location | Where it came from |
 |---|---|
 | root **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
-| root **K2 / K4 / K5** | fresh `encode-of` tiers from `zai-org/GLM-5.2`; their exact current coverage is `fq-manifest.json` `per_k[K].layers` (the sorted membership list, not a min/max range) |
+| root **K2 / K4 / K5** | fresh `encode-of` tiers from `zai-org/GLM-5.2`; their exact current coverage is `fq-manifest.json` `per_k[K].layer_coverage` (`fq-layer-coverage/1`), or signed `index-kK.json` keys when the field is absent — never legacy `per_k[K].layers` extrema |
 | `sources/willfalco-*` | nested, community-primed families: ranged-read `repack-of` / `derived-from` material over layers 3–10; not the root K4 tier and not a direct `fq_fetch --source` provider |
 
 **Inventory changes.** The artifact-card snapshot at commit `c64a3f60`, measured
@@ -533,7 +535,7 @@ they are not a supported runtime component of this repository.
 | K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
 | `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
 | Mixed-size (true mixed-K) assembly + loader metadata | offline assembly is working and tested; serving an output remains subject to the runtime's TP4-only / EP-and-DP refusal and hardware constraints |
-| Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, `fq-manifest.json` `per_k[K].layers` is the exact membership list |
+| Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, use `per_k[K].layer_coverage` (`fq-layer-coverage/1`) or signed index keys for older manifests; `per_k[K].layers` is legacy extrema only |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | separate experimental research, TP-only and not wired as an end-to-end supported workflow; no live-reallocation claim is made by these tools |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 
