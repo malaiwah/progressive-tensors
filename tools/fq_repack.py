@@ -115,6 +115,11 @@ def _required_tp4_components(tail: dict) -> frozenset[str]:
     else:
         # The published layout's legacy config does not need to spell this out.
         components.add("mcg")
+    unsupported = components - COMP_ORDER.keys()
+    if unsupported:
+        raise SourceLayoutError(
+            "config.json: rank_sliced_tp4 does not support routed component(s) "
+            f"{sorted(unsupported)}")
     return frozenset(components)
 
 
@@ -134,8 +139,8 @@ def _numel(shape: list[int]) -> int:
     return result
 
 
-def _routed_groups(header: dict, *, layer: int, who: str) -> dict:
-    """Group the routed tensors in one shard by expert/projection/rank."""
+def _routed_groups(header: dict, *, layer: int, who: str,
+                   components: frozenset[str]) -> dict:
     groups: dict[int, dict[str, dict[int, dict[str, dict]]]] = {}
     for name, tensor in header.items():
         if name == "__metadata__":
@@ -151,6 +156,9 @@ def _routed_groups(header: dict, *, layer: int, who: str) -> dict:
         if projection not in TP4_PROJECTIONS:
             raise SourceLayoutError(
                 f"{who}: unsupported routed projection {projection!r} in {name!r}")
+        if component not in components:
+            raise SourceLayoutError(
+                f"{who}: unsupported routed component {component!r} in {name!r}")
         groups.setdefault(int(expert), {}).setdefault(projection, {}).setdefault(
             int(rank), {})[component] = tensor
     return groups
@@ -266,7 +274,8 @@ def preflight_source_layout(snapshot: Path, *, layout: str | None,
             header, _ = read_header(shard)
         except (OSError, struct.error, json.JSONDecodeError) as e:
             raise SourceLayoutError(f"{shard}: cannot read source header ({e})") from e
-        groups = _routed_groups(header, layer=layer, who=f"source {shard.name}")
+        groups = _routed_groups(header, layer=layer, who=f"source {shard.name}",
+                                components=components)
         if not groups:
             # Dense/MTP shards are intentionally outside this routed layout.
             continue
@@ -285,7 +294,8 @@ def preflight_source_layout(snapshot: Path, *, layout: str | None,
         if source is None:
             # The source layer was dense/MTP and did not route experts.
             continue
-        segment = _routed_groups(header, layer=layer, who=f"segment layer {layer}")
+        segment = _routed_groups(header, layer=layer, who=f"segment layer {layer}",
+                                 components=components)
         _validate_tp4_groups(segment, experts=set(wanted), components=components,
                              layer=layer, who=f"segment layer {layer}")
         for expert in wanted:

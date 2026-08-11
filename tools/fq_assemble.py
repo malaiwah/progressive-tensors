@@ -173,6 +173,43 @@ def _as_int(value):
     except ValueError:
         return None
 
+def effective_layout(policy: dict, manifest: dict, segments: Path, jobs) -> str | None:
+    """Resolve layout evidence before source bytes or fragment bodies are used."""
+    layouts = {
+        value for value in (policy.get("layout"), manifest.get("layout"))
+        if isinstance(value, str) and value
+    }
+    for _source, layer, bits in jobs:
+        if bits is None:
+            continue
+        for k in set(bits):
+            path = segments / f"layer-{layer:03d}.k{k}.safetensors"
+            if not path.exists():
+                continue
+            try:
+                header, _ = read_header(path)
+            except (OSError, struct.error, json.JSONDecodeError) as e:
+                raise AssemblyError(
+                    f"{path}: cannot read segment layout header ({e})") from e
+            metadata = header.get("__metadata__")
+            if not isinstance(metadata, dict) or metadata.get("layout") is None:
+                continue
+            layout = metadata["layout"]
+            if not isinstance(layout, str) or not layout:
+                raise AssemblyError(f"{path}: segment layout must be a non-empty string")
+            layouts.add(layout)
+    if not layouts:
+        if any(bits is not None for _source, _layer, bits in jobs):
+            raise AssemblyError(
+                "cannot determine routed source layout: add layout to the policy "
+                "or family manifest, or use segments carrying layout metadata")
+        return None
+    # Any rank-sliced evidence must not silently bypass the TP4 preflight while
+    # SegmentVerifier later reports the conflicting source of truth.
+    if "rank_sliced_tp4" in layouts:
+        return "rank_sliced_tp4"
+    return next(iter(layouts))
+
 
 # ------------------------------------------------- strict header validation
 
@@ -1220,8 +1257,7 @@ def main(argv=None) -> int:
         if wanted is not None and layer not in wanted:
             continue
         jobs.append((src_shard, layer, bpe.get(str(layer))))
-
-    layout = policy.get("layout") or manifest.get("layout")
+    layout = effective_layout(policy, manifest, args.segments, jobs)
     source_targets = {
         layer: set(range(len(lb)))
         for _src, layer, lb in jobs

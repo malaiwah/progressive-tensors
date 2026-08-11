@@ -102,6 +102,22 @@ def test_repack_refuses_to_stamp_tp4_on_tp2_source(tmp_path):
     assert not out.exists()
 
 
+def test_repack_rejects_unknown_routed_component_before_output(workspace):
+    snap, out, key = workspace
+    shard = snap / f"model-layer-{LAYERS[0]:03d}.safetensors"
+    header, body_off = fq_repack.read_header(shard)
+    old = next(name for name in header if name.endswith(".mcg"))
+    header[old.removesuffix("mcg") + "unexpected"] = header.pop(old)
+    body = shard.read_bytes()[body_off:]
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
+
+    with pytest.raises(fq_repack.SourceLayoutError, match="unsupported routed component"):
+        run(snap, out, key)
+    assert not out.exists()
+
+
 def test_round_trip_byte_identity(workspace):
     snap, out, key = workspace
     assert run(snap, out, key) == 0

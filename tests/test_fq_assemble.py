@@ -99,6 +99,29 @@ def test_tp2_source_fails_before_segment_hashing_or_output(repacked, monkeypatch
     assert not out.exists()
 
 
+def test_manifestless_segments_still_dispatch_tp4_preflight(repacked):
+    _snap, segments, tmp = repacked
+    (segments / "fq-manifest.json").unlink()
+    source = topology_snapshot(tmp, ranks=2, tp=2)
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "manifestless-tp2"
+    with pytest.raises(fq_assemble.AssemblyError, match="tp must be integer 4"):
+        assemble(segments, source, ppath, out, "--insecure")
+    assert not out.exists()
+
+
+def test_routed_assembly_requires_layout_evidence(repacked):
+    snap, segments, tmp = repacked
+    (segments / "fq-manifest.json").unlink()
+    for segment in segments.glob("layer-*.safetensors"):
+        rewrite_header(segment, lambda header: header["__metadata__"].pop("layout"))
+    ppath = policy_file(tmp, {str(layer): [3] * E for layer in LAYERS})
+    out = tmp / "layout-unknown"
+    with pytest.raises(fq_assemble.AssemblyError, match="cannot determine routed source layout"):
+        assemble(segments, snap, ppath, out, "--insecure")
+    assert not out.exists()
+
+
 def test_missing_tp4_rank_fails_before_output(repacked):
     _snap, segments, tmp = repacked
     source = topology_snapshot(tmp, ranks=3, tp=4)
