@@ -116,7 +116,7 @@ observation was **316.4 decimal GB**. Those are planning observations, not
 coverage authority. Derive the current artifact size at the revision you chose:
 
 ```bash
-python - <<'PY'
+uv run --with 'huggingface_hub>=0.23' python - <<'PY'
 from huggingface_hub import HfApi
 repo, revision = "malaiwah/GLM-5.2-EXL3-FQ-segments", "<immutable-commit>"
 info = HfApi().model_info(repo, revision=revision, files_metadata=True)
@@ -141,28 +141,30 @@ ARTIFACT_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
 ARTIFACT_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
 RECIPE=recipes/glm52-3.0bpw-all-k3.json
 PUBLISHER_SIGNER=a58b7bb79ba58457
+FETCH_KEY=./fq-fetch.key
 
 # Copy the exact policy from the same immutable artifact revision.
-hf download "$ARTIFACT_REPO" "$RECIPE" --revision "$ARTIFACT_REV" \
+uv run hf download "$ARTIFACT_REPO" "$RECIPE" --revision "$ARTIFACT_REV" \
   --local-dir ./artifact
 
 # fq_assemble needs the original non-expert tensors and header layout.
-hf download brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw \
+uv run hf download brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw \
   --revision 9297b9f1d53af5c67cffa01e30cc071a1ff7144b \
   --local-dir ./source-quant
 
 # Inspect bandwidth before fetching; then repeat without --dry-run.
 uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
   --source "$ARTIFACT_REPO@$ARTIFACT_REV" \
-  --trust-signer "$PUBLISHER_SIGNER" --dry-run
+  --trust-signer "$PUBLISHER_SIGNER" --sign-key "$FETCH_KEY" --dry-run
 uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
   --source "$ARTIFACT_REPO@$ARTIFACT_REV" \
-  --trust-signer "$PUBLISHER_SIGNER"
+  --trust-signer "$PUBLISHER_SIGNER" --sign-key "$FETCH_KEY"
 
-# fq_fetch signed these newly materialized subset files. Trust that local
-# derived-from signer for verification and assembly; it is not the publisher.
+# fq_fetch signed these newly materialized subset files with this local,
+# consumer-controlled seed. Derive its public fingerprint from that key — not
+# from the untrusted subset manifest — for verification and assembly.
 LOCAL_SIGNER="$(uv run python -c \
-  'import json; print(json.load(open("segments/fq-manifest.json"))["signer_pubkey"])')"
+  'import sys; from pathlib import Path; sys.path.insert(0, "tools"); from fq_repack import Signer; print(Signer(Path("fq-fetch.key")).pub_hex)')"
 uv run tools/fq_verify.py --identity --segments ./segments \
   --source ./source-quant --trust-signer "$LOCAL_SIGNER" \
   --json id.json --md id.md
@@ -173,14 +175,17 @@ uv run tools/fq_assemble.py --segments ./segments --source ./source-quant \
 ```
 
 Do **not** run `fq_release.py verify --complete` on that range-fetched subset:
-it is not a copied publisher release and has no publisher release envelope.
-To verify a publisher release, download its entire signed file set into a
-separate empty directory, then pin the publisher signer:
+it has no copied publisher release envelope. To verify a publisher release,
+use the **release commit containing its `fq-release.json`**, not the
+range-fetched subset or moving `main`. Download its entire signed file set into
+a separate empty directory, then pin the publisher signer:
 
 ```bash
-hf download "$ARTIFACT_REPO" --revision "$ARTIFACT_REV" \
+PUBLISHER_RELEASE_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
+uv run hf download "$ARTIFACT_REPO" --revision "$PUBLISHER_RELEASE_REV" \
   --local-dir ./publisher-release
-uv run tools/fq_release.py verify --dir ./publisher-release --complete \
+uv run tools/fq_release.py verify --dir ./publisher-release \
+  --release ./publisher-release/fq-release.json --complete \
   --trust-signer "$PUBLISHER_SIGNER"
 ```
 
@@ -270,7 +275,7 @@ must come from the same immutable publisher revision as the `resolve` URL:
 ```bash
 PUBLISHER_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
 PUBLISHER_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
-hf download "$PUBLISHER_REPO" index-k3.json \
+uv run hf download "$PUBLISHER_REPO" index-k3.json \
   attestations/layer-030.k3.jsonl --revision "$PUBLISHER_REV" \
   --local-dir ./publisher-metadata
 ```
