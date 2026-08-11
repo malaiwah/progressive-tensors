@@ -161,7 +161,7 @@ uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
 
 # fq_fetch signed these newly materialized subset files. Trust that local
 # derived-from signer for verification and assembly; it is not the publisher.
-LOCAL_SIGNER="$(python -c \
+LOCAL_SIGNER="$(uv run python -c \
   'import json; print(json.load(open("segments/fq-manifest.json"))["signer_pubkey"])')"
 uv run tools/fq_verify.py --identity --segments ./segments \
   --source ./source-quant --trust-signer "$LOCAL_SIGNER" \
