@@ -185,6 +185,29 @@ def hub_url(repo: str, revision: str, filename: str) -> str:
         return f"{DEFAULT_ENDPOINT}/{repo}/resolve/{rev}/{filename}"
 
 
+def hub_commit_parent(repo: str, revision: str) -> str | None:
+    """Return an immutable Hub commit's direct parent, if the client exposes it.
+
+    `fq_release publish` signs the HEAD it atomically extends; the returned
+    publish commit cannot name itself inside its own signed bytes.  Confirming
+    that the selected immutable commit directly descends from that signed
+    parent is the authenticated relation that binds a consumer to the
+    published release.
+    """
+    try:  # pragma: no cover - hub API availability is environment-dependent
+        from huggingface_hub import HfApi
+
+        commits = list(HfApi().list_repo_commits(
+            repo_id=repo, repo_type="model", revision=revision))
+    except Exception:  # noqa: BLE001 - callers retain explicit strict mode
+        return None
+    if len(commits) < 2:
+        return None
+    current = getattr(commits[0], "commit_id", None)
+    parent = getattr(commits[1], "commit_id", None)
+    return str(parent) if current == revision and parent else None
+
+
 def http_get_range(url: str, start: int, end: int, timeout: float = 600.0):
     """GET bytes [start, end) of url -> (data, meta).  Module-level so tests
     can monkeypatch every byte of remote IO."""
@@ -295,6 +318,8 @@ class Source:
         self._header_auth: dict[str, dict] = {}
 1:         self._verified_pieces: dict[tuple[str, int, int], Path] = {}
         self._release_coverage: dict[str, bool] = {}
+        self._published_release_parent_checked = False
+        self._published_release_parent: str | None = None
         self.require_release_coverage = False
 2:         prov["release_covered"] = covered
         header, body_offset = self._headers[name]
@@ -437,11 +462,19 @@ class Source:
         selected = {self.revision}
         if self.resolved_commit:
             selected.add(self.resolved_commit)
-        return any(
-            value and str(value) in selected
-            for value in (self.release.get("revision"),
-                          self.release.get("parent_revision"),
-                          self.release.get("release")))
+        if any(value and str(value) in selected
+               for value in (self.release.get("revision"),
+                             self.release.get("parent_revision"),
+                             self.release.get("release"))):
+            return True
+        signed_parent = self.release.get("parent_revision")
+        if not signed_parent:
+            return False
+        if not self._published_release_parent_checked:
+            self._published_release_parent_checked = True
+            self._published_release_parent = hub_commit_parent(
+                self.repo, self.resolved_commit or self.revision)
+        return self._published_release_parent == signed_parent
 
     def _uncovered_release_name(self, name: str, *, kind: str) -> bool:
         self._release_coverage[name] = False
@@ -586,11 +619,16 @@ class Source:
         fragment_covered = self.cross_check_fragment(
             segment_file, merged["fragment"] or {})
         merged["release_covered"] = bool(release_covered and fragment_covered)
+        release_claim = (
+            "release signature establishes document integrity"
+            if self.release else
+            "no release signature; inner attestations establish all claims")
         print(f"  {self}: {name}: verified {merged['inner_signatures_verified']} "
               f"inner attestation signature(s), rejected "
-              f"{merged['inner_signatures_rejected']}; release signature establishes "
-              f"document integrity (release_covered:{str(merged['release_covered']).lower()})",
+              f"{merged['inner_signatures_rejected']}; {release_claim} "
+              f"(release_covered:{str(merged['release_covered']).lower()})",
               flush=True)
+        self._attestations[cache_key] = merged
         return merged
 
     # -- segment headers ---------------------------------------------------
@@ -1497,6 +1535,8 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                 "signed_release_manifest": bool(prov.get("release_manifest")),
                 "release_covered": bool(prov.get("release_covered")),
             }
+    release_claim = ("listed document integrity" if any(s.release for s in sources)
+                     else "none (no verified release)")
     report = {
         "schema": REPORT_SCHEMA,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1505,7 +1545,7 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                   "key_id": verifier.key_id,
                   "signatures_verified": verifier.checked,
                   "release_aggregation": "mandatory-inner-attestation-signer",
-                  "release_signature_establishes": "listed document integrity",
+                  "release_signature_establishes": release_claim,
                   "inner_signature_establishes": "fragment and expert digests",
                   "local_signer": local_signer,
                   "plan_authenticated": all(

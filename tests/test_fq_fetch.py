@@ -778,6 +778,8 @@ def test_attestation_signature_output_counts_only_verified_lines(
     assert "verified 1 inner attestation signature(s), rejected 1" in (
         capsys.readouterr().out)
 
+
+
 def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
     served["mount"]("test/pub", repo)
@@ -788,6 +790,62 @@ def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsy
     assert "no source carries it" in capsys.readouterr().err
     assert set(json.loads((out / "index-k3.json").read_text())
                [str(LAYERS[0])]["experts"]) == {"0", "2", "3"}
+
+def test_published_commit_is_strict_via_signed_parent_relation(
+        tmp_path, served, monkeypatch, capsys):
+    """The commit returned by atomic publish is bound through its signed parent."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "release-label",
+        "--repo", "test/pub", "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["parent_revision"] = "parent-before-publish"
+    payload["files"].pop(f"layer-{LAYERS[0]:03d}.k3.safetensors")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    monkeypatch.setattr(
+        fq_fetch, "hub_commit_parent",
+        lambda repo_id, revision: "parent-before-publish")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out,
+         "--source", "test/pub@published-commit",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    captured = capsys.readouterr()
+    assert "strict coverage" in captured.out
+    assert "not listed in the signed release manifest" in captured.err
+
+
+def test_attestation_cache_prevents_repeated_inner_verification(
+        tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["signatures_verified"] == 1
+
+
+def test_no_release_report_does_not_claim_release_integrity(tmp_path, served,
+                                                            capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["release_signature_establishes"] == (
+        "none (no verified release)")
+    assert "no release signature; inner attestations establish all claims" in (
+        capsys.readouterr().out)
 
 
 def test_coalescing_merges_adjacent_experts_into_one_request(tmp_path, served):
