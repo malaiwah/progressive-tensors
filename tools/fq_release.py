@@ -9,20 +9,23 @@ from that source shard".  Nothing says *which set of fragments is the
 release*.  Fragments can be added, dropped, or rolled back to an older signed
 version and every individual signature still verifies.
 
-`fq-release/1` fixes the granularity: ONE ed25519 signature over a document
-that names the release and lists sha256 + size for every file in it,
+`fq-release/1` fixes the set granularity: ONE ed25519 signature over a
+document that names the release and lists sha256 + size for every file in it,
 including `index-k*.json`, `fq-manifest.json` and every
-`attestations/*.jsonl`.  A consumer then:
+`attestations/*.jsonl`.  A consumer:
 
-    1. verifies one signature against a fingerprint pinned out of band
-       (keys/FINGERPRINTS in the git repo — see ../TRUST.md),
-    2. hashes the files it actually downloaded and compares,
+    1. verifies the release signature against a fingerprint pinned out of
+       band (keys/FINGERPRINTS in the git repo — see ../TRUST.md),
+    2. hashes each listed file it consumes and compares it to the release,
+    3. applies that consumer's normal signer policy to every inner
+       attestation line it consumes.
 
-and is done.  Because the attestation files are themselves covered by that
-one signature, their per-expert digests become trusted data — a range-fetch
-consumer (fq_fetch) can hash a single expert's bytes against the attestation
-without checking any further signatures.  The release manifest turns "N
-signatures, unknown completeness" into "1 signature, explicit set".
+The release signature establishes the immutable release set and the bytes of
+its listed documents.  It deliberately does **not** delegate authority over
+inner attestation claims: an aggregation consumer must explicitly implement
+and expose a separate delegation policy.  `fq_fetch` uses the conservative
+model above, so its configured signer establishes expert and fragment digest
+claims while the release signer establishes document integrity and coverage.
 
     # publisher, in the segment tree
     fq_release.py build --dir ~/fq-segments/GLM-5.2-EXL3-FQ \\

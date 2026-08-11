@@ -30,9 +30,11 @@ Trust.  Every attestation used is signature-checked against a fingerprint
 pinned out of band (`--trust-signer`, resolved through keys/FINGERPRINTS in
 the git repo — see ../TRUST.md), and every fetched expert's bytes are hashed
 against the attested digest before the file is finalized.  When the source
-publishes a signed `fq-release/1` manifest, one signature covers the index
-and attestation files too, fq_fetch checks their digests against it, and it
-refuses when the release and the attestation disagree about a fragment.
+publishes a signed `fq-release/1` manifest, its signature binds the listed
+file bytes (manifest, index, and attestation documents) to one release; it
+does not delegate authority over the inner attestation signatures.  fq_fetch
+therefore still verifies every consumed attestation line under the configured
+signer policy, and refuses when a listed release entry disagrees with it.
 
 The plan itself is authenticated too (peer review, finding P1-4c).  Tensor
 names, dtypes, shapes and offsets come from the remote segment's
@@ -291,7 +293,12 @@ class Source:
         self._header_bytes: dict[str, bytes] = {}
         self._attestations: dict[str, dict] = {}
         self._header_auth: dict[str, dict] = {}
-        self._verified_pieces: dict[tuple[str, int, int], Path] = {}
+1:         self._verified_pieces: dict[tuple[str, int, int], Path] = {}
+        self._release_coverage: dict[str, bool] = {}
+        self.require_release_coverage = False
+2:         prov["release_covered"] = covered
+        header, body_offset = self._headers[name]
+        self._write_header_cache(name, header, body_offset, prov)
         self.release: dict | None = None
         self.manifest: dict = {}
 
@@ -339,8 +346,13 @@ class Source:
 
     # -- small documents ---------------------------------------------------
 
-    def small_file(self, name: str) -> bytes | None:
-        """Fetch (and cache) a whole small file.  None when absent."""
+    def small_file(self, name: str, *, allow_404: bool = False) -> bytes | None:
+        """Fetch and cache a small file.
+
+        Only callers that can safely treat a *definitive* 404 as absence pass
+        ``allow_404``.  Authentication, rate-limit, server, and transport
+        failures are never downgraded to "not published".
+        """
         if name in self._small:
             return self._small[name]
         p = self.cache / name.replace("/", "__")
@@ -349,11 +361,10 @@ class Source:
         else:
             try:
                 data, meta = self.t.get_full(self.url(name))
-            except Exception as e:  # noqa: BLE001 - optional documents
-                code = getattr(e, "code", None)
-                if code not in (401, 403, 404) and not isinstance(e, urllib.error.HTTPError):
+            except urllib.error.HTTPError as e:
+                if e.code != 404 or not allow_404:
                     raise
-                print(f"  {self}: {name} unavailable ({code or e})", flush=True)
+                print(f"  {self}: {name} absent (HTTP 404)", flush=True)
                 self._small[name] = None
                 return None
             self.resolved_commit = self.resolved_commit or meta.get("commit")
@@ -362,12 +373,12 @@ class Source:
         self._small[name] = data
         return data
 
-    def small_json(self, name: str):
-        data = self.small_file(name)
+    def small_json(self, name: str, *, allow_404: bool = False):
+        data = self.small_file(name, allow_404=allow_404)
         return json.loads(data) if data else None
 
     def load_manifest(self) -> dict:
-        self.manifest = self.small_json("fq-manifest.json") or {}
+        self.manifest = self.small_json("fq-manifest.json", allow_404=True) or {}
         return self.manifest
 
     def manifest_sha256(self) -> str | None:
@@ -378,39 +389,76 @@ class Source:
     def load_release(self, verifier: fq_trust.Verifier) -> dict | None:
         """Fetch and verify fq-release.json when the source publishes one.
 
-        Returns the verified payload, or None.  A present-but-unverifiable
-        release manifest is fatal: it is the strongest claim the repo makes,
-        and a broken one means the repo is not what it says it is.
+        A release is optional only after a definitive HTTP 404.  A present,
+        unavailable, or unverifiable release is fatal: it is the strongest
+        claim the repo makes, and silently falling back would weaken trust.
         """
-        raw = self.small_file("fq-release.json")
+        try:
+            raw = self.small_file("fq-release.json", allow_404=True)
+        except Exception as e:  # noqa: BLE001 - preserve transport context
+            raise TrustError(
+                f"{self}: could not retrieve fq-release.json: {e}") from e
         if raw is None:
             return None
         import fq_release
 
         self.release = fq_release.verify_release(
             json.loads(raw), verifier, where=f"{self}:fq-release.json")
+        raw_manifest = self._small.get("fq-manifest.json")
+        if raw_manifest is None:
+            raise TrustError(
+                f"{self}: fq-release.json is present but fq-manifest.json is "
+                "absent — refusing an incomplete release")
+        self.check_against_release("fq-manifest.json", raw_manifest)
+        strict = "strict coverage" if self.release_coverage_required() else (
+            "moving revision; uncovered additions require inner attestations")
         print(f"  {self}: fq-release/1 verified — "
-              f"{self.release['counts']['files']} files under one signature",
+              f"{self.release['counts']['files']} files under one signature "
+              f"({strict}); inner attestation signatures remain required",
               flush=True)
         return self.release
 
     def release_entry(self, name: str) -> dict | None:
         return ((self.release or {}).get("files") or {}).get(name)
 
+    def release_coverage_required(self) -> bool:
+        """Whether this source must be wholly described by its release.
+
+        A signed release that explicitly names the selected source revision is
+        authoritative for that revision.  Moving revisions may legitimately
+        advance beyond an inherited release, unless the caller requests the
+        stricter deployment mode.
+        """
+        return bool(self.release and (
+            self.require_release_coverage
+            or self.release.get("revision") == self.revision))
+
+    def _uncovered_release_name(self, name: str, *, kind: str) -> bool:
+        self._release_coverage[name] = False
+        if self.release_coverage_required():
+            raise TrustError(
+                f"{self}: {name} is not listed in the signed release manifest "
+                f"while {kind} coverage is required")
+        print(f"  warning: {self}: signed release does not cover {name}; "
+              "using individually verified moving-revision input "
+              "(release_covered:false)", flush=True)
+        return False
+
+    def release_covered(self, name: str) -> bool:
+        return self._release_coverage.get(name, False)
+
     def cross_check_fragment(self, name: str, frag: dict) -> bool:
         """The signed release and the signed attestation must agree.
 
-        Both are signatures over the same publisher's claims about the same
-        file; when they disagree, one of them is a rollback or a swap, and
-        preferring either would be a guess.  Returns True when the release
-        actually covered this fragment.
+        A release entry is a binding claim, so a digest/size disagreement is
+        always fatal.  An unlisted fragment on a moving revision instead falls
+        back to its independently signature-checked attestation unless strict
+        release coverage was selected.
         """
         want = self.release_entry(name)
         if not want:
             if self.release:
-                raise TrustError(
-                    f"{self}: {name} is not listed in the signed release "
-                    f"manifest — refusing to fetch an uncovered fragment")
+                return self._uncovered_release_name(name, kind="fragment")
             return False
         got = frag.get("sha256")
         if got and got != want["sha256"]:
@@ -418,31 +466,35 @@ class Source:
                 f"{self}: the signed attestation says {name} is "
                 f"{got[:16]}… but the signed release says "
                 f"{want['sha256'][:16]}… — refusing while the publisher's "
-                f"own signatures disagree")
+                "own signatures disagree")
         if frag.get("size") and want.get("size") and frag["size"] != want["size"]:
             raise TrustError(
                 f"{self}: attested size {frag['size']} != release size "
                 f"{want['size']} for {name}")
+        self._release_coverage[name] = True
         return True
 
-    def check_against_release(self, name: str, data: bytes) -> None:
-        """Digest-check a small document against the signed release list."""
+    def check_against_release(self, name: str, data: bytes) -> bool:
+        """Digest/size-check a small document against the signed release list."""
         if not self.release:
-            return
+            return False
         want = self.release["files"].get(name)
         if want is None:
-            raise TrustError(
-                f"{self}: {name} is not listed in the signed release manifest "
-                f"— refusing to use an uncovered document")
+            return self._uncovered_release_name(name, kind="document")
         got = hashlib.sha256(data).hexdigest()
         if got != want["sha256"]:
             raise TrustError(
                 f"{self}: {name} sha256 {got[:16]}… does not match the signed "
                 f"release ({want['sha256'][:16]}…)")
-
+        if len(data) != want.get("size", len(data)):
+            raise TrustError(
+                f"{self}: {name} size {len(data)} does not match the signed "
+                f"release ({want['size']})")
+        self._release_coverage[name] = True
+        return True
     def index(self, k: int) -> dict | None:
         name = self.index_name(k)
-        raw = self.small_file(name)
+        raw = self.small_file(name, allow_404=True)
         if raw is None:
             return None
         self.check_against_release(name, raw)
@@ -452,31 +504,31 @@ class Source:
                     segment_file: str) -> dict:
         """Verified, merged attestation payload for one segment file.
 
-        The file is JSON Lines and every line is checked on its own: a line
-        this consumer cannot trust (a third party's countersignature, an
-        older key, a corrupted line) is skipped with its reason recorded,
-        and only lines a trusted key signed for THIS fragment contribute.
-        Raises TrustError when the file is missing or when nothing in it
-        verifies — a fetch that cannot be checked does not happen.
+        A release signature binds this JSONL file's bytes but intentionally
+        does not replace its signer policy: every nonblank inner line is
+        independently checked, and only a configured trusted signer can
+        establish the fragment and per-expert digest claims.
         """
         cache_key = f"{layer}.{k}"
         if cache_key in self._attestations:
             return self._attestations[cache_key]
         name = self.attestation_name(layer, k)
-        raw = self.small_file(name)
+        raw = self.small_file(name, allow_404=True)
         if raw is None:
             raise TrustError(
                 f"{self}: no {name} — cannot verify fetched bytes for layer "
                 f"{layer} K{k}; refusing (use --insecure-skip-signatures only "
                 f"for offline fixtures, and even then attestations carry the "
-                f"per-expert digests)")
-        self.check_against_release(name, raw)
+                "per-expert digests)")
+        release_covered = self.check_against_release(name, raw)
         merged: dict = {"expert_sha256": {}, "fragment": None, "lines": 0,
-                        "rejected_lines": []}
+                        "rejected_lines": [], "release_covered": release_covered,
+                        "inner_signatures_checked": 0}
         for n, line in enumerate(raw.decode().splitlines(), 1):
             if not line.strip():
                 continue
             try:
+                merged["inner_signatures_checked"] += 1
                 payload = verifier.verify_envelope(
                     json.loads(line), where=f"{self}:{name}:{n}")
             except (TrustError, json.JSONDecodeError, TypeError) as e:
@@ -498,8 +550,13 @@ class Source:
             raise TrustError(
                 f"{self}: {name} has no trusted attestation line for "
                 f"{segment_file} ({detail})")
-        self.cross_check_fragment(segment_file, merged["fragment"] or {})
-        self._attestations[cache_key] = merged
+        fragment_covered = self.cross_check_fragment(
+            segment_file, merged["fragment"] or {})
+        merged["release_covered"] = bool(release_covered and fragment_covered)
+        print(f"  {self}: {name}: verified {merged['inner_signatures_checked']} "
+              "inner attestation signature(s); release signature establishes "
+              f"document integrity (release_covered:{str(merged['release_covered']).lower()})",
+              flush=True)
         return merged
 
     # -- segment headers ---------------------------------------------------
@@ -614,11 +671,12 @@ class Source:
         """
         name = self.segment_name(layer, k)
         frag = att.get("fragment") or {}
-        covered = bool(self.release_entry(name))
+        covered = self.release_covered(name)
         if mode == HEADER_UNSAFE:
             header, body_offset = self.segment_header(layer, k)
             prov = {"method": AUTH_NONE, "authenticated": False,
                     "body_offset": body_offset, "release_manifest": covered,
+                    "release_covered": covered,
                     "note": "the plan came from an unverified ranged read"}
             self._header_auth[name] = prov
             return prov
@@ -645,6 +703,10 @@ class Source:
         # a later process must not observe a half-recorded proof that lacks
         # the release coverage used in derived provenance.
         prov["release_manifest"] = covered
+1:         self._verified_pieces: dict[tuple[str, int, int], Path] = {}
+        self._release_coverage: dict[str, bool] = {}
+        self.require_release_coverage = False
+2:         prov["release_covered"] = covered
         header, body_offset = self._headers[name]
         self._write_header_cache(name, header, body_offset, prov)
         return prov
@@ -1347,7 +1409,9 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         if entry:
             per_k[plan.k][str(plan.layer)] = entry
         provenance.setdefault(str(plan.layer), {})[f"k{plan.k}"] = {
-            str(p.expert): {"source": str(p.source), "sha256": p.sha256}
+            str(p.expert): {"source": str(p.source), "sha256": p.sha256,
+                            "release_covered": p.source.release_covered(
+                                Source.segment_name(plan.layer, plan.k))}
             for p in plan.pieces}
     index_names = {}
     for k, index in per_k.items():
@@ -1397,6 +1461,7 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
                 "authenticated": bool(prov.get("authenticated")),
                 "header_sha256": prov.get("header_sha256"),
                 "signed_release_manifest": bool(prov.get("release_manifest")),
+                "release_covered": bool(prov.get("release_covered")),
             }
     report = {
         "schema": REPORT_SCHEMA,
@@ -1405,6 +1470,9 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "trust": {"rung": verifier.rung, "signer": verifier.fingerprint,
                   "key_id": verifier.key_id,
                   "signatures_verified": verifier.checked,
+                  "release_aggregation": "mandatory-inner-attestation-signer",
+                  "release_signature_establishes": "listed document integrity",
+                  "inner_signature_establishes": "fragment and expert digests",
                   "local_signer": local_signer,
                   "plan_authenticated": all(
                       h["authenticated"]
@@ -1413,7 +1481,10 @@ def write_outputs(out: Path, plans: list[FilePlan], entries: dict,
         "header_authentication": headers,
         "sources": [{"repo": s.repo, "revision": s.revision,
                      "pinned": s.pinned, "resolved_commit": s.resolved_commit,
-                     "release_manifest": bool(s.release)} for s in sources],
+                     "release_manifest": bool(s.release),
+                     "release_coverage_required": s.release_coverage_required(),
+                     "release_coverage": dict(sorted(s._release_coverage.items()))}
+                    for s in sources],
         "bytes": stats,
         "experts": provenance,
     }
@@ -1483,6 +1554,7 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
             "header_authenticated": bool(prov.get("authenticated")),
             "header_sha256": prov.get("header_sha256"),
             "signed_release_manifest": bool(prov.get("release_manifest")),
+            "release_covered": bool(prov.get("release_covered")),
         })
     payload = {
         "schema": "fq-attestation/1",
@@ -1781,6 +1853,11 @@ def main(argv=None) -> int:
                         "as such in the emitted attestation.")
     p.add_argument("--json", type=Path, default=None,
                    help="write the plan/result summary here as well")
+    p.add_argument("--require-release-coverage", action="store_true",
+                   help="refuse any selected manifest, index, attestation, or "
+                   "fragment not listed by a verified fq-release/1 envelope; "
+                   "required automatically when the selected revision is the "
+                   "release's signed revision")
     fq_trust.add_trust_arguments(p)
     args = p.parse_args(argv)
 
@@ -1792,6 +1869,8 @@ def main(argv=None) -> int:
     transport = Transport(pace=args.pace, retries=args.retries)
     sources = [Source.parse(s, transport, cache_root, order=i)
                for i, s in enumerate(args.source)]
+    for s in sources:
+        s.require_release_coverage = args.require_release_coverage
     for s in sources:
         if not s.pinned:
             print(f"warning: {s.repo} is not pinned to a revision — following "
