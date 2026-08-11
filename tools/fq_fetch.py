@@ -409,7 +409,7 @@ class Source:
             raise TrustError(
                 f"{self}: fq-release.json is present but fq-manifest.json is "
                 "absent — refusing an incomplete release")
-        self.check_against_release("fq-manifest.json", raw_manifest)
+        self.check_manifest_against_release(raw_manifest)
         strict = "strict coverage" if self.release_coverage_required() else (
             "moving revision; uncovered additions require inner attestations")
         print(f"  {self}: fq-release/1 verified — "
@@ -424,14 +424,24 @@ class Source:
     def release_coverage_required(self) -> bool:
         """Whether this source must be wholly described by its release.
 
-        A signed release that explicitly names the selected source revision is
-        authoritative for that revision.  Moving revisions may legitimately
-        advance beyond an inherited release, unless the caller requests the
-        stricter deployment mode.
+        A release is authoritative only when the selected source identifies
+        that signed release by its explicit revision, publisher parent commit,
+        or release tag/identifier.  This covers the forms emitted by both
+        ``build`` and ``publish`` without mistaking a stale inherited release
+        on a moving revision for HEAD coverage.
         """
-        return bool(self.release and (
-            self.require_release_coverage
-            or self.release.get("revision") == self.revision))
+        if not self.release:
+            return False
+        if self.require_release_coverage:
+            return True
+        selected = {self.revision}
+        if self.resolved_commit:
+            selected.add(self.resolved_commit)
+        return any(
+            value and str(value) in selected
+            for value in (self.release.get("revision"),
+                          self.release.get("parent_revision"),
+                          self.release.get("release")))
 
     def _uncovered_release_name(self, name: str, *, kind: str) -> bool:
         self._release_coverage[name] = False
@@ -492,6 +502,27 @@ class Source:
                 f"release ({want['size']})")
         self._release_coverage[name] = True
         return True
+
+    def check_manifest_against_release(self, data: bytes) -> bool:
+        """Bind a current release's manifest; report stale moving manifests.
+
+        Incremental publishers rebuild ``fq-manifest.json`` while a moving
+        revision may still inherit an older release envelope.  A manifest
+        mismatch is fatal when that envelope identifies the selected revision
+        (or strict coverage was requested); otherwise it is an explicit,
+        uncovered moving-revision input and normal individual attestation
+        checks remain mandatory.
+        """
+        if self.release_coverage_required():
+            return self.check_against_release("fq-manifest.json", data)
+        try:
+            return self.check_against_release("fq-manifest.json", data)
+        except TrustError:
+            self._release_coverage["fq-manifest.json"] = False
+            print(f"  warning: {self}: signed release does not cover the current "
+                  "fq-manifest.json; using moving-revision manifest "
+                  "(release_covered:false)", flush=True)
+            return False
     def index(self, k: int) -> dict | None:
         name = self.index_name(k)
         raw = self.small_file(name, allow_404=True)
@@ -523,17 +554,19 @@ class Source:
         release_covered = self.check_against_release(name, raw)
         merged: dict = {"expert_sha256": {}, "fragment": None, "lines": 0,
                         "rejected_lines": [], "release_covered": release_covered,
-                        "inner_signatures_checked": 0}
+                        "inner_signatures_verified": 0,
+                        "inner_signatures_rejected": 0}
         for n, line in enumerate(raw.decode().splitlines(), 1):
             if not line.strip():
                 continue
             try:
-                merged["inner_signatures_checked"] += 1
                 payload = verifier.verify_envelope(
                     json.loads(line), where=f"{self}:{name}:{n}")
             except (TrustError, json.JSONDecodeError, TypeError) as e:
+                merged["inner_signatures_rejected"] += 1
                 merged["rejected_lines"].append(f"line {n}: {e}")
                 continue
+            merged["inner_signatures_verified"] += 1
             frag = payload.get("fragment") or {}
             if frag.get("file") != segment_file:
                 continue
@@ -553,8 +586,9 @@ class Source:
         fragment_covered = self.cross_check_fragment(
             segment_file, merged["fragment"] or {})
         merged["release_covered"] = bool(release_covered and fragment_covered)
-        print(f"  {self}: {name}: verified {merged['inner_signatures_checked']} "
-              "inner attestation signature(s); release signature establishes "
+        print(f"  {self}: {name}: verified {merged['inner_signatures_verified']} "
+              f"inner attestation signature(s), rejected "
+              f"{merged['inner_signatures_rejected']}; release signature establishes "
               f"document integrity (release_covered:{str(merged['release_covered']).lower()})",
               flush=True)
         return merged

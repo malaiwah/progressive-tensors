@@ -665,12 +665,16 @@ def test_release_binds_the_cached_manifest_before_planning(tmp_path, served,
 
 
 def _add_unreleased_k4(tmp_path: Path, repo: Path, key: Path) -> None:
-    """Add a later, individually attested K4 without changing the old release."""
+    """Add a later, individually attested K4 and rebuild its moving manifest."""
     later, _, _ = build_source(tmp_path, "later", ks=(4,), key=key)
     shutil.copy2(later / "index-k4.json", repo / "index-k4.json")
     shutil.copy2(later / f"layer-{LAYERS[0]:03d}.k4.safetensors",
                  repo / f"layer-{LAYERS[0]:03d}.k4.safetensors")
     shutil.copy2(_att_path(later, LAYERS[0], 4), _att_path(repo, LAYERS[0], 4))
+    manifest = json.loads((repo / "fq-manifest.json").read_text())
+    manifest["k_variants"] = sorted({*manifest["k_variants"], 4})
+    manifest["tensor_indexes"]["4"] = "index-k4.json"
+    (repo / "fq-manifest.json").write_text(json.dumps(manifest, indent=1))
 
 
 def test_stale_release_allows_new_individually_attested_object_by_default(
@@ -710,7 +714,7 @@ def test_require_release_coverage_rejects_stale_unreleased_object_before_payload
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
          "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
          "--require-release-coverage"], expect=1)
-    assert "index-k4.json is not listed" in capsys.readouterr().err
+    assert "fq-manifest.json sha256" in capsys.readouterr().err
     assert not served["ranges"]
 
 
@@ -733,6 +737,46 @@ def test_release_does_not_delegate_inner_attestation_signer(tmp_path, served,
         expect=1)
     err = capsys.readouterr().err
     assert "no trusted attestation line" in err
+
+
+def test_release_tag_selection_enables_strict_coverage(tmp_path, served, capsys):
+    """A publish-style release without `revision` is strict when its tag is selected."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    tag = "release-2026-08-11"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", tag,
+        "--repo", "test/pub", "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["files"].pop(f"layer-{LAYERS[0]:03d}.k3.safetensors")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{tag}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    captured = capsys.readouterr()
+    assert "strict coverage" in captured.out
+    assert "not listed in the signed release manifest" in captured.err
+
+
+def test_attestation_signature_output_counts_only_verified_lines(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    att = _att_path(repo, LAYERS[0], 3)
+    att.write_text(att.read_text() + json.dumps({"keyid": "not-a-key"}) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--dry-run"])
+    assert "verified 1 inner attestation signature(s), rejected 1" in (
+        capsys.readouterr().out)
 
 def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
