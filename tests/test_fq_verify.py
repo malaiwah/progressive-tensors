@@ -663,6 +663,10 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
     copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
     upstream = json.loads(base64.b64decode(
         json.loads(copied.read_text().splitlines()[0])["payload"]))
+    # A second publisher parent can name a different source shard than the
+    # subset header's first-source metadata; its signed parent record remains
+    # independently bound by fragment and expert digests.
+    upstream["materials"]["file"] = "other-source.safetensors"
     digests = list(upstream["expert_sha256"].items())
     upstream["expert_sha256"] = dict(digests[:len(digests) // 2])
     other = dict(upstream)

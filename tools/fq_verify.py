@@ -102,35 +102,53 @@ import fq_trust  # noqa: E402
 from fq_trust import TrustError  # noqa: E402
 
 
-_ATTESTATION_VALIDATOR = None
-
-
-def attestation_validator():
-    """Load the shipped fq-attestation/1 contract for signed payload checks."""
-    global _ATTESTATION_VALIDATOR
-    if _ATTESTATION_VALIDATOR is None:
-        try:
-            import jsonschema
-        except ImportError as e:  # pragma: no cover - packaging failure
-            raise TrustError(
-                "fq_verify requires jsonschema to validate signed "
-                "fq-attestation/1 payloads") from e
-        schema_path = (Path(__file__).resolve().parent.parent / "schemas" /
-                       "fq-attestation-1.schema.json")
-        schema = json.loads(schema_path.read_text())
-        schema["$ref"] = "#/$defs/payload"
-        _ATTESTATION_VALIDATOR = jsonschema.Draft202012Validator(schema)
-    return _ATTESTATION_VALIDATOR
-
-
 def validate_attestation_payload(payload: dict, *, where: str) -> None:
-    """Fail closed unless a verified payload conforms to fq-attestation/1."""
-    errors = sorted(attestation_validator().iter_errors(payload),
-                    key=lambda e: list(e.absolute_path))
-    if errors:
-        path = ".".join(str(p) for p in errors[0].absolute_path) or "payload"
-        raise TrustError(f"{where}: invalid fq-attestation/1 {path}: "
-                         f"{errors[0].message}")
+    """Validate the fq-attestation/1 payload contract without a dev dependency."""
+    def fail(field: str) -> None:
+        raise TrustError(f"{where}: invalid fq-attestation/1 {field}")
+
+    if not isinstance(payload, dict):
+        fail("payload")
+    if payload.get("schema") != "fq-attestation/1":
+        fail("schema")
+    if payload.get("predicate") not in {
+            "repack-of", "derived-from", "encode-of", "equivalence-of"}:
+        fail("predicate")
+    fragment = payload.get("fragment")
+    if (not isinstance(fragment, dict) or
+            not isinstance(fragment.get("file"), str) or
+            not fragment["file"] or not is_sha256(fragment.get("sha256")) or
+            ("size" in fragment and
+             (not isinstance(fragment["size"], int) or fragment["size"] < 1))):
+        fail("fragment")
+    experts = payload.get("expert_sha256")
+    if (not isinstance(experts, dict) or not experts or
+            any(not isinstance(eid, str) or not eid.isdigit() or
+                not is_sha256(digest) for eid, digest in experts.items())):
+        fail("expert_sha256")
+    created = payload.get("created_utc")
+    if (not isinstance(created, str) or len(created) != 20 or
+            created[4:5] != "-" or created[7:8] != "-" or
+            created[10:11] != "T" or created[13:14] != ":" or
+            created[16:17] != ":" or created[19:20] != "Z" or
+            not (created[:4] + created[5:7] + created[8:10] +
+                 created[11:13] + created[14:16] + created[17:19]).isdigit()):
+        fail("created_utc")
+    for field in ("parents", "dependencies"):
+        values = payload.get(field)
+        if values is not None and (
+                not isinstance(values, list) or any(
+                    not isinstance(value, dict) or
+                    not isinstance(value.get("file"), str) or
+                    not value["file"] or not is_sha256(value.get("sha256"))
+                    for value in values)):
+            fail(field)
+    derivation = payload.get("derivation")
+    if derivation is not None and (
+            not isinstance(derivation, dict) or
+            not isinstance(derivation.get("rule"), str) or
+            not derivation["rule"]):
+        fail("derivation")
 
 
 
@@ -1029,8 +1047,7 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 terminal_source_ok = (
                     parent_record.get("role") == "source_fragment" and
                     (upstream_payload or {}).get("predicate") == "repack-of" and
-                    isinstance(material_file, str) and bool(material_file) and
-                    meta.get("source_file") == material_file)
+                    isinstance(material_file, str) and bool(material_file))
                 parent_ok = (
                     valid_parent and upstream_payload is not None and
                     attestation_ok(upstream_sig) and terminal_source_ok and
