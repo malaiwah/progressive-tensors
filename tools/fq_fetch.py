@@ -124,7 +124,7 @@ SELECT_SCHEMA = "fq-select/1"
 FETCH_BINDING_SCHEMA = "fq-fetch-binding/1"
 REPORT_SCHEMA = "fq-fetch-report/1"
 ATTESTATION_SCHEMA = "fq-attestation/1"
-ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of", "encode-of", "derived-from"))
+ALLOWED_UPSTREAM_PREDICATES = frozenset(("repack-of",))
 USER_AGENT = "fq_fetch/0.1 (+https://github.com/malaiwah/progressive-tensors)"
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
@@ -627,14 +627,9 @@ class Source:
             raise TrustError(
                 f"{where}: predicate {predicate!r} is not accepted for "
                 "range-fetched parents")
-        if predicate == "derived-from":
-            # A second range fetch needs signed, recursively traversable
-            # envelopes for every parent.  fq_fetch currently emits copied
-            # first-generation evidence only, so accepting it would turn
-            # unverified nested metadata into a trusted range source.
-            raise TrustError(
-                f"{where}: refusing derived-from range parent without a "
-                "recursively verifiable signed evidence chain")
+        # Fetched-subset verification terminates at a publisher's
+        # source_fragment/repack-of attestation.  Other predicates require
+        # evidence chains that range fetching neither copies nor verifies.
         fragment = payload.get("fragment")
         if not isinstance(fragment, dict) or fragment.get("file") != segment_file:
             raise TrustError(f"{where}: fragment does not name {segment_file}")

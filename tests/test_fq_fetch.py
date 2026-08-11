@@ -1539,6 +1539,7 @@ def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys)
 @pytest.mark.parametrize(("field", "value", "needle"), [
     ("schema", "fq-attestation/0", "expected"),
     ("predicate", "equivalence-of", "not accepted"),
+    ("predicate", "encode-of", "not accepted"),
 ])
 def test_signed_upstream_schema_and_predicate_are_fail_closed(
         tmp_path, served, capsys, field, value, needle):
@@ -1760,7 +1761,7 @@ def test_recursive_fetched_subset_is_refused_without_signed_nested_evidence(
     run(["--policy", policy, "--out", second,
          "--source", f"test/first@{REV}", "--trust-signer", local_pub,
          "--trust-root", trust_root(tmp_path, local_pub)], expect=1)
-    assert "recursively verifiable signed evidence chain" in capsys.readouterr().err
+    assert "not accepted" in capsys.readouterr().err
     assert not list(second.glob("*.safetensors"))
 
 
