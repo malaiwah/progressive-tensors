@@ -2249,6 +2249,9 @@ def main(argv=None) -> int:
     try:
         authenticate_policy_cardinality(policy, plans, args.header_trust)
     except TrustError as e:
+        for plan in plans:
+            for source in {p.source.slug: p.source for p in plan.pieces}.values():
+                source.discard_verified_pieces(plan.name)
         print(f"TRUST FAILURE: {e}", file=sys.stderr)
         return 1
 
