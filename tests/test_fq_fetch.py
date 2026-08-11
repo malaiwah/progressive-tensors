@@ -610,6 +610,176 @@ def test_release_manifest_is_verified_and_binds_the_indexes(tmp_path, served,
     assert "does not match the signed release" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("status", (403, 429, 500))
+def test_release_retrieval_errors_fail_closed(tmp_path, served, monkeypatch,
+                                              capsys, status):
+    """Only a 404 means no release; an inaccessible one must not downgrade."""
+    repo, snap, pub = build_source(tmp_path, "pub")
+    served["mount"]("test/pub", repo)
+    real = fq_fetch.http_get_full
+
+    def unavailable_release(url, timeout=600.0):
+        if url.endswith("/fq-release.json"):
+            raise urllib.error.HTTPError(url, status, "unavailable", {}, None)
+        return real(url, timeout)
+
+    monkeypatch.setattr(fq_fetch, "http_get_full", unavailable_release)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--retries", "1"], expect=1)
+    assert f"could not retrieve fq-release.json: HTTP Error {status}" in (
+        capsys.readouterr().err)
+
+
+def test_release_404_is_the_explicit_no_release_path(tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--dry-run"])
+    assert "fq-release.json absent (HTTP 404)" in capsys.readouterr().out
+
+
+def test_release_binds_the_cached_manifest_before_planning(tmp_path, served,
+                                                            capsys):
+    repo, snap, pub = build_source(tmp_path, "pub")
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    manifest = json.loads((repo / "fq-manifest.json").read_text())
+    manifest["base_model"] = "attacker/substitution"
+    (repo / "fq-manifest.json").write_text(json.dumps(manifest))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--dry-run"], expect=1)
+    assert "fq-manifest.json sha256" in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))
+
+
+def _add_unreleased_k4(tmp_path: Path, repo: Path, key: Path) -> None:
+    """Add a later, individually attested K4 and rebuild its moving manifest."""
+    later, _, _ = build_source(tmp_path, "later", ks=(4,), key=key)
+    shutil.copy2(later / "index-k4.json", repo / "index-k4.json")
+    shutil.copy2(later / f"layer-{LAYERS[0]:03d}.k4.safetensors",
+                 repo / f"layer-{LAYERS[0]:03d}.k4.safetensors")
+    shutil.copy2(_att_path(later, LAYERS[0], 4), _att_path(repo, LAYERS[0], 4))
+    manifest = json.loads((repo / "fq-manifest.json").read_text())
+    manifest["k_variants"] = sorted({*manifest["k_variants"], 4})
+    manifest["tensor_indexes"]["4"] = "index-k4.json"
+    (repo / "fq-manifest.json").write_text(json.dumps(manifest, indent=1))
+
+
+def test_stale_release_allows_new_individually_attested_object_by_default(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "old",
+        "--repo", "test/pub", "--revision", "release-2026-08-10",
+        "--sign-key", str(key)]) == 0
+    _add_unreleased_k4(tmp_path, repo, key)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [4] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    source = report["sources"][0]
+    assert source["release_coverage_required"] is False
+    assert source["release_coverage"]["index-k4.json"] is False
+    assert report["experts"][str(LAYERS[0])]["k4"]["0"]["release_covered"] is False
+    assert "release_covered:false" in capsys.readouterr().out
+
+
+def test_require_release_coverage_rejects_stale_unreleased_object_before_payload(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "old",
+        "--repo", "test/pub", "--revision", "release-2026-08-10",
+        "--sign-key", str(key)]) == 0
+    _add_unreleased_k4(tmp_path, repo, key)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [4] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--require-release-coverage"], expect=1)
+    assert "fq-manifest.json sha256" in capsys.readouterr().err
+    assert not served["ranges"]
+
+
+def test_release_does_not_delegate_inner_attestation_signer(tmp_path, served,
+                                                            capsys):
+    """The selected aggregation policy requires both release and inner pins."""
+    repo, snap, producer_pub = build_source(tmp_path, "producer")
+    release_key = tmp_path / "release.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/producer", "--revision", REV,
+        "--sign-key", str(release_key)]) == 0
+    release_pub = fq_repack.Signer(release_key).pub_hex
+    served["mount"]("test/producer", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/producer@{REV}",
+         "--trust-signer", release_pub,
+         "--trust-root", trust_root(tmp_path, release_pub), "--dry-run"],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "no trusted attestation line" in err
+
+
+def test_release_tag_selection_enables_strict_coverage(tmp_path, served, capsys):
+    """A publish-style release without `revision` is strict when its tag is selected."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    tag = "release-2026-08-11"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", tag,
+        "--repo", "test/pub", "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["files"].pop(f"layer-{LAYERS[0]:03d}.k3.safetensors")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{tag}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    captured = capsys.readouterr()
+    assert "strict coverage" in captured.out
+    assert "not listed in the signed release manifest" in captured.err
+
+
+def test_attestation_signature_output_counts_only_verified_lines(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    att = _att_path(repo, LAYERS[0], 3)
+    att.write_text(att.read_text() + json.dumps({"keyid": "not-a-key"}) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--dry-run"])
+    assert "verified 1 inner attestation signature(s), rejected 1" in (
+        capsys.readouterr().out)
+
+
+
 def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
     served["mount"]("test/pub", repo)
@@ -620,6 +790,103 @@ def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsy
     assert "no source carries it" in capsys.readouterr().err
     assert set(json.loads((out / "index-k3.json").read_text())
                [str(LAYERS[0])]["experts"]) == {"0", "2", "3"}
+
+def test_published_commit_is_strict_via_signed_parent_relation(
+        tmp_path, served, monkeypatch, capsys):
+    """The commit returned by atomic publish is bound through its signed parent."""
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "release-label",
+        "--repo", "test/pub", "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["parent_revision"] = "parent-before-publish"
+    payload["files"].pop(f"layer-{LAYERS[0]:03d}.k3.safetensors")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    monkeypatch.setattr(
+        fq_fetch, "hub_commit_parent",
+        lambda repo_id, revision: "parent-before-publish")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out,
+         "--source", "test/pub@published-commit",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    captured = capsys.readouterr()
+    assert "strict coverage" in captured.out
+    assert "not listed in the signed release manifest" in captured.err
+
+
+def test_attestation_cache_prevents_repeated_inner_verification(
+        tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["signatures_verified"] == 1
+
+
+def test_no_release_report_does_not_claim_release_integrity(tmp_path, served,
+                                                            capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["trust"]["release_signature_establishes"] == (
+        "none (no verified release)")
+    assert "no release signature; inner attestations establish all claims" in (
+        capsys.readouterr().out)
+
+
+def test_require_release_coverage_rejects_repository_without_release(
+        tmp_path, served, capsys):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--require-release-coverage"], expect=1)
+    assert "--require-release-coverage needs a verified fq-release.json" in (
+        capsys.readouterr().err)
+    assert not served["ranges"]
+
+
+def test_expert_release_coverage_requires_segment_and_attestation(
+        tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "old",
+        "--repo", "test/pub", "--revision", "old-revision",
+        "--sign-key", str(key)]) == 0
+    release = json.loads((repo / "fq-release.json").read_text())
+    import base64
+    payload = json.loads(base64.b64decode(release["payload"]))
+    payload["files"].pop(f"attestations/layer-{LAYERS[0]:03d}.k3.jsonl")
+    (repo / "fq-release.json").write_text(
+        fq_repack.Signer(key).sign_line(payload) + "\n")
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    assert report["sources"][0]["release_coverage"][
+        f"layer-{LAYERS[0]:03d}.k3.safetensors"] is True
+    assert report["sources"][0]["release_coverage"][
+        f"attestations/layer-{LAYERS[0]:03d}.k3.jsonl"] is False
+    assert report["experts"][str(LAYERS[0])]["k3"]["0"]["release_covered"] is False
 
 
 def test_coalescing_merges_adjacent_experts_into_one_request(tmp_path, served):
