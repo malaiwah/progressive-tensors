@@ -815,6 +815,138 @@ def test_attested_header_digest_catches_a_tampered_header(tmp_path, served,
     assert not list(out.glob("*.safetensors"))
 
 
+def test_full_header_fallback_reauthenticates_cache_and_reuses_pass_bytes(
+        tmp_path, served):
+    """A cached full-file claim is never a substitute for re-hashing source."""
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    drop_header_digests(repo, key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    seg = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    run(argv)
+    raw = seg.read_bytes()
+    body = 8 + struct.unpack("<Q", raw[:8])[0]
+    segment_reads = [r for r in served["ranges"] if r[0] == seg.name]
+    # Full authentication needs the source once, plus the tiny draft header:
+    # selected bytes from that verified pass are spooled to disk instead of
+    # being fetched again.
+    assert sum(end - start for _, start, end in segment_reads) <= len(raw) + body
+
+    cache = next((out / ".fq-fetch-cache").rglob(f"hdr-{seg.name}.json"))
+    cached = json.loads(cache.read_text())
+    assert cached["authentication"]["method"] == fq_fetch.AUTH_FULL_FRAGMENT
+    assert cached["authentication"]["release_manifest"] is True
+
+    # A full-file digest cannot authenticate a separately persisted prefix:
+    # it is self-reported and forgeable.  Restart pricing therefore includes
+    # a fresh full rehash, and a completed-output skip leaves no spool files.
+    plan_path = tmp_path / "restart-plan.json"
+    run([*argv, "--dry-run", "--json", plan_path])
+    plan = json.loads(plan_path.read_text())
+    assert plan["header_authentication"]["extra_bytes"] == len(raw)
+    assert plan["header_authentication"]["methods"][fq_fetch.AUTH_FULL_FRAGMENT] == 1
+    run(argv)
+    assert not list((out / ".fq-fetch-cache" / "test__pub@0123456789ab" /
+                     ".verified-pieces").glob("*"))
+
+    # Forge every field in a persisted full-proof record that is locally
+    # editable.  The next process still hashes the pinned fragment, detects
+    # the substituted header during re-planning, and cleans its error spool.
+    forged = bytearray(base64.b64decode(cached["header_bytes"]))
+    assert b'"I16"' in forged
+    forged = bytes(forged).replace(b'"I16"', b'"F16"', 1)
+    cached["header_bytes"] = base64.b64encode(forged).decode()
+    cached["header"] = json.loads(forged[8:])
+    cached["authentication"]["header_sha256"] = hashlib.sha256(forged).hexdigest()
+    cache.write_text(json.dumps(cached))
+    served["ranges"].clear()
+    run(argv, expect=1)
+    reread = [r for r in served["ranges"] if r[0] == seg.name]
+    assert sum(end - start for _, start, end in reread) >= len(raw)
+    assert not list((out / ".fq-fetch-cache" / "test__pub@0123456789ab" /
+                     ".verified-pieces").glob("*"))
+
+
+def test_signed_header_cache_reduces_restart_authentication_cost(tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    plan_path = tmp_path / "restart-plan.json"
+    run([*argv, "--dry-run", "--json", plan_path])
+    auth = json.loads(plan_path.read_text())["header_authentication"]
+    assert auth["extra_bytes"] == 0
+    assert auth["methods"]["cached"] == 1
+
+
+def test_done_output_is_rehashed_before_it_is_resigned(tmp_path, served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    _retag_header(seg, b'"I16"', b'"F16"')
+    raw = bytearray(seg.read_bytes())
+    body = 8 + struct.unpack("<Q", raw[:8])[0]
+    # State is attacker controlled too: even a matching forged digest must
+    # not let a modified completed file bypass the per-expert/header checks.
+    state_path = out / "state.json"
+    state = json.loads(state_path.read_text())
+    entry = state["files"][seg.name]["entry"]
+    entry["sha256"] = hashlib.sha256(raw).hexdigest()
+    entry["header_sha256"] = hashlib.sha256(raw[:body]).hexdigest()
+    state_path.write_text(json.dumps(state))
+
+    served["ranges"].clear()
+    run(argv)
+    fixed = seg.read_bytes()
+    assert fixed != bytes(raw)
+    entry = json.loads((out / "index-k3.json").read_text())[str(LAYERS[0])]
+    assert hashlib.sha256(fixed).hexdigest() == entry["sha256"]
+    assert any(name == seg.name for name, _, _ in served["ranges"])
+
+
+def test_done_output_header_length_is_bounded_by_authenticated_plan(tmp_path,
+                                                                    served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = bytearray(seg.read_bytes())
+    raw[:8] = struct.pack("<Q", 1 << 62)
+    seg.write_bytes(raw)
+    served["ranges"].clear()
+    run(argv)
+    fixed = seg.read_bytes()
+    assert struct.unpack("<Q", fixed[:8])[0] < len(fixed)
+    assert any(name == seg.name for name, _, _ in served["ranges"])
+
+
 def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
                                                                    served,
                                                                    capsys):
