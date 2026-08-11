@@ -92,6 +92,7 @@ import random
 import struct
 import sys
 import time
+from urllib.parse import quote
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -217,13 +218,10 @@ def is_immutable_revision(value) -> bool:
 
 
 def evidence_source_slug(repo: str, revision: str, subdir: str) -> str | None:
-    """Canonical, traversal-free name of a copied upstream evidence directory."""
-    if (not isinstance(subdir, str) or subdir.startswith("/") or
-            any(part in ("", ".", "..") for part in subdir.split("/")
-                if subdir)):
+    """Injective canonical name of a copied upstream evidence directory."""
+    if not isinstance(repo, str) or not isinstance(subdir, str):
         return None
-    suffix = f":{subdir.replace('/', '__')}" if subdir else ""
-    return f"{repo.lower().replace('/', '__')}@{revision[:12]}{suffix}"
+    return f"{quote(repo, safe='')}@{revision[:12]}:{quote(subdir, safe='')}"
 
 # load_attestation() states.  Only VERIFIED is evidence; NOT_CHECKED exists
 # solely because the operator passed --insecure-skip-signatures and asked to
