@@ -221,6 +221,20 @@ def test_all_k3_assembly_is_byte_identical(repacked):
     assert (out / "config.json").exists(), "non-shard files copied through"
 
 
+def test_bad_policy_fails_before_layout_or_segment_header_preflight(
+        repacked, monkeypatch):
+    snap, segments, tmp = repacked
+    policy = policy_file(tmp, {str(LAYERS[0]): [3]})
+    monkeypatch.setattr(
+        fq_assemble, "effective_layout",
+        lambda *_args, **_kwargs: pytest.fail("bad policy reached layout discovery"))
+
+    with pytest.raises(
+            fq_assemble.VerificationError,
+            match=r"layer 3 policy has 1 entries; source/family requires 4"):
+        assemble(segments, snap, policy, tmp / "bad-cardinality")
+
+
 @pytest.fixture()
 def repacked_multi_k(tmp_path):
     """K3 source snapshot + K3 AND K4 segments (larger K4 trellis tensors)."""

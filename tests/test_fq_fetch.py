@@ -295,6 +295,33 @@ def test_fetch_rejects_manifest_authenticated_header_cardinality_disagreement(
             policy, [plan], fq_fetch.HEADER_AUTO)
 
 
+def test_signed_expert_digest_union_supports_legacy_primed_family(monkeypatch):
+    """Older primed attestations prove full cardinality through K-union."""
+    source = _CardinalitySource(experts=4, manifest_experts=4)
+    source.manifest = {"k_variants": [3, 4]}
+    source.index = lambda k: {"3": {"file": f"layer-003.k{k}.safetensors"}}
+    by_k = {3: {"0": "a" * 64, "2": "b" * 64},
+            4: {"1": "c" * 64, "3": "d" * 64}}
+    source.attestation = lambda layer, k, verifier, filename: {
+        "expert_sha256": by_k[k]}
+    source.header = {
+        "__metadata__": {"num_experts": "2"},
+        **{f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis": {}
+           for expert in (0, 2)},
+    }
+    policy = {3: {expert: 3 for expert in range(4)}}
+    plan = type("Plan", (), {
+        "layer": 3, "k": 3, "meta": {},
+        "atts": {source.slug: {"expert_sha256": by_k[3]}},
+        "pieces": [type("Piece", (), {"source": source})()]})()
+
+    fq_fetch.validate_policy_cardinality(policy, [plan], [source], object())
+    monkeypatch.setattr(fq_fetch, "authenticate_plan", lambda plan, mode: None)
+    fq_fetch.authenticate_policy_cardinality(
+        policy, [plan], fq_fetch.HEADER_AUTO)
+    assert plan.attested_expert_counts[source.slug] == 4
+    assert plan.meta["num_experts"] == "4"
+
 # --------------------------------------------------------------------- tests
 
 def test_dry_run_reports_savings_and_writes_nothing(tmp_path, served, capsys):
@@ -371,6 +398,8 @@ def test_derived_subset_remains_a_dense_fetch_source(tmp_path, served):
     """Its local attestations carry the full family count, not subset size."""
     _repo, _snap, subset, policy, _pub = _fetch_all(tmp_path, served)
     local = json.loads((subset / "fq-manifest.json").read_text())["signer_pubkey"]
+    for segment in subset.glob("layer-*.safetensors"):
+        assert fq_repack.read_header(segment)[0]["__metadata__"]["num_experts"] == str(E)
     served["mount"]("test/subset", subset)
     refetched = tmp_path / "refetched"
 

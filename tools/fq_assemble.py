@@ -1294,6 +1294,10 @@ def main(argv=None) -> int:
             continue
 
         jobs.append((src_shard, layer, bpe.get(str(layer))))
+
+    # This reads only source headers and rejects incomplete dense recipes
+    # before any segment header/layout evidence is opened.
+    validate_policy_cardinality(jobs, manifest)
     layout = effective_layout(policy, manifest, args.segments, jobs)
     source_targets = {
         layer: set(range(len(lb)))
@@ -1306,10 +1310,7 @@ def main(argv=None) -> int:
     except SourceLayoutError as e:
         raise AssemblyError(str(e)) from e
 
-    # This reads only the source headers and happens before any segment is
-    # opened, hashed, or staged.  An ordinary fq-policy/2 is dense by
-    # contract, so an incomplete recipe is never allowed to fail mid-copy.
-    validate_policy_cardinality(jobs, manifest)
+
 
     # Every segment is opened and authenticated BEFORE the output dir is
     # touched: a bad fragment (or a bad trust configuration) must never cost
