@@ -1007,9 +1007,9 @@ def verify_release_evidence(fam: Path, parent: dict, *, evidence_source: str,
     except (OSError, ValueError, TrustError):
         return False, "release-evidence-invalid"
     signed_revisions = {
-        value for value in (release.get("revision"),
-                            release.get("parent_revision"))
-        if is_immutable_revision(value)}
+        value.lower() for value in (release.get("revision"),
+                                    release.get("parent_revision"))
+        if fq_fetch.Source.is_immutable_commit(value)}
     if (evidence.get("repo") != parent.get("repo") or
             evidence.get("source_revision") != parent.get("revision") or
             evidence.get("revision") not in signed_revisions or

@@ -521,7 +521,11 @@ class Source:
         selected = {self.requested_revision, self.revision}
         if self.resolved_commit:
             selected.add(self.resolved_commit)
-        if any(value and str(value) in selected
+
+        def canonical_revision(value: object) -> str:
+            return value.lower() if self.is_immutable_commit(value) else str(value)
+
+        if any(value and canonical_revision(value) in selected
                for value in (self.release.get("revision"),
                              self.release.get("parent_revision"),
                              self.release.get("release"))):
@@ -533,7 +537,8 @@ class Source:
             self._published_release_parent_checked = True
             self._published_release_parent = hub_commit_parent(
                 self.repo, self.resolved_commit or self.revision)
-        return self._published_release_parent == signed_parent
+        return (self._published_release_parent ==
+                canonical_revision(signed_parent))
 
     def _uncovered_release_name(self, name: str, *, kind: str) -> bool:
         self._release_coverage[name] = False
@@ -2182,8 +2187,8 @@ def release_evidence(src: Source) -> tuple[bytes, dict] | None:
         return None
     release_repo = src.release.get("repo")
     signed_revisions = [
-        value for value in (src.release.get("revision"),
-                            src.release.get("parent_revision"))
+        value.lower() for value in (src.release.get("revision"),
+                                    src.release.get("parent_revision"))
         if Source.is_immutable_commit(value)]
     if not isinstance(release_repo, str) or not release_repo or release_repo != src.repo:
         raise TrustError(
@@ -2199,7 +2204,8 @@ def release_evidence(src: Source) -> tuple[bytes, dict] | None:
             src._published_release_parent = hub_commit_parent(
                 src.repo, src.resolved_commit)
         source_matches_release = (
-            src._published_release_parent == src.release["parent_revision"])
+            src._published_release_parent ==
+            src.release["parent_revision"].lower())
     if not signed_revisions or not source_matches_release:
         raise TrustError(
             f"{src}: fq-release/1 needs an immutable signed revision or "
@@ -2210,7 +2216,7 @@ def release_evidence(src: Source) -> tuple[bytes, dict] | None:
         raise TrustError(f"{src}: verified fq-release.json disappeared from cache")
     binding_revision = (src.resolved_commit
                         if src.resolved_commit in signed_revisions else
-                        src.release["parent_revision"])
+                        src.release["parent_revision"].lower())
     return raw, {
         "file": "fq-release.json",
         "sha256": hashlib.sha256(raw).hexdigest(),
