@@ -28,8 +28,8 @@ Think progressive JPEG, for quants.
   (layers 3–78; 278.5 GB of expert bytes came from segments, the dense
   layers and embed/head pass through from the source). The full per-quant
   reconstruction proof — byte-identity rungs and measured numeric similarity
-  across three community quants, including evidence that two *independent*
-  producers' K4 fragments are equal in measured quality — is in
+  across three community quants, including two different K4 encodes/layouts
+  from the same uploader and cross-uploader K3-vs-K4 comparisons — is in
   [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md).
 - **Fetch only what your recipe uses** — segments are per-expert
   contiguous, so `fq_fetch` HTTP-Range-reads exactly the expert spans a
@@ -38,15 +38,14 @@ Think progressive JPEG, for quants.
 - **Sharing is deduplicating *within a segment family*** — one published
   set of fragments is one set of bytes, however many recipes reference it,
   and Hugging Face Xet dedupes at chunk level on top. This is a property of
-  reusing the *same* fragments, not of the model: two independent K4
-  encodes of the same expert are different bytes (measured cosine 0.9934 —
-  numerically equivalent, byte-wise unrelated), so they do not dedupe
-  against each other and never will.
-- **No special loader required** — the assembled output is a normal
-  checkpoint for the target runtime (Gilded Gnosis vLLM / EXL3 stack).
-  A runtime *progressive loader* and live bit-width reallocation are being
-  built on top (see Research), but everything in this repo works today
-  with plain files.
+  reusing the *same* fragments, not of the model: two distinct K4 encodes of
+  the same expert are different bytes (measured cosine 0.9934 — numerically
+  equivalent, byte-wise unrelated), so they do not dedupe against each other
+  and never will.
+- **Offline tooling, normal checkpoints** — this repository fetches, verifies,
+  and assembles normal safetensors checkpoints. A runtime progressive loader
+  and live bit-width reallocation are separate experimental work; they are
+  not part of this tooling and are not wired as a supported serving workflow.
 
 ### Maturity, by component — not one number
 
@@ -57,9 +56,11 @@ Think progressive JPEG, for quants.
   green, on Linux and macOS across Python 3.11–3.13. One live caveat:
   signer-pinned verification *inside* `fq_assemble` has just landed, so
   pass `--trust-signer` explicitly — the tools print the exact line.
-- **Runtime — progressive loader and live per-expert reallocation:
-  experimental.** It boots from segments and reallocates in 0.4 s; that is
-  where the sharp edges are.
+- **Runtime: experimental and separate.** The public runtime research is TP
+  only and not wired for live reallocation; do not infer a production hot-swap
+  path from an assembled checkpoint. The measured topology and SM120 K5 limit
+  are documented at immutable revision
+  [`69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant).
 - **Artifact repo: public, and still growing.**
   [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments)
   is live. An unattended encode campaign publishes new K2/K5 windows to it,
@@ -80,7 +81,8 @@ Think progressive JPEG, for quants.
 
 *All three measured on the GLM-5.2-architecture proxy: one sealed 1.05M-token
 capture, four hessian-identical encodes (K2/K3/K4/K5) with the sha-pinned
-production encoder. Full campaign data and reports in the research branch.*
+production encoder. The [campaign evidence is pinned to immutable research
+revision `69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant).*
 
 ## Quickstart: verify + reassemble
 
@@ -89,86 +91,101 @@ Segments for **GLM-5.2** (from
 at pinned commit `9297b9f1`) live at
 [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments).
 
-**Four tiers are in that tree, and they did not all come from us.**
+> **Before a large download: serving scope.** The published rank-sliced
+> artifacts are usable as-is only at **TP4**. TP1/TP2 need dequantization and
+> re-quantization (not a repack); TP8/TP16 are unimplemented; the referenced
+> runtime refuses EP and DP > 1. On SM120/Blackwell, K5 can assemble and verify
+> but cannot currently serve as a mixed tier. These are runtime limits, not
+> validations performed by these offline tools; see the [immutable topology
+> report](https://github.com/malaiwah/vllm-voipmonitor/blob/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant/runs/m5-serve/topology-neutrality.md)
+> and [K5 report](https://github.com/malaiwah/vllm-voipmonitor/blob/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant/runs/m5-serve/k5-shared-memory-limit.md).
 
-| Tier | Where it came from |
+**Root tiers and nested families are different provenance chains.**
+
+| Location | Where it came from |
 |---|---|
-| **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
-| **K4** | **primed from other people's published quants** — `sources/willfalco-3.42bpw/{shared-h,expanded}/` and `sources/willfalco-3.36bpw/`, 1,528 K4 fragments over layers 3–10, extracted by ranged reads and byte-identity-verified against the pinned sources |
-| **K2** | fresh encodes (fast-load base tier) — **coverage grows window by window**; `fq-manifest.json` `per_k["2"]` is the authority |
-| **K5** | fresh encodes (hot-expert tier) — same, `per_k["5"]` |
+| root **K3** | the shared base: every MoE layer, repacked from the brandonmusic 3.0 bpw quant |
+| root **K2 / K4 / K5** | fresh `encode-of` tiers from `zai-org/GLM-5.2`; their exact current coverage is `fq-manifest.json` `per_k[K].layers` (the sorted membership list, not a min/max range) |
+| `sources/willfalco-*` | nested, community-primed families: ranged-read `repack-of` / `derived-from` material over layers 3–10; not the root K4 tier and not a direct `fq_fetch --source` provider |
 
-The K4 tier is the point of the whole exercise made concrete: it is not our
-encode, it is somebody else's quant decomposed into fragments a recipe can
-name.
+**Inventory changes.** The artifact-card snapshot at commit `c64a3f60`, measured
+2026-08-11 10:07 UTC, was **961.8 decimal GB** total; its source checkpoint
+observation was **316.4 decimal GB**. Those are planning observations, not
+coverage authority. Derive the current artifact size at the revision you chose:
 
-**Do not `hf download` that repository whole.** It is ~481 GB and no recipe
-needs all of it; the model card carries commit-pinned, per-recipe
-`--include` patterns and the disk cost of each (all-K3 is ~279 GB, the K2
-tier on its own ~74 GB). `fq_fetch --policy` is smaller still, because it
-range-reads only the experts a recipe names.
+```bash
+python - <<'PY'
+from huggingface_hub import HfApi
+repo, revision = "malaiwah/GLM-5.2-EXL3-FQ-segments", "<immutable-commit>"
+info = HfApi().model_info(repo, revision=revision, files_metadata=True)
+print(f"{sum(f.size or 0 for f in info.siblings) / 1e9:.1f} GB")
+PY
+```
 
-**What you need on disk.** Assembly writes a complete checkpoint, so
-besides the fragments you need the **source checkpoint snapshot** (~295 GB
-for GLM-5.2): dense layers, attention, embeddings, `config.json` and the
-safetensors header order all come from it — Progressive Tensors only
-substitutes the routed-expert bytes. Plan for the source checkpoint plus
-your fetched segments plus the assembled output.
+Assembly writes a complete checkpoint, so also download the source checkpoint:
+dense layers, attention, embeddings, `config.json`, and safetensors header
+order come from it. Plan for source + fetched segments + assembled output.
+
+The following is a literal range-fetch workflow. It obtains the policy before
+using it and verifies the **locally signed fetched subset**, not a publisher
+release:
 
 ```bash
 git clone https://github.com/malaiwah/progressive-tensors
 cd progressive-tensors
 uv venv && uv pip install -r requirements-dev.txt
-uv run pytest tests/            # the tools' own test suite
 
-# your recipe: which K per expert, per layer (fq-policy/2 JSON)
-python - <<'EOF'
-import json
-json.dump({"schema": "fq-policy/2",
-           "bits_per_expert": {str(l): [3]*256 for l in range(3, 79)}},
-          open("recipe-all-k3.json", "w"))
-EOF
+ARTIFACT_REPO=malaiwah/GLM-5.2-EXL3-FQ-segments
+ARTIFACT_REV=64e582a19a97d87236d98c03da26e1ed2a32be16
+RECIPE=recipes/glm52-3.0bpw-all-k3.json
+PUBLISHER_SIGNER=a58b7bb79ba58457
 
-# what would this cost?  (ranged bytes vs whole files vs whole repo)
-uv run tools/fq_fetch.py --policy recipe-all-k3.json --out ./segments \
-  --source malaiwah/GLM-5.2-EXL3-FQ-segments@<commit> \
-  --trust-signer a58b7bb79ba58457 --dry-run
+# Copy the exact policy from the same immutable artifact revision.
+hf download "$ARTIFACT_REPO" "$RECIPE" --revision "$ARTIFACT_REV" \
+  --local-dir ./artifact
 
-# fetch ONLY the expert byte ranges the recipe names, verified as they land
-uv run tools/fq_fetch.py --policy recipe-all-k3.json --out ./segments \
-  --source malaiwah/GLM-5.2-EXL3-FQ-segments@<commit> \
-  --trust-signer a58b7bb79ba58457
+# fq_assemble needs the original non-expert tensors and header layout.
+hf download brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw \
+  --revision 9297b9f1d53af5c67cffa01e30cc071a1ff7144b \
+  --local-dir ./source-quant
 
-# assemble a bootable checkpoint (dense tensors come from the source repo).
-# Assembly verifies every fragment it consumes — signature under a pinned
-# signer, signed fragment and per-expert digests recomputed from the bytes on
-# disk — and fails closed if you do not pin one.  fq_fetch prints the exact
-# --trust-signer line for the tree it just wrote.
-uv run tools/fq_assemble.py \
-  --segments ./segments --source <source-checkpoint-dir> \
-  --policy recipe-all-k3.json --out ./my-checkpoint \
-  --trust-signer <fingerprint>   # or --trust-file keys/FINGERPRINTS
+# Inspect bandwidth before fetching; then repeat without --dry-run.
+uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
+  --source "$ARTIFACT_REPO@$ARTIFACT_REV" \
+  --trust-signer "$PUBLISHER_SIGNER" --dry-run
+uv run tools/fq_fetch.py --policy "./artifact/$RECIPE" --out ./segments \
+  --source "$ARTIFACT_REPO@$ARTIFACT_REV" \
+  --trust-signer "$PUBLISHER_SIGNER"
 
-sha256sum ./my-checkpoint/model-layer-030.safetensors
-#  -> identical to the original shard. That's the point.
+# fq_fetch signed these newly materialized subset files. Trust that local
+# derived-from signer for verification and assembly; it is not the publisher.
+LOCAL_SIGNER="$(python -c \
+  'import json; print(json.load(open("segments/fq-manifest.json"))["signer_pubkey"])')"
+uv run tools/fq_verify.py --identity --segments ./segments \
+  --source ./source-quant --trust-signer "$LOCAL_SIGNER" \
+  --json id.json --md id.md
+uv run tools/fq_assemble.py --segments ./segments --source ./source-quant \
+  --policy "./artifact/$RECIPE" --out ./my-checkpoint \
+  --trust-signer "$LOCAL_SIGNER"
+(cd ./my-checkpoint && sha256sum -c MANIFEST.sha256)
 ```
 
-**Two fingerprints, one chain.** For the *fetch* step, `--trust-signer` is
-the publisher's fingerprint from [`keys/FINGERPRINTS`](keys/FINGERPRINTS) in
-*this* repository — the point being that it does not come from the download
-you are checking. For the *assemble* step it is **your own**: a fetched
-subset is a new file (fewer experts, new offsets, new digest), so no
-publisher signature can cover it, and `fq_fetch` signs what it materialized
-as `derived-from`, naming the publisher fragments as parents and pinning
-them by digest. It prints that fingerprint and the exact assemble command.
-Assembling a tree you downloaded whole instead pins the publisher directly.
+Do **not** run `fq_release.py verify --complete` on that range-fetched subset:
+it is not a copied publisher release and has no publisher release envelope.
+To verify a publisher release, download its entire signed file set into a
+separate empty directory, then pin the publisher signer:
 
-An all-K3
-recipe over all 76 MoE layers is the whole base tier, so it fetches
-essentially everything; the savings appear as soon as the recipe is
-narrower than the repo (a layer window, or a K4 hot set on top of a K3
-base). `--dry-run` always prints the three numbers so you can see which
-case you are in before spending bandwidth.
+```bash
+hf download "$ARTIFACT_REPO" --revision "$ARTIFACT_REV" \
+  --local-dir ./publisher-release
+uv run tools/fq_release.py verify --dir ./publisher-release --complete \
+  --trust-signer "$PUBLISHER_SIGNER"
+```
+
+`--complete` fails both for a signed file that is missing and for a local file
+that is absent from the envelope. It is deliberately unsuitable for a
+selective `hf download --include` tree unless that release envelope describes
+exactly that subset.
 
 ### Disk-saving assembly (`--reflink`)
 
@@ -210,35 +227,36 @@ extent sharing is worth buying.
 
 ## Fetch only what the recipe needs (`fq_fetch`)
 
-`fq_fetch` is the consumer half. Given a recipe and one or more source
-repos, it reads `index-kK.json`, turns the recipe into per-expert byte
-spans, coalesces them, and HTTP-Range-fetches exactly those — into a local
-segment tree that `fq_assemble` consumes unchanged.
+`fq_fetch` is the consumer half. Given a recipe and one or more **compatible
+FQ artifact** sources, it reads `index-kK.json`, turns the recipe into
+per-expert byte spans, coalesces them, and HTTP-Range-fetches exactly those —
+into a local segment tree that `fq_assemble` consumes unchanged.
 
 ```bash
-# expert-level fragments from several publishers, in priority order
-uv run tools/fq_fetch.py --policy hot-k4.json --out ./segments \
-  --source malaiwah/GLM-5.2-EXL3-FQ-segments@<commit> \
-  --source willfalco/GLM-5.2-EXL3-TR3-3.36bpw-FQ@<commit> \
+# A real single-source fetch; use the quickstart above to obtain the policy.
+uv run tools/fq_fetch.py --policy ./artifact/recipes/glm52-3.0bpw-all-k3.json \
+  --out ./segments \
+  --source malaiwah/GLM-5.2-EXL3-FQ-segments@64e582a19a97d87236d98c03da26e1ed2a32be16 \
   --trust-signer a58b7bb79ba58457
-
-# "I want this exact fragment, whoever publishes it"
-  --prefer-sha 3c5b0b901ccec3f69836078d5e18b32f54c35887d010b0626d0398cbf05dacea
-
-# or an explicit per-expert / per-layer provider map (fq-select/1)
-  --select providers.json
 ```
 
-- **Ordered sources.** The first source carrying an expert at the required
-  K wins; content hash and the provider map override that.
+`--source` is repeatable and ordered only for artifact repositories that
+actually publish compatible FQ indexes, attestations, and manifests. The
+upstream `willfalco/GLM-5.2-EXL3-TR3-3.36bpw` quant is a valid `fq_prime`
+input, but it is **not** an FQ source for `fq_fetch`; its primed
+representation is nested in the artifact repository rather than independently
+addressable. For compatible sources, the first source carrying an expert at
+the required K wins; `--prefer-sha` and `--select providers.json` provide
+content-hash and explicit provider selection.
+
 - **Every expert is verified as it lands**, against the signed attestation
-  *of the source it came from*, before the file is finalized. One output
-  file may legitimately mix publishers;
-  `fq-fetch-report.json` records who provided each expert.
+  *of the source it came from*, before the file is finalized. One output file
+  may legitimately mix publishers; `fq-fetch-report.json` records each
+  provider.
 - **Resumable.** Interrupt it, re-run the same command. Per-expert progress
   is recorded, partial files resume in place, resumed bytes are re-hashed
-  before being trusted, and a changed recipe discards the stale partial
-  rather than resuming into it.
+  before being trusted, and a changed recipe discards the stale partial rather
+  than resuming into it.
 - **`--dry-run`** prints ranged bytes vs whole-segment-files vs whole-repo.
 
 ### Verify provenance without downloading anything big
@@ -252,7 +270,7 @@ import base64, hashlib, json
 from nacl.signing import VerifyKey
 
 # The fingerprint comes from keys/FINGERPRINTS in the GIT repo, NOT from
-# the download being checked.  That is the entire point (see TRUST.md).
+# the download being checked. That is the entire point (see TRUST.md).
 TRUSTED = "a58b7bb79ba5845716aa6fee7d54e714ef243c2875f23a617e1ef3247c565525"
 verify_key = VerifyKey(bytes.fromhex(TRUSTED))
 
@@ -261,25 +279,51 @@ for line in open("segments/attestations/layer-030.k3.jsonl"):
     if not line.strip():
         continue
     env = json.loads(line)
-    assert env["keyid"] == TRUSTED, f"signed by an unexpected key: {env['keyid']}"
+    assert env["keyid"] == TRUSTED, f"unexpected signer: {env['keyid']}"
     raw = base64.b64decode(env["payload"])
     verify_key.verify(raw, base64.b64decode(env["signature"]))  # raises if bad
     payload = json.loads(raw)
     if payload["fragment"]["file"] == "layer-030.k3.safetensors":
         digests.update(payload["expert_sha256"])
 
-# spot-check ONE expert with one ranged read against the segment file:
+# Local spot-check: seek and read only this expert's [lo, hi) bytes.
 idx = json.load(open("segments/index-k3.json"))["30"]
 lo, hi = idx["experts"]["137"]
-blob = open(f"segments/{idx['file']}", "rb").read()[
-    idx["body_offset"] + lo : idx["body_offset"] + hi]
+start, size = idx["body_offset"] + lo, hi - lo
+with open(f"segments/{idx['file']}", "rb") as segment:
+    segment.seek(start)
+    blob = segment.read(size)
+assert len(blob) == size
 assert hashlib.sha256(blob).hexdigest() == digests["137"]
 ```
 
-The `materials` block pins the source repo + commit + file sha256, so the
-same spot-check can be run against the *source* quant with an HTTP range
-request — the trust chain is explicit and third-party-verifiable, which is
-strictly stronger than "download 300 GB from a named uploader and hope."
+For a remote spot-check, request those exact bytes from an immutable
+`resolve/<commit>` URL and require an HTTP range response. This checks both
+that the server honored the bounded request and that only the indexed expert
+span was hashed:
+
+```python
+from urllib.request import Request, urlopen
+
+repo = "malaiwah/GLM-5.2-EXL3-FQ-segments"
+revision = "64e582a19a97d87236d98c03da26e1ed2a32be16"
+end = start + size - 1
+url = f"https://huggingface.co/{repo}/resolve/{revision}/{idx['file']}"
+request = Request(url, headers={"Range": f"bytes={start}-{end}"})
+with urlopen(request) as response:
+    assert response.status == 206
+    assert response.headers["Content-Range"].startswith(f"bytes {start}-{end}/")
+    assert int(response.headers["Content-Length"]) == size
+    blob = response.read(size)
+    assert response.read(1) == b""
+assert len(blob) == size
+assert hashlib.sha256(blob).hexdigest() == digests["137"]
+```
+
+The attestation `materials` block separately pins the upstream source repo,
+commit, and file sha256. A matching source-layout span can be range-checked
+there too; the immutable artifact request above is the literal bounded
+HTTP-range proof for the published fragment.
 
 ## Prime segments from a community quant (`fq_prime`)
 
@@ -371,25 +415,30 @@ unambiguous ≥16-hex prefix). Under pinning, a compromised artifact
 repository can deny you service — it cannot make you accept the wrong
 bytes.
 
-A release additionally publishes **`fq-release/1`**: one signature over a
-document listing sha256 and size for *every* file, including the indexes
-and the attestation files. Verify one signature, then hash:
+A publisher release additionally publishes **`fq-release/1`**: one signature
+over sha256 and size for *every* file, including indexes and attestations.
+Verify it only after copying that complete signed release tree:
 
 ```bash
-uv run tools/fq_release.py verify --dir ./segments \
+uv run tools/fq_release.py verify --dir ./publisher-release \
   --trust-signer a58b7bb79ba58457
 
-# strict rung, for a tree you pulled whole: non-zero if any listed file is
-# absent, and non-zero if any local file is NOT covered by the signature
-uv run tools/fq_release.py verify --dir ./segments --complete \
+# strict: fail if any signed file is absent or any local file is unlisted
+uv run tools/fq_release.py verify --dir ./publisher-release --complete \
   --trust-signer a58b7bb79ba58457
 ```
 
-That closes the gap N per-fragment signatures leave open — they each prove
-a fragment's origin, but nothing says *which set of fragments is the
-release*, so files could be added, dropped or rolled back silently.
-`--complete` is what makes "nothing was added" actionable: unlisted files
-are a **failure**, not a warning, so it can gate a deploy.
+That closes the gap N per-fragment signatures leave open — they each prove a
+fragment's origin, but nothing says *which set of fragments is the release*,
+so files could be added, dropped, or rolled back silently. `--complete` makes
+"nothing was added" actionable: unlisted files are a **failure**, not a
+warning, so it can gate a deploy.
+
+`fq_fetch` instead creates a **derived local subset** with a local signer and
+no copied publisher release envelope. Verify it with `fq_verify --identity`
+and the local signer from its generated `fq-manifest.json` (as in the
+quickstart), then use that same signer for assembly. Running release
+verification against it would answer the wrong question and must fail closed.
 
 ### Publishing a release atomically
 
@@ -467,8 +516,9 @@ the output. So `encode-of` attestations carry an explicit
 the reproducible-builds model applied where reproducible builds actually
 hold, and named differently where they do not.
 
-The encoder driver and capture tooling live in the research branch below
-and are being promoted into this repo as they stabilize.
+The encoder driver and capture tooling are documented at the immutable
+[research revision `69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant);
+they are not a supported runtime component of this repository.
 
 ## Status & roadmap
 
@@ -482,9 +532,9 @@ and are being promoted into this repo as they stabilize.
 | GLM-5.2 K3 base segments on HF | **published** at [`malaiwah/GLM-5.2-EXL3-FQ-segments`](https://huggingface.co/malaiwah/GLM-5.2-EXL3-FQ-segments), with `LICENSE`, `NOTICE` and a signed `fq-release.json`; reassembly **sha256-verified 76/76 MoE shards** |
 | K4 hot-set priming from community mixed quants (3.42/3.36 bpw) | layers 3–10 primed + verified (fragment byte-identity vs fresh source reads — [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)) |
 | `fq_verify` (byte-identity + numeric similarity proofs) | working, tested |
-| Mixed-size (true mixed-K) assembly + loader metadata | done — mixed-K checkpoint assembled and booted |
-| Four tiers in the artifact tree (K2/K3/K4/K5) | K3 base complete (layers 3–78); K4 **primed from community quants** (1,528 fragments, layers 3–10); K2/K5 fresh encodes with `encode-of` attestations, **published window by window — read `fq-manifest.json` `per_k` for today's coverage** |
-| Runtime progressive loader + live bit-width reallocation (vLLM/GG) | loader boots from segments; live reallocation demonstrated at 0.4 s |
+| Mixed-size (true mixed-K) assembly + loader metadata | offline assembly is working and tested; serving an output remains subject to the runtime's TP4-only / EP-and-DP refusal and hardware constraints |
+| Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, `fq-manifest.json` `per_k[K].layers` is the exact membership list |
+| Runtime progressive loader + live bit-width reallocation (vLLM/GG) | separate experimental research, TP-only and not wired as an end-to-end supported workflow; no live-reallocation claim is made by these tools |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 
 ## Prior art and positioning
@@ -522,10 +572,10 @@ tiers; and multi-provider interoperability.
 
 ## Research
 
-Design docs, verification reports, and the runtime work live in
-[`malaiwah/vllm-voipmonitor` branch `claude/gg-overview-exploration-jchgd3`](https://github.com/malaiwah/vllm-voipmonitor/tree/claude/gg-overview-exploration-jchgd3/research/fungible-quant)
-(`research/fungible-quant/`). Built and verified on 8× RTX PRO 6000
-(SM120) against the Gilded Gnosis vLLM + b12x stack.
+Design docs, verification reports, and separate runtime research are pinned at
+[`malaiwah/vllm-voipmonitor` revision `69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant)
+(`research/fungible-quant/`). Its measured TP4/SM120 environment does not
+turn that experimental branch into a supported live-reallocation product.
 
 MIT licensed. Attestation ≠ endorsement: provenance chains terminate at
 the source quant's reputation — they make that trust explicit and

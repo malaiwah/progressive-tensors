@@ -39,20 +39,19 @@ Rows 1–5 are byte proofs. Row 6 and the table below are the numeric rung:
 fragments from *different encodes* cannot be byte-identical, so the claim
 there is bounded similarity instead of identity.
 
-## Two independent producers, same expert slot
+## Two K4 encodes from one uploader, plus cross-uploader comparisons
 
-This is the part that matters for the project's core claim, and it was the
-piece a prior-art review flagged as missing: *do fragments from unrelated
-producers actually interoperate?*
+The evidence compares three published encodes: brandonmusic's flat K3,
+willfalco's 3.36 bpw (`per_expert_v1`), and willfalco's 3.42 bpw
+(`shared_h_v1`, a different layout and K partition). The two K4 rows are
+different encodes/layouts from the **same uploader**. This measurement does
+not establish that they were independently produced; the cross-uploader
+comparisons are brandonmusic K3 versus each willfalco K4 encode.
 
-Three unrelated encodes — brandonmusic's flat K3, willfalco's 3.36 bpw
-(`per_expert_v1`), willfalco's 3.42 bpw (`shared_h_v1`, a different layout
-and a different K partition) — each contain fragments for the **same**
-(layer, expert, projection) of the same base model. All three were
-decomposed by the same segment tooling and decoded through the same
-reference path (`LinearEXL3.get_weight_tensor`: `ext.reconstruct` +
-Hadamard-128 + `diag(suh)/diag(svh)`), then compared in fp64 against the
-BF16 original.
+All three were decomposed by the same segment tooling and decoded through the
+same reference path (`LinearEXL3.get_weight_tensor`: `ext.reconstruct` +
+Hadamard-128 + `diag(suh)/diag(svh)`), then compared in fp64 against the BF16
+original.
 
 24 experts spread over layers 3–10 (seed 42), all three projections,
 4 rank slices each → n = 72 per pair.
@@ -60,36 +59,32 @@ BF16 original.
 | Pair | cos mean / min | relF mean / max | max abs | reading |
 |---|---|---|---|---|
 | 3.42 expanded ≡ 3.42 shared-h | **1.00000 / 1.00000** (bitwise EQUAL) | 0.0000 / 0.0000 | 0.0000 | exact expansion, proven at the weights |
-| 3.42-K4 vs BF16 | 0.99684 / 0.99625 | 0.0793 / 0.0866 | 0.0129 | producer A's K4 quality |
-| 3.36-K4 vs BF16 | 0.99684 / 0.99626 | 0.0792 / 0.0864 | 0.0142 | producer B's K4 quality |
-| 3.42-K4 vs 3.36-K4 | 0.99370 / 0.99255 | 0.1120 / 0.1221 | 0.0196 | the two K4 encodes against each other |
-| brandonmusic-K3 vs BF16 | 0.98761 / 0.98566 | 0.1569 / 0.1692 | 0.0284 | the K3 tier, for scale |
-| brandonmusic-K3 vs 3.42-K4 | 0.98452 / 0.98229 | 0.1754 / 0.1881 | 0.0340 | cross-producer, cross-bitrate |
-| brandonmusic-K3 vs 3.36-K4 | 0.98466 / 0.98245 | 0.1746 / 0.1873 | 0.0305 | cross-producer, cross-bitrate |
+| willfalco 3.42 K4 vs BF16 | 0.99684 / 0.99625 | 0.0793 / 0.0866 | 0.0129 | quality of this K4 encode |
+| willfalco 3.36 K4 vs BF16 | 0.99684 / 0.99626 | 0.0792 / 0.0864 | 0.0142 | quality of this K4 encode |
+| willfalco 3.42 K4 vs willfalco 3.36 K4 | 0.99370 / 0.99255 | 0.1120 / 0.1221 | 0.0196 | the two K4 encodes against each other |
+| brandonmusic K3 vs BF16 | 0.98761 / 0.98566 | 0.1569 / 0.1692 | 0.0284 | the K3 tier, for scale |
+| brandonmusic K3 vs willfalco 3.42 K4 | 0.98452 / 0.98229 | 0.1754 / 0.1881 | 0.0340 | cross-uploader, cross-bitrate |
+| brandonmusic K3 vs willfalco 3.36 K4 | 0.98466 / 0.98245 | 0.1746 / 0.1873 | 0.0305 | cross-uploader, cross-bitrate |
 
 Three things fall out of those numbers:
 
-1. **The two independent K4 producers are indistinguishable in quality.**
+1. **The two willfalco K4 encodes have nearly the same measured quality.**
    Both sit at relative Frobenius error ≈ 0.079 from the BF16 original — a
-   spread of 0.0001 between encodes that share nothing but the base model and
-   the calibration corpus. A K4 expert slot filled from either producer buys
-   the same accuracy. That is interoperability as a *measured* property, not
-   a format assertion.
-2. **They are genuinely independent, and they agree.** The two K4 encodes
-   differ from each other (relF 0.112) by more than either differs from
-   ground truth (0.079) — precisely the √2 factor two unbiased quantizers
-   scattering independently around the same target produce
-   (√2 × 0.079 = 0.112, observed 0.112). Copies would have collapsed to 0;
-   disagreement about the underlying weight would have exceeded it.
-3. **The bitrate ordering is monotone everywhere.** K3 sits at relF 0.157,
+   spread of 0.0001 in this sample. That supports comparability of these two
+   published encodes; it does not establish producer independence.
+2. **They are different bytes.** The two K4 encodes differ from each other
+   (relF 0.112), while each is measured against the same ground truth (0.079).
+   This is consistent with distinct encodes, but provenance claims stop at the
+   signed source records and uploader identity.
+3. **The bitrate ordering is monotone in this sample.** K3 sits at relF 0.157,
    K4 at 0.079 — a 1.98× step, matching the campaign's measured per-K error
-   ladder. A mixed recipe that upgrades experts to K4 fragments from *either*
-   producer buys the same step over the K3 base.
+   ladder. A mixed recipe can upgrade a K3 base with a compatible K4 fragment,
+   subject to the source's explicit provenance and layout constraints.
 
-**What is not claimed:** fragments from different producers are not
-bit-identical, and nothing here suggests they should be. The bounded claim is
-that the same expert slot, filled from either producer, decodes to weights
-equally close to the BF16 original.
+**What is not claimed:** K4 fragments from different encodes are not
+bit-identical, and this table does not prove their producers are independent.
+The bounded claim is the reported similarity to the BF16 original and between
+the sampled encodes.
 
 ## What each proof rung establishes
 
@@ -131,6 +126,6 @@ python tools/fq_verify.py --similarity \
 `fq_verify --identity` picks its check automatically: whole-shard sha256 when
 a local `--source` snapshot is given, fresh-ranged-read fragment comparison
 for a family primed from a remote repo, and full re-derivation for a
-`derived-from` family. Machine-readable JSON reports for every run behind
-this page live in the research branch under
-`research/fungible-quant/runs/0c-campaign/verify/`.
+`derived-from` family. Machine-readable JSON reports for every run behind this
+page are pinned at
+[`research/fungible-quant/runs/0c-campaign/verify/` revision `69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant/runs/0c-campaign/verify/).
