@@ -1450,6 +1450,11 @@ def render_md(report: dict) -> str:
 def detect_check(segments: Path, source: Path | None) -> str:
     if source is not None:
         return "local"
+    # fq_fetch writes this alongside each locally signed range subset.  It is
+    # only a mode selector, never a trust input; --check fetched still requires
+    # independently pinned publisher attestations.
+    if (segments / "fq-fetch-report.json").exists():
+        return "fetched"
     manifest_path = segments / "fq-manifest.json"
     predicate = None
     if manifest_path.exists():

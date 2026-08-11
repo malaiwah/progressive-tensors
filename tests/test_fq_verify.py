@@ -607,6 +607,7 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
             "--trust-signer", local, "--upstream-trust-signer", publisher,
             "--json", str(tmp_path / "fetched.json")]
     assert fq_verify.main(argv) == 0
+    assert fq_verify.detect_check(fam, None) == "fetched"
     report = json.loads((tmp_path / "fetched.json").read_text())
     assert report["summary"]["segments_verified"] > 0
 
