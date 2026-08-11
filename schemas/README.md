@@ -49,6 +49,18 @@ Concretely, the compatibility rules we hold ourselves to now:
   as such, because each one is a different claim about how the bytes came to
   exist.
 
+## Per-K sparse coverage
+
+The v1 `per_k[K].layers` field is a legacy inclusive `[minimum, maximum]`
+convenience. It cannot establish coverage for a sparse K: when
+`per_k[K].layer_coverage` is absent, consumers must read the signed
+`index-kK.json` keys.
+
+New producers write `per_k[K].layer_coverage` as
+`{"schema": "fq-layer-coverage/1", "layers": [...]}`. Its `layers` is the
+**exact sorted membership list** and is the coverage authority: a layer not
+listed is unavailable for that K, including values between two listed layers.
+
 ## Validating
 
 ```bash

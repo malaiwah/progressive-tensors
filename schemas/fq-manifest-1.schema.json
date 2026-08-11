@@ -165,10 +165,34 @@
               },
               "layers": {
                 "type": "array",
+                "description": "Legacy inclusive [minimum, maximum] layer extrema. This is not exact sparse coverage; use layer_coverage when present, otherwise read the index keys.",
                 "items": {
                   "type": "integer"
                 },
                 "maxItems": 2
+              },
+              "layer_coverage": {
+                "type": "object",
+                "description": "Versioned exact sparse coverage. When present, its layers list is the coverage authority.",
+                "required": [
+                  "schema",
+                  "layers"
+                ],
+                "properties": {
+                  "schema": {
+                    "const": "fq-layer-coverage/1"
+                  },
+                  "layers": {
+                    "type": "array",
+                    "description": "Exact sorted layer membership. A layer absent from this list is not published for this K.",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "uniqueItems": true
+                  }
+                },
+                "additionalProperties": false
               },
               "segment_count": {
                 "type": "integer",
