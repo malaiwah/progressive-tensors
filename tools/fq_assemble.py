@@ -348,10 +348,21 @@ def digest_file_and_spans(path: Path, spans: dict[str, tuple[int, int]]
 
 
 def _resolve_explicit_signer(token: str, trust_root: Path | None) -> str:
-    """Resolve one explicit pin with the shared trust-root contract."""
+    """Resolve one explicit pin with the shared trust-root contract.
+
+    Preserve assembler's legacy ``ed25519:`` spelling and bare local ``.pub``
+    filenames while handing their canonical values to fq_trust.
+    """
+    spec = token.strip()
+    if spec.lower().startswith("ed25519:"):
+        spec = spec.split(":", 1)[1]
+    pub_path = Path(spec)
+    if (pub_path.suffix.lower() == ".pub" and pub_path.is_file()
+            and os.sep not in spec):
+        spec = f".{os.sep}{spec}"
     try:
         verifier = TrustVerifier.resolve(
-            trust_signer=token, trust_root=trust_root)
+            trust_signer=spec, trust_root=trust_root)
     except TrustError as e:
         raise VerificationError(str(e)) from e
     assert verifier.fingerprint is not None

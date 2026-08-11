@@ -377,6 +377,27 @@ def test_trust_signer_tokens_match_shared_resolver(repacked, kind):
                     "--trust-signer", token) == 0
 
 
+@pytest.mark.parametrize("kind", ("ed25519-prefix", "bare-pub-path"))
+def test_legacy_trust_signer_tokens_remain_supported(repacked, monkeypatch, kind):
+    """Legacy assembler spellings retain the same explicit-key verification."""
+    snap, segments, tmp = repacked
+    pub = signer_of(segments)
+    root = write_trust_root(
+        tmp / "FINGERPRINTS", (pub, "assemble-test-signer", "active"))
+    pub_path = tmp / "assemble-test-signer.pub"
+    pub_path.write_text(pub + "\n")
+    if kind == "ed25519-prefix":
+        token = f"ed25519:{pub}"
+    else:
+        token = pub_path.name
+        monkeypatch.chdir(tmp)
+
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    assert assemble(segments, snap, ppath, tmp / f"asm-{kind}",
+                    "--trust-root", str(root),
+                    "--trust-signer", token) == 0
+
+
 def test_trust_signer_rejections_match_shared_resolver(repacked):
     """Short, ambiguous, unknown, and revoked pins fail with fq_trust's text."""
     snap, segments, tmp = repacked
