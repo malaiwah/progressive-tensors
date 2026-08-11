@@ -505,7 +505,7 @@ class Source:
             return False
         if self.require_release_coverage:
             return True
-        selected = {self.revision}
+        selected = {self.requested_revision, self.revision}
         if self.resolved_commit:
             selected.add(self.resolved_commit)
         if any(value and str(value) in selected
