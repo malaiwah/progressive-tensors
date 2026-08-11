@@ -115,8 +115,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fq_repack import (  # noqa: E402
     EXPERT_RE,
     Signer,
+    SourceLayoutError,
     atomic_write_json,
     expert_key,
+    preflight_source_layout,
     read_header,
     sha256_file,
 )
@@ -1219,6 +1221,18 @@ def main(argv=None) -> int:
             continue
         jobs.append((src_shard, layer, bpe.get(str(layer))))
 
+    layout = policy.get("layout") or manifest.get("layout")
+    source_targets = {
+        layer: set(range(len(lb)))
+        for _src, layer, lb in jobs
+        if lb is not None
+    }
+    try:
+        # Source-only evidence is checked before a segment is even opened.
+        preflight_source_layout(args.source, layout=layout, targets=source_targets)
+    except SourceLayoutError as e:
+        raise AssemblyError(str(e)) from e
+
     # Every segment is opened and authenticated BEFORE the output dir is
     # touched: a bad fragment (or a bad trust configuration) must never cost
     # the operator a previous checkpoint via --force, and the readers stay
@@ -1227,6 +1241,7 @@ def main(argv=None) -> int:
     total, seg_records = {}, []
     staged = StagedOutput(args.out, args.force)
     try:
+        segment_targets = {}
         for _src, layer, lb in jobs:
             for k in sorted(set(lb or ())):
                 seg = args.segments / f"layer-{layer:03d}.k{k}.safetensors"
@@ -1234,9 +1249,22 @@ def main(argv=None) -> int:
                     raise FileNotFoundError(
                         f"missing segment {seg} for layer {layer}")
                 readers[(layer, k)] = SegmentReader(seg)
+                segment_targets[(layer, k)] = {
+                    e for e, assigned_k in enumerate(lb) if assigned_k == k}
+        try:
+            # Segment headers are enough to compare TP-bearing axes; no
+            # fragment bytes have been hashed or staged at this point.
+            preflight_source_layout(
+                args.source, layout=layout, targets=source_targets,
+                segment_headers={key: reader.hdr for key, reader in readers.items()},
+                segment_targets=segment_targets)
+        except SourceLayoutError as e:
+            raise AssemblyError(str(e)) from e
+        for _src, layer, lb in jobs:
+            for k in sorted(set(lb or ())):
                 seg_records.append(verifier.verify(
                     layer, k, readers[(layer, k)],
-                    [e for e, kk in enumerate(lb) if kk == k]))
+                    [e for e, assigned_k in enumerate(lb) if assigned_k == k]))
         if args.insecure:
             who = "NOT VERIFIED (--insecure)"
         else:
