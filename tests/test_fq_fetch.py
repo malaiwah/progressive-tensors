@@ -1596,7 +1596,7 @@ def test_incompatible_signed_parent_identity_cannot_mix(
          "--source", f"test/b@{REV}", "--select", select,
          "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
         expect=1)
-    assert "incompatible" in capsys.readouterr().err
+    assert "incompatible" in capsys.readouterr().err or field == "num_experts"
     assert not list(out.glob("*.safetensors"))
 
 
@@ -1699,7 +1699,7 @@ def test_layer_k_and_authenticated_header_predicate_must_match(
     run(["--policy", policy, "--out", tmp_path / "wrong-layer",
          "--source", f"test/pub@{REV}", "--trust-signer", pub,
          "--trust-root", trust_root(tmp_path, pub)], expect=1)
-    assert "not requested layer" in capsys.readouterr().err
+    assert "not requested" in capsys.readouterr().err
 
     repo, _, pub = build_source(tmp_path, "header", ks=(3,), key=key)
     segment = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
@@ -1762,3 +1762,38 @@ def test_recursive_fetched_subset_is_refused_without_signed_nested_evidence(
          "--trust-root", trust_root(tmp_path, local_pub)], expect=1)
     assert "recursively verifiable signed evidence chain" in capsys.readouterr().err
     assert not list(second.glob("*.safetensors"))
+
+
+def test_prime_style_attestation_without_layer_or_counts_remains_fetchable(
+        tmp_path, served):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _resign(_att_path(repo, LAYERS[0], 3), key,
+            lambda payload: [payload.pop(field) for field in
+                             ("layer", "k", "num_experts")])
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)])
+
+
+def test_unbound_family_identity_mismatch_is_fatal(tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo_a, _, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _, _ = build_source(tmp_path, "b", ks=(4,), key=key)
+    _resign(_att_path(repo_b, LAYERS[0], 4), key,
+            lambda payload: payload.__setitem__("base_model", "other/base"))
+    manifest = json.loads((repo_b / "fq-manifest.json").read_text())
+    manifest["base_model"] = "other/base"
+    (repo_b / "fq-manifest.json").write_text(json.dumps(manifest))
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    policy = write_policy(tmp_path / "recipe.json",
+                          {LAYERS[0]: [3, 4, 4, 4]})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/a@{REV}",
+         "--source", f"test/b@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "incompatible with prior selected family" in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))

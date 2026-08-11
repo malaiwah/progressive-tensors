@@ -638,18 +638,25 @@ class Source:
         fragment = payload.get("fragment")
         if not isinstance(fragment, dict) or fragment.get("file") != segment_file:
             raise TrustError(f"{where}: fragment does not name {segment_file}")
-        if payload.get("layer") != layer or payload.get("k") != k:
-            raise TrustError(
-                f"{where}: attests layer {payload.get('layer')!r} K"
-                f"{payload.get('k')!r}, not requested layer {layer} K{k}")
+        for field, expected in (("layer", layer), ("k", k)):
+            declared = payload.get(field)
+            if declared is not None and declared != expected:
+                raise TrustError(
+                    f"{where}: attests {field} {declared!r}, not requested "
+                    f"{expected!r}")
         base_model, layout = payload.get("base_model"), payload.get("layout")
-        count = payload.get("num_experts")
+        fragment_count = payload.get("num_experts")
         if not isinstance(base_model, str) or not base_model:
             raise TrustError(f"{where}: accepted predicate lacks base_model")
         if not isinstance(layout, str) or not layout:
             raise TrustError(f"{where}: accepted predicate lacks layout")
-        if not isinstance(count, int) or count <= 0:
-            raise TrustError(f"{where}: accepted predicate lacks num_experts")
+        if fragment_count is not None and (
+                not isinstance(fragment_count, int) or fragment_count <= 0):
+            raise TrustError(f"{where}: num_experts is invalid")
+        family_count = payload.get("family_num_experts")
+        if family_count is not None and (
+                not isinstance(family_count, int) or family_count <= 0):
+            raise TrustError(f"{where}: family_num_experts is invalid")
         digests = payload.get("expert_sha256")
         if not isinstance(digests, dict) or not digests:
             raise TrustError(f"{where}: accepted predicate lacks expert_sha256")
@@ -681,7 +688,8 @@ class Source:
                 f"fq-manifest.json {published_revision!r}")
         return {"predicate": predicate, "base_model": base_model,
                 "base_revision": revision, "layout": layout,
-                "num_experts": count, "fragment_num_experts": count,
+                "num_experts": family_count,
+                "fragment_num_experts": fragment_count,
                 "layer": layer, "k": k}
 
     def attestation(self, layer: int, k: int, verifier: fq_trust.Verifier,
@@ -1625,25 +1633,23 @@ def plan_fetch(policy: dict[int, dict[int, int]], sources: list[Source],
             identities = [(src, plan.atts[src.slug]["identity"])
                           for src in selected.values()]
             canonical = identities[0][1]
-            contract_fields = ("base_model", "base_revision", "layout", "num_experts")
+            contract_fields = ("base_model", "base_revision", "layout")
             mismatch = next(
                 ((src, ident) for src, ident in identities
                  if any(ident[field] != canonical[field] for field in contract_fields)),
                 None)
             if mismatch:
                 src, ident = mismatch
-                problems.append(
-                    f"layer {layer} K{k}: {src} identity {ident} is incompatible "
-                    f"with selected parent identity {canonical}")
-                continue
+                raise TrustError(
+                    f"layer {layer} K{k}: {src} identity {ident} is "
+                    f"incompatible with selected parent identity {canonical}")
             current_family = {field: canonical[field] for field in contract_fields}
             if family is None:
                 family = current_family
             elif family != current_family:
-                problems.append(
+                raise TrustError(
                     f"layer {layer} K{k}: selected family {current_family} is "
                     f"incompatible with prior selected family {family}")
-                continue
             plan.identity = canonical
             _build_file_plan(plan, chosen, problems)
             if plan.pieces:
@@ -1667,12 +1673,18 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
         for field, want in (("base_model", att["base_model"]),
                             ("layout", att["layout"]),
                             ("predicate", att["predicate"]),
-                            ("layer", str(plan.layer)), ("k", str(plan.k)),
-                            ("num_experts", str(att["fragment_num_experts"]))):
+                            ("layer", str(plan.layer)), ("k", str(plan.k))):
             if str(meta.get(field)) != str(want):
                 raise TrustError(
                     f"{plan.name}: {src} authenticated header {field}="
                     f"{meta.get(field)!r} disagrees with signed {want!r}")
+        fragment_count = att["fragment_num_experts"]
+        if (fragment_count is not None
+                and str(meta.get("num_experts")) != str(fragment_count)):
+            raise TrustError(
+                f"{plan.name}: {src} authenticated header num_experts="
+                f"{meta.get('num_experts')!r} disagrees with signed "
+                f"{fragment_count!r}")
         # Older fq-segment/1 headers do not repeat the base revision.  The
         # signed attestation is still authoritative for it; when a header
         # does declare one it must agree.
@@ -1683,7 +1695,7 @@ def validate_authenticated_plan_compatibility(plan: FilePlan) -> None:
                 f"{meta['revision']!r} disagrees with signed "
                 f"{att['base_revision']!r}")
         if any(att[field] != expected[field] for field in
-               ("base_model", "base_revision", "layout", "num_experts")):
+               ("base_model", "base_revision", "layout")):
             raise TrustError(
                 f"{plan.name}: {src} signed identity is incompatible with "
                 "the selected family")
