@@ -682,16 +682,16 @@ class Source:
                 f"signed size, so the fragment cannot be verified in full. "
                 f"Ask the publisher for fragment.header_sha256.")
         retained = {}
-        if retain:
-            spool = self.cache / ".verified-pieces"
-            spool.mkdir(exist_ok=True)
-            for piece in retain:
-                path = spool / (
-                    f"{name}.{piece.remote_start}-{piece.remote_end}."
-                    f"{os.getpid()}-{time.time_ns()}")
-                path.write_bytes(b"")
-                retained[piece] = path
         try:
+            if retain:
+                spool = self.cache / ".verified-pieces"
+                spool.mkdir(exist_ok=True)
+                for piece in retain:
+                    path = spool / (
+                        f"{name}.{piece.remote_start}-{piece.remote_end}."
+                        f"{os.getpid()}-{time.time_ns()}")
+                    path.write_bytes(b"")
+                    retained[piece] = path
             url = self.url(name)
             digest = hashlib.sha256()
             head = bytearray()
@@ -1446,6 +1446,8 @@ def save_state(out: Path, state: dict) -> None:
 def _completed_entry(plan: FilePlan, target: Path) -> dict:
     """Re-establish every claim a done-state entry is allowed to make."""
     expected_header = {"__metadata__": plan.meta, **plan.header}
+    expected_hj = json.dumps(expected_header, separators=(",", ":")).encode()
+    expected_hj += b" " * ((8 - len(expected_hj) % 8) % 8)
     size = target.stat().st_size
     digest = hashlib.sha256()
     with open(target, "rb") as f:
@@ -1453,20 +1455,19 @@ def _completed_entry(plan: FilePlan, target: Path) -> dict:
         if len(prefix) != 8:
             raise TrustError(f"{plan.name}: completed file has no safetensors header")
         hlen = struct.unpack("<Q", prefix)[0]
-        if not 0 < hlen < (1 << 31):
-            raise TrustError(f"{plan.name}: completed file has an implausible header")
+        # State-controlled bytes must never select an unbounded read.  A
+        # completed subset has exactly the canonical header SegmentWriter
+        # would produce for this authenticated plan.
+        if hlen != len(expected_hj):
+            raise TrustError(
+                f"{plan.name}: completed file header length does not match "
+                "the authenticated plan")
         hj = f.read(hlen)
-        if len(hj) != hlen:
-            raise TrustError(f"{plan.name}: completed file has a short header")
-        body_offset = 8 + hlen
-        try:
-            header = json.loads(hj)
-        except json.JSONDecodeError as e:
-            raise TrustError(f"{plan.name}: completed file header is invalid JSON") from e
-        if header != expected_header:
+        if hj != expected_hj:
             raise TrustError(
                 f"{plan.name}: completed file header no longer matches the "
                 "authenticated plan")
+        body_offset = 8 + hlen
         if size != body_offset + plan.body_size:
             raise TrustError(
                 f"{plan.name}: completed file size no longer matches the plan")

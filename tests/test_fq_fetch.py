@@ -795,6 +795,27 @@ def test_done_output_is_rehashed_before_it_is_resigned(tmp_path, served):
     assert any(name == seg.name for name, _, _ in served["ranges"])
 
 
+def test_done_output_header_length_is_bounded_by_authenticated_plan(tmp_path,
+                                                                    served):
+    repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", pub,
+            "--trust-root", str(trust_root(tmp_path, pub))]
+    run(argv)
+    seg = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = bytearray(seg.read_bytes())
+    raw[:8] = struct.pack("<Q", 1 << 62)
+    seg.write_bytes(raw)
+    served["ranges"].clear()
+    run(argv)
+    fixed = seg.read_bytes()
+    assert struct.unpack("<Q", fixed[:8])[0] < len(fixed)
+    assert any(name == seg.name for name, _, _ in served["ranges"])
+
+
 def test_header_trust_attested_refuses_when_no_digest_is_published(tmp_path,
                                                                    served,
                                                                    capsys):
