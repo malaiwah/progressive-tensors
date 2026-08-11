@@ -2204,10 +2204,9 @@ def local_attestation(plan: FilePlan, entry: dict, verifier: fq_trust.Verifier,
         "base_model": plan.identity.get("base_model"),
         "base_revision": plan.identity.get("base_revision"),
         "layout": plan.identity.get("layout"),
-        # This is the authenticated full family count, not len(plan.pieces):
-        # a mixed-K recipe distributes one dense layer across multiple
-        # derived subset files, each of which must remain usable as a source.
-        "num_experts": plan.family_num_experts,
+        # Unknown family cardinality remains explicit: the local fragment's
+        # count is still true, while no unsound full-family claim is made.
+        "num_experts": getattr(plan, "family_num_experts", len(plan.pieces)),
         "derivation": {
             "rule": "range_subset_v1",
             "description": (

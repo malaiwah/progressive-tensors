@@ -1547,6 +1547,31 @@ def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
     assert "1" not in index[str(LAYERS[0])]["experts"]
 
 
+
+def test_sparse_unknown_family_cardinality_remains_materializable(
+        tmp_path, served, capsys):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _resign(_att_path(repo, LAYERS[0], 3), key,
+            lambda payload: (payload["expert_sha256"].pop("3"),
+                             payload["expert_sha256"].update(
+                                 {"4": payload["expert_sha256"]["2"]})))
+    segment = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = bytearray(segment.read_bytes())
+    hlen = struct.unpack("<Q", raw[:8])[0]
+    raw[8:8 + hlen] = raw[8:8 + hlen].replace(b".experts.3.", b".experts.4.")
+    segment.write_bytes(raw)
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub),
+         "--header-trust", "unsafe"])
+    assert "no attested digest" in capsys.readouterr().err
+    payload = _payload(
+        out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
+    assert payload["num_experts"] == E - 1
+
 def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
     repo, snap, pub = build_source(tmp_path, "pub", ks=(3,))
     served["mount"]("test/pub", repo)
