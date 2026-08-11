@@ -315,8 +315,9 @@ def test_authenticated_header_cannot_escape_signed_family_bounds(monkeypatch):
             policy, [plan], fq_fetch.HEADER_AUTO)
 
 
-def test_signed_expert_digest_union_supports_legacy_primed_family(monkeypatch):
-    """Older primed attestations prove full cardinality through K-union."""
+def test_signed_expert_digest_union_supports_selected_legacy_primed_family(
+        monkeypatch):
+    """Selected legacy K tiers can jointly prove a dense family inventory."""
     source = _CardinalitySource(experts=4, manifest_experts=4)
     source.manifest = {"k_variants": [3, 4]}
     source.index = lambda k: {"3": {"file": f"layer-003.k{k}.safetensors"}}
@@ -324,23 +325,37 @@ def test_signed_expert_digest_union_supports_legacy_primed_family(monkeypatch):
             4: {"1": "c" * 64, "3": "d" * 64}}
     source.attestation = lambda layer, k, verifier, filename: {
         "expert_sha256": by_k[k]}
-    source.header = {
-        "__metadata__": {"num_experts": "2"},
-        **{f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis": {}
-           for expert in (0, 2)},
+    headers = {
+        3: {
+            "__metadata__": {"num_experts": "2"},
+            **{f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis": {}
+               for expert in (0, 2)},
+        },
+        4: {
+            "__metadata__": {"num_experts": "2"},
+            **{f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis": {}
+               for expert in (1, 3)},
+        },
     }
-    policy = {3: {expert: 3 for expert in range(4)}}
-    plan = type("Plan", (), {
-        "layer": 3, "k": 3, "meta": {},
-        "atts": {source.slug: {"expert_sha256": by_k[3]}},
-        "pieces": [type("Piece", (), {"source": source})()]})()
+    source.segment_header = lambda layer, k: (headers[k], 0)
+    policy = {3: {0: 3, 1: 4, 2: 3, 3: 4}}
+    plans = [
+        type("Plan", (), {
+            "layer": 3, "k": k, "meta": {},
+            "atts": {source.slug: {"expert_sha256": by_k[k]}},
+            "pieces": [type("Piece", (), {"source": source})()]})()
+        for k in (3, 4)
+    ]
 
-    fq_fetch.validate_policy_cardinality(policy, [plan], [source], object())
+    fq_fetch.validate_policy_cardinality(policy, plans, [source], object())
     monkeypatch.setattr(fq_fetch, "authenticate_plan", lambda plan, mode: None)
     fq_fetch.authenticate_policy_cardinality(
-        policy, [plan], fq_fetch.HEADER_AUTO)
-    assert plan.attested_expert_counts[source.slug] == 4
-    assert plan.meta["num_experts"] == "4"
+        policy, plans, fq_fetch.HEADER_AUTO)
+    for plan in plans:
+        assert plan.attested_expert_counts[source.slug] == 4
+        assert plan.meta["num_experts"] == "4"
+
+
 
 # --------------------------------------------------------------------- tests
 
@@ -358,7 +373,7 @@ def test_dry_run_reports_savings_and_writes_nothing(tmp_path, served, capsys):
     assert plan["ranged_bytes"] < plan["whole_segment_files_bytes"]
     assert plan["whole_segment_files_bytes"] < plan["whole_repo_bytes"]
     assert not list(out.glob("*.safetensors"))
-    assert "what `hf download <repo>` costs" in capsys.readouterr().out
+    assert "downloading all files in the selected tier indexes" in capsys.readouterr().out
 
 
 def _fetch_all(tmp_path, served, extra=()):
@@ -829,6 +844,51 @@ def test_stale_release_allows_new_individually_attested_object_by_default(
     assert source["release_coverage"]["index-k4.json"] is False
     assert report["experts"][str(LAYERS[0])]["k4"]["0"]["release_covered"] is False
     assert "release_covered:false" in capsys.readouterr().out
+
+
+def test_k3_policy_does_not_read_unsupported_unselected_k_siblings(
+        tmp_path, served):
+    """A dense selected K3 attestation must end cardinality discovery."""
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(2, 3))
+    key = tmp_path / "pub.key"
+    k2_attestation = repo / "attestations" / f"layer-{LAYERS[0]:03d}.k2.jsonl"
+    envelope = json.loads(k2_attestation.read_text())
+    payload = json.loads(base64.b64decode(envelope["payload"]))
+    payload["predicate"] = "encode-of"
+    k2_attestation.write_text(fq_repack.Signer(key).sign_line(payload) + "\n")
+    manifest = json.loads((repo / "fq-manifest.json").read_text())
+    manifest["k_variants"] = [2, 3, 4, 5]
+    manifest["tensor_indexes"].update({
+        "4": "index-k4.json",
+        "5": "index-k5.json",
+    })
+    (repo / "fq-manifest.json").write_text(json.dumps(manifest))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub), "--dry-run"])
+    assert not {"index-k2.json", "index-k4.json", "index-k5.json",
+                f"layer-{LAYERS[0]:03d}.k2.jsonl"} & set(served["full"])
+
+
+def test_k3_policy_does_not_read_stale_unselected_k_index(tmp_path, served):
+    """A stale release entry for K2 cannot invalidate selected K3."""
+    repo, _snap, pub = build_source(tmp_path, "pub", ks=(2, 3))
+    key = tmp_path / "pub.key"
+    assert fq_release.main([
+        "build", "--dir", str(repo), "--release", "test 0.1.0",
+        "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
+    stale_index = repo / "index-k2.json"
+    stale_index.write_text(json.dumps(json.loads(stale_index.read_text()),
+                                      indent=1))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub), "--dry-run"])
+    assert not {"index-k2.json", f"layer-{LAYERS[0]:03d}.k2.jsonl"} & set(
+        served["full"])
 
 
 def test_require_release_coverage_rejects_stale_unreleased_object_before_payload(

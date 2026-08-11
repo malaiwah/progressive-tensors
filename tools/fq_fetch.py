@@ -1217,56 +1217,41 @@ def _signed_expert_count(attestation: dict, *, layer: int, source: Source) -> in
 
 
 def _attested_cardinality(source: Source, layer: int, k: int,
-                          verifier: fq_trust.Verifier) -> int | None:
-    """Get a trusted family cardinality without reading segment payload bytes.
+                          verifier: fq_trust.Verifier,
+                          attestation: dict | None = None) -> int | None:
+    """Get a trusted family cardinality from one signed attestation.
 
-    New producers sign ``family_num_experts`` directly. Older primed
-    families omit it and sign the per-expert digest map instead; unioning
-    those signed maps across their advertised K files supplies the same
-    dense inventory without trusting a ranged header or fetching a parent
-    body. A sparse map establishes no dense cardinality.
+    Callers that already selected a segment pass its verified attestation, so
+    deriving cardinality cannot read an unrelated K sibling.  The optional
+    lookup remains for a policy with no selected tier at all.  Older primed
+    attestations omit ``family_num_experts``; their dense digest map proves
+    cardinality by itself, while a sparse map establishes none.
     """
-    index = source.index(k) or {}
-    entry = index.get(str(layer))
-    if not entry:
-        raise TrustError(
-            f"layer {layer}: {source} has no K{k} segment with a signed "
-            "expert cardinality")
-    attestation = source.attestation(layer, k, verifier, entry["file"])
+    if attestation is None:
+        index = source.index(k) or {}
+        entry = index.get(str(layer))
+        if not entry:
+            raise TrustError(
+                f"layer {layer}: {source} has no K{k} segment with a signed "
+                "expert cardinality")
+        attestation = source.attestation(layer, k, verifier, entry["file"])
     identity = attestation.get("identity")
     if ((identity or {}).get("num_experts") is not None
             or (identity is None and attestation.get("num_experts") is not None)):
         return _signed_expert_count(attestation, layer=layer, source=source)
-
-    experts: set[int] = set()
-    variants = {int(k)}
-    for variant in source.manifest.get("k_variants") or ():
-        try:
-            variants.add(int(variant))
-        except (TypeError, ValueError):
-            continue
-    for variant in sorted(variants):
-        candidate = source.index(variant) or {}
-        candidate_entry = candidate.get(str(layer))
-        if not candidate_entry:
-            continue
-        candidate_attestation = source.attestation(
-            layer, variant, verifier, candidate_entry["file"])
-        digests = candidate_attestation.get("expert_sha256")
-        if not isinstance(digests, dict):
-            raise TrustError(
-                f"layer {layer}: {source} K{variant} signed attestation has "
-                "neither family_num_experts nor an expert_sha256 map")
-        try:
-            experts.update(int(expert) for expert in digests)
-        except (TypeError, ValueError) as e:
-            raise TrustError(
-                f"layer {layer}: {source} K{variant} signed expert ids are "
-                "not integers") from e
+    digests = attestation.get("expert_sha256")
+    if not isinstance(digests, dict):
+        raise TrustError(
+            f"layer {layer}: {source} K{k} signed attestation has neither "
+            "family_num_experts nor an expert_sha256 map")
+    try:
+        experts = {int(expert) for expert in digests}
+    except (TypeError, ValueError) as e:
+        raise TrustError(
+            f"layer {layer}: {source} K{k} signed expert ids are not integers"
+        ) from e
     count = len(experts)
-    if experts != set(range(count)):
-        return None
-    return count
+    return count if experts == set(range(count)) else None
 
 
 def _check_policy_length(layer: int, bits: dict[int, int],
@@ -1296,6 +1281,8 @@ def validate_policy_cardinality(policy: dict[int, dict[int, int]],
     transfer when a publisher has not yet signed a header digest.
     """
     counts: dict[int, set[int]] = {}
+    planned_layers = {plan.layer for plan in plans}
+    selected: dict[tuple[int, str], list[tuple[FilePlan, Source, dict]]] = {}
     seen: set[tuple[int, str, int]] = set()
     for plan in plans:
         for piece in plan.pieces:
@@ -1303,22 +1290,52 @@ def validate_policy_cardinality(policy: dict[int, dict[int, int]],
             if key in seen:
                 continue
             seen.add(key)
-            if plan.atts.get(piece.source.slug) is None:
+            attestation = plan.atts.get(piece.source.slug)
+            if attestation is None:
                 raise TrustError(
                     f"layer {plan.layer}: {piece.source} has no trusted "
                     "attestation for its planned segment")
-            count = _attested_cardinality(
-                piece.source, plan.layer, plan.k, verifier)
-            if count is not None:
-                known = getattr(plan, "attested_expert_counts", {})
-                known[piece.source.slug] = count
-                plan.attested_expert_counts = known
-                counts.setdefault(plan.layer, set()).add(count)
+            selected.setdefault((plan.layer, piece.source.slug), []).append(
+                (plan, piece.source, attestation))
 
-    # An empty list routes no K and creates no plan.  Its cardinality still
-    # comes from an attestation, never from an unauthenticated header.
+    for (layer, _slug), evidence in selected.items():
+        direct: set[int] = set()
+        experts: set[int] = set()
+        for plan, source, attestation in evidence:
+            count = _attested_cardinality(
+                source, layer, plan.k, verifier, attestation)
+            if count is not None:
+                direct.add(count)
+            else:
+                try:
+                    experts.update(int(expert)
+                                   for expert in attestation["expert_sha256"])
+                except (TypeError, ValueError) as e:
+                    raise TrustError(
+                        f"layer {layer}: {source} K{plan.k} signed expert ids "
+                        "are not integers") from e
+        if len(direct) > 1:
+            raise TrustError(
+                f"layer {layer}: {evidence[0][1]} selected attestations "
+                f"disagree on family expert cardinality "
+                f"({', '.join(map(str, sorted(direct)))})")
+        count = next(iter(direct), None)
+        if count is None and experts == set(range(len(experts))):
+            count = len(experts)
+        if count is None:
+            continue
+        counts.setdefault(layer, set()).add(count)
+        for plan, source, _attestation in evidence:
+            known = getattr(plan, "attested_expert_counts", {})
+            known[source.slug] = count
+            plan.attested_expert_counts = known
+
+    # An empty list routes no K and creates no plan. Its cardinality still
+    # comes from an attestation, never from an unauthenticated header. A
+    # sparse selected tier deliberately does not enter this fallback: probing
+    # an unselected sibling would make its availability a policy dependency.
     for layer in policy:
-        if layer in counts:
+        if layer in counts or layer in planned_layers:
             continue
         for source in sources:
             for k in source.manifest.get("k_variants") or ():
@@ -2010,39 +2027,33 @@ def human(n: float) -> str:
     return f"{n:.2f} TB"
 
 
-def counterfactual(sources: list[Source], plans: list[FilePlan]) -> dict:
+def counterfactual(plans: list[FilePlan]) -> dict:
     """What the same recipe costs without ranged reads.
 
     whole_files: downloading every segment file the recipe touches.
-    whole_repo:  downloading every segment listed in every index the sources
-                 publish (the `hf download <repo>` the quickstart used to
-                 recommend), summed over the sources actually consulted.
+    whole_repo:  downloading every segment listed in the policy-selected
+                 tier indexes from the sources actually consulted.  This
+                 accounting deliberately never discovers unselected tiers:
+                 their availability and provenance must not affect a plan.
     """
     touched: dict[tuple[str, str], int] = {}
+    selected_indexes: dict[tuple[str, int], tuple[Source, dict]] = {}
     for plan in plans:
         for p in plan.pieces:
             idx = p.source.index(plan.k) or {}
+            selected_indexes[(p.source.slug, plan.k)] = (p.source, idx)
             entry = idx.get(str(plan.layer))
             if entry:
                 touched[(p.source.slug, entry["file"])] = entry["size"]
     whole_repo = 0
     seen_repo = set()
-    for src in sources:
-        ks = src.manifest.get("k_variants") or []
-        names = src.manifest.get("tensor_indexes") or {}
-        idx_names = set(names.values()) | {src.index_name(int(k)) for k in ks}
-        if not idx_names and src.manifest.get("tensor_index"):
-            idx_names = {src.manifest["tensor_index"]}
-        for name in sorted(idx_names):
-            raw = src.small_file(name)
-            if not raw:
+    for src, idx in selected_indexes.values():
+        for entry in idx.values():
+            key = (src.slug, entry.get("file"))
+            if key in seen_repo:
                 continue
-            for entry in json.loads(raw).values():
-                key = (src.slug, entry.get("file"))
-                if key in seen_repo:
-                    continue
-                seen_repo.add(key)
-                whole_repo += int(entry.get("size") or 0)
+            seen_repo.add(key)
+            whole_repo += int(entry.get("size") or 0)
     return {"whole_files": sum(touched.values()), "whole_repo": whole_repo,
             "files_touched": len(touched)}
 
@@ -2613,7 +2624,7 @@ def main(argv=None) -> int:
 
     needed = sum(pl.bytes_needed for pl in plans)
     experts = sum(len(pl.pieces) for pl in plans)
-    cf = counterfactual(sources, plans)
+    cf = counterfactual(plans)
     auth = authentication_cost(plans, args.header_trust)
     summary = {
         "experts": experts,
@@ -2630,9 +2641,9 @@ def main(argv=None) -> int:
     print(f"  ranged fetch:        {human(needed)}")
     print(f"  whole segment files: {human(cf['whole_files'])}"
           + (f"  ({cf['whole_files'] / max(needed, 1):.1f}x)" if needed else ""))
-    print(f"  whole repo download: {human(cf['whole_repo'])}"
+    print(f"  selected-tier download: {human(cf['whole_repo'])}"
           + (f"  ({cf['whole_repo'] / max(needed, 1):.1f}x)" if needed else "")
-          + "   <- what `hf download <repo>` costs")
+          + "   <- downloading all files in the selected tier indexes")
     print("  header authentication: "
           + ", ".join(f"{n}x {m}" for m, n in sorted(auth["methods"].items()))
           + (f"  (+{human(auth['extra_bytes'])} read to prove the plan; ask "
