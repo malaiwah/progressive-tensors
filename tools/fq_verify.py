@@ -32,6 +32,13 @@ Two modes, one per proof rung (see runs/0c-campaign/ATTESTATION-V2.md):
            re-hashed and checked against the pins in the expanded metadata,
            chaining this proof to the parent family's remote identity.
 
+  fetched  offline full provenance for a range-fetched subset: verify the
+           local derived-from line under --trust-signer, then every copied
+           publisher line under separately repeated --upstream-trust-signer
+           pins.  It binds files, indexes, expert spans, immutable source
+           revisions and header-planning evidence.  Unsafe header planning is
+           rejected unless --accept-unsafe-header-plan is explicit.
+
 --similarity  Numeric equivalence evidence: dequantize corresponding experts
            from two or more families with the reference exllamav3 reconstruct
            (GPU; run under the GG env) and report cosine similarity, relative
@@ -94,6 +101,88 @@ import fq_prime  # noqa: E402  (Transport, SHARED_RE, parse_int_set)
 import fq_trust  # noqa: E402
 from fq_trust import TrustError  # noqa: E402
 
+
+_ATTESTATION_VALIDATOR = None
+
+
+def attestation_validator():
+    """Load the shipped fq-attestation/1 contract for signed payload checks."""
+    global _ATTESTATION_VALIDATOR
+    if _ATTESTATION_VALIDATOR is None:
+        try:
+            import jsonschema
+        except ImportError as e:  # pragma: no cover - packaging failure
+            raise TrustError(
+                "fq_verify requires jsonschema to validate signed "
+                "fq-attestation/1 payloads") from e
+        schema_path = (Path(__file__).resolve().parent.parent / "schemas" /
+                       "fq-attestation-1.schema.json")
+        schema = json.loads(schema_path.read_text())
+        schema["$ref"] = "#/$defs/payload"
+        _ATTESTATION_VALIDATOR = jsonschema.Draft202012Validator(schema)
+    return _ATTESTATION_VALIDATOR
+
+
+def validate_attestation_payload(payload: dict, *, where: str) -> None:
+    """Fail closed unless a verified payload conforms to fq-attestation/1."""
+    errors = sorted(attestation_validator().iter_errors(payload),
+                    key=lambda e: list(e.absolute_path))
+    if errors:
+        path = ".".join(str(p) for p in errors[0].absolute_path) or "payload"
+        raise TrustError(f"{where}: invalid fq-attestation/1 {path}: "
+                         f"{errors[0].message}")
+
+
+
+def validate_shared_profile_payload(payload: dict, *, where: str) -> None:
+    """Validate legacy shared-profile attestations against the common contract.
+
+    fq-attestation/1 predates profiles and requires expert_sha256; profiles
+    instead have a per-tensor map.  Validate every shared field through the
+    schema with a synthetic structural expert digest, then require the real
+    profile-specific map below.
+    """
+    normalized = dict(payload)
+    normalized.setdefault("expert_sha256", {"0": "0" * 64})
+    validate_attestation_payload(normalized, where=where)
+    digests = payload.get("tensor_sha256")
+    if not isinstance(digests, dict) or not digests:
+        raise TrustError(f"{where}: shared_profile lacks tensor_sha256")
+    if any(not isinstance(name, str) or not isinstance(digest, str) or
+           len(digest) != 64 for name, digest in digests.items()):
+        raise TrustError(f"{where}: shared_profile has invalid tensor_sha256")
+
+def header_sha256(path: Path, body_offset: int) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read(body_offset)).hexdigest()
+
+
+def fragment_binding(path: Path, entry: dict, payload: dict) -> dict:
+    """Bind current bytes and signed claims; absence is a mismatch."""
+    fragment = payload.get("fragment") or {}
+    size = path.stat().st_size
+    sha = file_sha256(path)
+    body_offset = entry.get("body_offset")
+    signed_body_offset = fragment.get("body_offset")
+    body_ok = (signed_body_offset is None or
+               signed_body_offset == body_offset)
+    signed_header = fragment.get("header_sha256")
+    header_ok = (signed_header is None or
+                 (body_ok and isinstance(body_offset, int) and
+                  header_sha256(path, body_offset) == signed_header))
+    return {
+        "index_sha_match": sha == entry.get("sha256"),
+        "index_size_match": size == entry.get("size"),
+        "attestation_sha_match": sha == fragment.get("sha256"),
+        "attestation_size_match": size == fragment.get("size"),
+        "fragment_file_match": path.name == fragment.get("file"),
+        "body_offset_match": body_ok,
+        "header_sha_match": header_ok,
+    }
+
+
+def binding_ok(binding: dict) -> bool:
+    return all(binding.values())
 CHUNK = 1 << 24
 PROJS = ("gate_proj", "up_proj", "down_proj")
 
@@ -192,7 +281,8 @@ def make_verifier(args, manifest: dict) -> fq_trust.Verifier:
 
 
 def load_attestation(fam: Path, stem: str, verifier: fq_trust.Verifier,
-                     fragment_file: str | None = None):
+                     fragment_file: str | None = None, *,
+                     shared_profile: bool = False):
     """(payload, state) for attestations/<stem>.jsonl.
 
     The file is JSON Lines and is treated as such: every line is checked,
@@ -218,6 +308,8 @@ def load_attestation(fam: Path, stem: str, verifier: fq_trust.Verifier,
         try:
             payload = verifier.verify_envelope(json.loads(raw),
                                                where=f"{p.name}:{n}")
+            (validate_shared_profile_payload if shared_profile
+             else validate_attestation_payload)(payload, where=f"{p.name}:{n}")
         except (TrustError, json.JSONDecodeError, TypeError) as e:
             reasons.append(f"line {n}: {e}")
             continue
@@ -237,6 +329,28 @@ def load_attestation(fam: Path, stem: str, verifier: fq_trust.Verifier,
              else ATT_VERIFIED)
     return merged, state
 
+
+
+def load_attestation_path(path: Path, verifier: fq_trust.Verifier,
+                          fragment_file: str) -> tuple[dict | None, str]:
+    """Verify a copied publisher JSONL without trusting its directory name."""
+    if not path.exists():
+        return None, ATT_MISSING
+    reasons = []
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            payload = verifier.verify_envelope(json.loads(raw),
+                                               where=f"{path.name}:{n}")
+            validate_attestation_payload(payload, where=f"{path.name}:{n}")
+        except (TrustError, json.JSONDecodeError, TypeError) as e:
+            reasons.append(f"line {n}: {e}")
+            continue
+        if (payload.get("fragment") or {}).get("file") == fragment_file:
+            return payload, (ATT_NOT_CHECKED if verifier.rung == fq_trust.RUNG_NONE
+                             else ATT_VERIFIED)
+    return None, f"BAD: {'; '.join(reasons) or 'no signed line names this fragment'}"
 
 def attestation_ok(state: str | None) -> bool:
     """Only a positive verification counts.  MISSING, BAD and (on the
@@ -439,6 +553,7 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
 
     # ---- phase 1: full local integrity (segment files vs index + attestation)
     local_rows = []
+    local_payloads: dict[tuple[int, int], dict] = {}
     for k, idx in sorted(indexes.items()):
         for layer_s, entry in sorted(idx.items(), key=lambda kv: int(kv[0])):
             layer = int(layer_s)
@@ -447,10 +562,7 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
             seg = fam / entry["file"]
             payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}",
                                             verifier, entry["file"])
-            seg_sha = file_sha256(seg)
-            index_ok = seg_sha == entry["sha256"]
-            att_ok = (payload is not None
-                      and seg_sha == payload.get("fragment", {}).get("sha256"))
+            binding = fragment_binding(seg, entry, payload or {})
             n_bad = 0
             # No payload means no per-expert digests to check against: that is
             # len(experts) unproven spans, not zero mismatches.
@@ -459,16 +571,19 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
                                   entry["body_offset"] + hi)
                 if (payload or {}).get("expert_sha256", {}).get(str(eid)) != got:
                     n_bad += 1
-            ok = index_ok and att_ok and n_bad == 0 and attestation_ok(sig)
+            ok = bool(binding) and binding_ok(binding) and n_bad == 0 and attestation_ok(sig)
             failures += 0 if ok else 1
+            if payload is not None:
+                local_payloads[layer, k] = payload
             local_rows.append({"layer": layer, "k": k, "file": entry["file"],
-                               "index_sha_match": index_ok,
-                               "attestation_sha_match": att_ok, "signature": sig,
+                               **binding, "signature": sig,
                                "experts": len(entry["experts"]),
                                "expert_sha_mismatches": n_bad})
-            print(f"local  layer {layer:3d} k{k}: index={'ok' if index_ok else 'BAD'} "
-                  f"attestation={'ok' if att_ok else 'BAD'} sig={sig} "
-                  f"expert-mismatches={n_bad}/{len(entry['experts'])}", flush=True)
+            print(f"local  layer {layer:3d} k{k}: index="
+                  f"{'ok' if binding.get('index_sha_match') else 'BAD'} "
+                  f"attestation={'ok' if binding.get('attestation_sha_match') else 'BAD'} "
+                  f"sig={sig} expert-mismatches={n_bad}/{len(entry['experts'])}",
+                  flush=True)
 
     # ---- phase 2: fresh ranged re-reads of the pinned source
     remote_rows = []
@@ -480,12 +595,24 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
                 continue
             seg_path = fam / entry["file"]
             meta = segment_meta(fam, entry)
-            if meta.get("predicate") != "repack-of":
-                print(f"skip remote check of {entry['file']}: predicate "
-                      f"{meta.get('predicate')} (use --check derived)", flush=True)
+            payload = local_payloads.get((layer, k), {})
+            materials = payload.get("materials") or {}
+            meta = segment_meta(fam, entry)
+            signed_source_ok = (
+                payload.get("predicate") == "repack-of" and
+                all(isinstance(materials.get(field), str) and materials[field]
+                    for field in ("repo", "revision", "file")) and
+                all(meta.get(f"source_{field}") == materials[field]
+                    for field in ("repo", "revision", "file")))
+            if not signed_source_ok:
+                failures += 1
+                remote_rows.append({"layer": layer, "k": k, "file": entry["file"],
+                                    "signed_source_match": False})
+                print(f"remote layer {layer:3d} k{k}: signed source binding BAD",
+                      flush=True)
                 continue
-            url = (f"https://huggingface.co/{meta['source_repo']}/resolve/"
-                   f"{meta['source_revision']}/{meta['source_file']}")
+            url = (f"https://huggingface.co/{materials['repo']}/resolve/"
+                   f"{materials['revision']}/{materials['file']}")
             if url not in hdr_cache:
                 hdr_cache[url] = fetch_fresh_header(transport, url)
             hdr, body_off = hdr_cache[url]
@@ -529,7 +656,7 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
             finally:
                 reader.close()
 
-    # ---- phase 3: shared profiles, re-fetched and compared IN FULL
+    # ---- phase 3: authenticate shared profiles, then re-fetch them in full.
     profile_rows = []
     shared_idx = load_shared_index(fam)
     for layer_s, entry in sorted(shared_idx.items(), key=lambda kv: int(kv[0])):
@@ -537,27 +664,66 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
         if wanted is not None and layer not in wanted:
             continue
         prof_path = fam / entry["file"]
+        payload, sig = load_attestation(
+            fam, f"layer-{layer:03d}.shared", verifier, entry["file"],
+            shared_profile=True)
+        binding = (fragment_binding(prof_path, entry, payload)
+                   if payload is not None else {})
         meta = read_header(prof_path)[0].get("__metadata__", {})
-        url = (f"https://huggingface.co/{meta['source_repo']}/resolve/"
-               f"{meta['source_revision']}/{meta['source_file']}")
-        if url not in hdr_cache:
-            hdr_cache[url] = fetch_fresh_header(transport, url)
-        hdr, body_off = hdr_cache[url]
+        materials = (payload or {}).get("materials") or {}
+        signed_source_ok = (
+            (payload or {}).get("predicate") == "repack-of" and
+            (payload or {}).get("kind") == "shared_profile" and
+            all(isinstance(materials.get(field), str) and materials[field]
+                for field in ("repo", "revision", "file")) and
+            all(meta.get(f"source_{field}") == materials[field]
+                for field in ("repo", "revision", "file")))
+        deps = [
+            dep for (dep_layer, _), expert_payload in local_payloads.items()
+            if dep_layer == layer
+            for dep in expert_payload.get("dependencies", [])
+            if dep.get("role") == "shared_profile"
+        ]
+        dependency_ok = (bool(deps) and all(
+            dep.get("file") == entry["file"] and dep.get("sha256") == entry.get("sha256")
+            for dep in deps))
         reader = SegmentReader(prof_path)
         try:
+            tensor_digests = (payload or {}).get("tensor_sha256") or {}
+            tensor_bad = sum(
+                tensor_digests.get(name) != hashlib.sha256(reader.tensor_bytes(name)).hexdigest()
+                for name in reader.hdr)
+            local_ok = (bool(binding) and binding_ok(binding) and
+                        attestation_ok(sig) and signed_source_ok and
+                        dependency_ok and tensor_bad == 0)
             n_bad = 0
-            for n in reader.hdr:
-                a, b = hdr[n]["data_offsets"]
-                blob, _ = transport.get_range(url, body_off + a, body_off + b)
-                if blob != reader.tensor_bytes(n):
-                    n_bad += 1
-            ok = n_bad == 0
+            if signed_source_ok:
+                url = (f"https://huggingface.co/{materials['repo']}/resolve/"
+                       f"{materials['revision']}/{materials['file']}")
+                if url not in hdr_cache:
+                    hdr_cache[url] = fetch_fresh_header(transport, url)
+                hdr, body_off = hdr_cache[url]
+                for name in reader.hdr:
+                    if name not in hdr:
+                        n_bad += 1
+                        continue
+                    a, b = hdr[name]["data_offsets"]
+                    blob, _ = transport.get_range(url, body_off + a, body_off + b)
+                    if blob != reader.tensor_bytes(name):
+                        n_bad += 1
+            else:
+                n_bad = len(reader.hdr)
+            ok = local_ok and n_bad == 0
             failures += 0 if ok else 1
-            profile_rows.append({"layer": layer, "file": entry["file"],
-                                 "tensors": len(reader.hdr),
-                                 "tensor_mismatches": n_bad})
+            profile_rows.append({
+                "layer": layer, "file": entry["file"], **binding,
+                "signature": sig, "signed_source_match": signed_source_ok,
+                "dependency_match": dependency_ok,
+                "tensors": len(reader.hdr), "tensor_sha_mismatches": tensor_bad,
+                "tensor_mismatches": n_bad})
             print(f"profile layer {layer:3d}: "
-                  f"{'BYTES EQUAL' if ok else 'MISMATCH'} "
+                  f"{'BYTES EQUAL' if ok else 'MISMATCH'} sig={sig} "
+                  f"deps={'ok' if dependency_ok else 'BAD'} "
                   f"({len(reader.hdr)} shared rows, full fetch)", flush=True)
         finally:
             reader.close()
@@ -578,8 +744,8 @@ def cmd_identity_remote(args) -> tuple[int, dict]:
         "summary": {
             "segments_checked": len(local_rows),
             "experts_hashed_locally": sum(r["experts"] for r in local_rows),
-            "experts_refetched": len(remote_rows),
-            "experts_byte_equal": sum(r["byte_equal"] for r in remote_rows),
+            "experts_refetched": sum("expert" in r for r in remote_rows),
+            "experts_byte_equal": sum(r.get("byte_equal", False) for r in remote_rows),
             "profiles_refetched": len(profile_rows),
             "profiles_byte_equal": sum(
                 r["tensor_mismatches"] == 0 for r in profile_rows),
@@ -621,17 +787,51 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
                 continue
             seg_path = fam / entry["file"]
             meta = segment_meta(fam, entry)
-            if meta.get("predicate") != "derived-from":
-                print(f"skip {entry['file']}: predicate {meta.get('predicate')}",
-                      flush=True)
-                continue
-            pseg_path = parent / meta["parent_segment"]
-            prof_path = parent / meta["parent_profile"]
-            pin_seg_ok = parent_sha(pseg_path) == meta["parent_segment_sha256"]
-            pin_prof_ok = parent_sha(prof_path) == meta["parent_profile_sha256"]
             payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}",
                                             verifier, entry["file"])
-
+            parents = (payload or {}).get("parents") or []
+            signed_seg = next((p for p in parents
+                               if p.get("role") == "expert_segment"), None)
+            signed_prof = next((p for p in parents
+                                if p.get("role") == "shared_profile"), None)
+            derivation = (payload or {}).get("derivation") or {}
+            signed_parents_ok = (
+                (payload or {}).get("predicate") == "derived-from" and
+                signed_seg is not None and signed_prof is not None and
+                all(isinstance(p.get(field), str) and p[field]
+                    for p in (signed_seg, signed_prof)
+                    for field in ("file", "sha256")) and
+                isinstance(derivation.get("rule"), str) and derivation["rule"])
+            metadata_ok = signed_parents_ok and all((
+                meta.get("predicate") == payload.get("predicate"),
+                meta.get("parent_segment") == signed_seg["file"],
+                meta.get("parent_segment_sha256") == signed_seg["sha256"],
+                meta.get("parent_profile") == signed_prof["file"],
+                meta.get("parent_profile_sha256") == signed_prof["sha256"],
+                meta.get("derived_rule") == derivation["rule"],
+            ))
+            binding = (fragment_binding(seg_path, entry, payload)
+                       if payload is not None else {})
+            pseg_path = parent / signed_seg["file"] if signed_parents_ok else None
+            prof_path = parent / signed_prof["file"] if signed_parents_ok else None
+            pin_seg_ok = (pseg_path is not None and pseg_path.exists() and
+                          parent_sha(pseg_path) == signed_seg["sha256"])
+            pin_prof_ok = (prof_path is not None and prof_path.exists() and
+                           parent_sha(prof_path) == signed_prof["sha256"])
+            if not pin_seg_ok or not pin_prof_ok:
+                failures += 1
+                rows.append({
+                    "layer": layer, "k": k, "file": entry["file"], **binding,
+                    "experts": len(entry["experts"]), "verbatim_tensors": 0,
+                    "replicated_tensors": 0, "verbatim_bytes": 0,
+                    "replicated_bytes": 0, "tensor_mismatches": len(entry["experts"]),
+                    "parent_segment_sha_match": pin_seg_ok,
+                    "parent_profile_sha_match": pin_prof_ok,
+                    "metadata_matches_attestation": metadata_ok,
+                    "signature": sig})
+                print(f"derived layer {layer:3d} k{k}: MISMATCH parents PIN-BAD",
+                      flush=True)
+                continue
             exp = SegmentReader(seg_path)
             par = SegmentReader(pseg_path)
             prof = SegmentReader(prof_path)
@@ -640,6 +840,9 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
                 b_verbatim = b_replicated = 0
                 for name in exp.hdr:
                     m = EXPERT_RE.match(name)
+                    if m is None:
+                        n_bad += 1
+                        continue
                     _, _, proj, rank, comp = m.groups()
                     got = exp.tensor_bytes(name)
                     if name in par.hdr:
@@ -658,19 +861,27 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
                         b_replicated += len(got)
                     if got != want:
                         n_bad += 1
-                ok = (n_bad == 0 and pin_seg_ok and pin_prof_ok
-                      and attestation_ok(sig))
+                digest_bad = sum(
+                    (payload or {}).get("expert_sha256", {}).get(str(eid)) !=
+                    span_sha256(seg_path, entry["body_offset"] + lo,
+                                entry["body_offset"] + hi)
+                    for eid, (lo, hi) in entry["experts"].items())
+                ok = (n_bad == 0 and digest_bad == 0 and bool(binding) and
+                      binding_ok(binding) and metadata_ok and pin_seg_ok and
+                      pin_prof_ok and attestation_ok(sig))
                 failures += 0 if ok else 1
                 rows.append({
-                    "layer": layer, "k": k, "file": entry["file"],
+                    "layer": layer, "k": k, "file": entry["file"], **binding,
                     "experts": len(entry["experts"]),
                     "verbatim_tensors": n_verbatim,
                     "replicated_tensors": n_replicated,
                     "verbatim_bytes": b_verbatim,
                     "replicated_bytes": b_replicated,
                     "tensor_mismatches": n_bad,
+                    "expert_sha_mismatches": digest_bad,
                     "parent_segment_sha_match": pin_seg_ok,
                     "parent_profile_sha_match": pin_prof_ok,
+                    "metadata_matches_attestation": metadata_ok,
                     "signature": sig})
                 print(f"derived layer {layer:3d} k{k}: "
                       f"{'EXACT' if ok else 'MISMATCH'} "
@@ -707,6 +918,120 @@ def cmd_identity_derived(args) -> tuple[int, dict]:
     }
     return (1 if failures else 0), report
 
+
+
+# ------------------------------------------------------- identity: fetched
+
+def cmd_identity_fetched(args) -> tuple[int, dict]:
+    """Verify a locally signed range subset and copied publisher evidence."""
+    fam = args.segments
+    indexes = load_indexes(fam)
+    if not indexes:
+        print(f"no indexes under {fam}", flush=True)
+        return 2, {}
+    manifest_path = fam / "fq-manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    verifier = make_verifier(args, manifest)
+    if not args.upstream_trust_signer:
+        raise TrustError("--check fetched requires --upstream-trust-signer for "
+                         "each publisher key pinned independently of the local key")
+    upstream = {
+        fq_trust.Verifier.resolve(trust_signer=spec, trust_root=args.trust_root):
+        spec for spec in args.upstream_trust_signer
+    }
+    # The dictionary above keys by verifier identity, not artifact claims.
+    by_key = {v.fingerprint: v for v in upstream}
+    wanted = parse_layers(args.layers)
+    failures, unsafe = 0, 0
+    rows = []
+    for k, idx in sorted(indexes.items()):
+        for layer_s, entry in sorted(idx.items(), key=lambda kv: int(kv[0])):
+            layer = int(layer_s)
+            if wanted is not None and layer not in wanted:
+                continue
+            seg = fam / entry["file"]
+            payload, sig = load_attestation(fam, f"layer-{layer:03d}.k{k}",
+                                            verifier, entry["file"])
+            binding = fragment_binding(seg, entry, payload or {})
+            digest_bad = sum(
+                (payload or {}).get("expert_sha256", {}).get(str(eid)) !=
+                span_sha256(seg, entry["body_offset"] + lo,
+                            entry["body_offset"] + hi)
+                for eid, (lo, hi) in entry["experts"].items())
+            parents = (payload or {}).get("parents") or []
+            provenance_ok = ((payload or {}).get("predicate") == "derived-from" and
+                             ((payload or {}).get("derivation") or {}).get("rule") ==
+                             "range_subset_v1")
+            parent_rows = []
+            for parent_record in parents:
+                repo, revision = parent_record.get("repo"), parent_record.get("revision")
+                parent_file = parent_record.get("file")
+                keyid = parent_record.get("keyid")
+                valid_parent = all(isinstance(v, str) and v for v in
+                                   (repo, revision, parent_file, keyid))
+                parent_verifier = by_key.get(keyid) if valid_parent else None
+                copied = (fam / "attestations" /
+                          (f"{repo.replace('/', '__')}@{revision[:12]}"
+                           if valid_parent else "") /
+                          f"layer-{layer:03d}.k{k}.jsonl")
+                upstream_payload, upstream_sig = (
+                    load_attestation_path(copied, parent_verifier, parent_file)
+                    if parent_verifier is not None else
+                    (None, "BAD: publisher key is not independently pinned"))
+                upstream_frag = (upstream_payload or {}).get("fragment") or {}
+                materials = (upstream_payload or {}).get("materials") or {}
+                parent_ok = (
+                    valid_parent and upstream_payload is not None and
+                    attestation_ok(upstream_sig) and
+                    upstream_frag.get("sha256") == parent_record.get("sha256") and
+                    upstream_frag.get("size") == parent_record.get("size") and
+                    all(materials.get(field) == parent_record.get(field)
+                        for field in ("repo", "revision")) and
+                    all(upstream_payload.get("expert_sha256", {}).get(str(eid)) ==
+                        (payload or {}).get("expert_sha256", {}).get(str(eid))
+                        for eid in parent_record.get("experts", [])))
+                authenticated = parent_record.get("header_authenticated") is True
+                if not authenticated:
+                    unsafe += 1
+                release = ("claimed-but-not-copied" if
+                           parent_record.get("signed_release_manifest") else
+                           "not-release-covered")
+                parent_rows.append({
+                    "repo": repo, "revision": revision, "file": parent_file,
+                    "signature": upstream_sig, "match": parent_ok,
+                    "header_authenticated": authenticated,
+                    "release_coverage": release})
+            parents_ok = bool(parent_rows) and all(p["match"] for p in parent_rows)
+            headers_ok = all(p["header_authenticated"] for p in parent_rows)
+            ok = (bool(binding) and binding_ok(binding) and digest_bad == 0 and
+                  provenance_ok and parents_ok and attestation_ok(sig) and
+                  (headers_ok or args.accept_unsafe_header_plan))
+            failures += 0 if ok else 1
+            rows.append({
+                "layer": layer, "k": k, "file": entry["file"], **binding,
+                "signature": sig, "expert_sha_mismatches": digest_bad,
+                "provenance_match": provenance_ok, "parents": parent_rows,
+                "header_plan_authenticated": headers_ok, "match": ok})
+            print(f"fetched layer {layer:3d} k{k}: "
+                  f"{'CHAIN VERIFIED' if ok else 'CHAIN MISMATCH'} "
+                  f"parents={len(parent_rows)} header-plan="
+                  f"{'authenticated' if headers_ok else 'UNSAFE'}", flush=True)
+    if unsafe:
+        policy = "accepted by explicit --accept-unsafe-header-plan" if args.accept_unsafe_header_plan else "REJECTED"
+        print(f"unsafe header-planning evidence: {unsafe} parent record(s), {policy}",
+              file=sys.stderr, flush=True)
+    report = {
+        "mode": "identity", "check": "fetched", "created_utc": now_utc(),
+        "segments": str(fam), "trust": trust_report(verifier), "layers": rows,
+        "summary": {"segments_checked": len(rows),
+                    "segments_verified": sum(r["match"] for r in rows),
+                    "unsafe_header_records": unsafe, "failures": failures},
+        "note": ("fetched checks the local last hop plus copied, independently "
+                 "pinned publisher attestations; release coverage is reported "
+                 "as unavailable unless a future fetched tree preserves the "
+                 "publisher's signed release manifest."),
+    }
+    return (1 if failures else 0), report
 
 # ------------------------------------------------------------- similarity
 
@@ -1018,7 +1343,7 @@ def render_md(report: dict) -> str:
                     f"{'PASS' if ok_local else 'FAIL'} "
                     f"({lr['experts']} experts hashed, sig {lr['signature']}) | "
                     f"{len(rem)} | "
-                    f"{sum(r['byte_equal'] for r in rem)}/{len(rem)} |")
+                    f"{sum(r.get('byte_equal', False) for r in rem)}/{len(rem)} |")
             lines.append("")
             msg = (f"**{s['experts_byte_equal']}/{s['experts_refetched']} sampled "
                    f"experts byte-identical to freshly range-read source bytes** "
@@ -1027,6 +1352,22 @@ def render_md(report: dict) -> str:
                 msg += (f"; {s['profiles_byte_equal']}/{s['profiles_refetched']} "
                         f"shared profiles byte-identical (fetched in full)")
             lines.append(msg + ".")
+        elif check == "fetched":
+            s = report["summary"]
+            lines.append("| layer | k | local hop | publisher parents | header plan |")
+            lines.append("|---|---|---|---|---|")
+            for r in report["layers"]:
+                lines.append(
+                    f"| {r['layer']} | {r['k']} | "
+                    f"{'PASS' if r['match'] else 'FAIL'} | "
+                    f"{sum(p['match'] for p in r['parents'])}/{len(r['parents'])} | "
+                    f"{'authenticated' if r['header_plan_authenticated'] else 'UNSAFE'} |")
+            lines.append("")
+            lines.append(
+                f"**{s['segments_verified']}/{s['segments_checked']} fetched "
+                f"segments have a locally pinned hop and independently pinned "
+                f"publisher parents**; {s['unsafe_header_records']} unsafe "
+                f"header-planning record(s), {s['failures']} failures.")
         elif check == "derived":
             s = report["summary"]
             lines.append("| layer | k | experts | verbatim tensors | "
@@ -1051,8 +1392,6 @@ def render_md(report: dict) -> str:
                      f"{report['layers'][0]}–{report['layers'][-1]}, decode: "
                      f"{report['decode']}.")
         lines.append("")
-        lines.append("| pair | projection | n | cos (mean / min) | "
-                     "relF (mean / max) | max abs | bitwise |")
         lines.append("|---|---|---|---|---|---|---|")
         for pair in sorted(report["aggregates"]):
             for proj in PROJS:
@@ -1097,12 +1436,18 @@ def main(argv=None) -> int:
                    help="local source snapshot -> whole-shard identity")
     p.add_argument("--parent", type=Path,
                    help="parent shared-h family dir (derived check)")
-    p.add_argument("--check", choices=("auto", "local", "remote", "derived"),
+    p.add_argument("--check", choices=("auto", "local", "remote", "derived", "fetched"),
                    default="auto")
-    p.add_argument("--layers", default=None, help="e.g. 3-10")
+    p.add_argument("--upstream-trust-signer", action="append", default=[],
+                   help="publisher signer pin for --check fetched; repeat for "
+                        "independent upstream publishers")
+    p.add_argument("--accept-unsafe-header-plan", action="store_true",
+                   help="allow fetched chains whose signed parent evidence says "
+                        "the layout header was unauthenticated")
     p.add_argument("--sample", default="3",
                    help="experts re-fetched per (layer,k) in remote check, "
                         "or 'all'")
+    p.add_argument("--layers", default=None, help="e.g. 3-10")
     p.add_argument("--attest", default="2",
                    help="layers spot-checked against attestations in local "
                         "check, or 'all'")
@@ -1139,11 +1484,11 @@ def main(argv=None) -> int:
                 rc, report = cmd_identity_local(args)
             elif check == "remote":
                 rc, report = cmd_identity_remote(args)
+            elif check == "fetched":
+                rc, report = cmd_identity_fetched(args)
             else:
                 rc, report = cmd_identity_derived(args)
         except TrustError as e:
-            # A verification tool that cannot decide who to trust has not
-            # verified anything.  Say so and fail.
             print(f"TRUST FAILURE: {e}", file=sys.stderr)
             return 1
         if args.insecure_skip_signatures:

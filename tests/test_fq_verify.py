@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import sys
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,8 @@ import fq_repack  # noqa: E402
 import fq_trust  # noqa: E402
 import fq_verify  # noqa: E402
 from test_fq_prime import build_repo, prime, served  # noqa: E402,F401
+import fq_fetch  # noqa: E402
+from test_fq_fetch import REV, build_source, write_policy  # noqa: E402
 from test_fq_repack import LAYERS, E, write_shard  # noqa: E402
 
 
@@ -514,3 +517,112 @@ def test_check_autodetect(served, tmp_path):
     assert fq_verify.detect_check(base / "shared-h", None) == "remote"
     assert fq_verify.detect_check(base / "expanded", None) == "derived"
     assert fq_verify.detect_check(base / "shared-h", Path("/x")) == "local"
+
+
+
+def test_identity_derived_binds_signed_fragment_and_metadata(served, tmp_path):
+    srv_tmp, _ = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh", ["--expand"]) == 0
+    fam = srv_tmp / "primed" / "segments-sh" / "expanded"
+    idx = json.loads((fam / "index-k3.json").read_text())
+    idx["3"]["sha256"] = "0" * 64
+    (fam / "index-k3.json").write_text(json.dumps(idx))
+    assert fq_verify.main([
+        "--identity", "--segments", str(fam), *pin(fam),
+        "--parent", str(srv_tmp / "primed" / "segments-sh" / "shared-h"),
+        "--json", str(tmp_path / "derived.json")]) == 1
+    row = json.loads((tmp_path / "derived.json").read_text())["layers"][0]
+    assert not row["index_sha_match"]
+
+
+def test_identity_remote_requires_shared_profile_attestation(served, tmp_path):
+    srv_tmp, _ = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh") == 0
+    fam = srv_tmp / "primed" / "segments-sh" / "shared-h"
+    att_lines(fam, f"layer-{LAYERS[0]:03d}.shared").unlink()
+    assert fq_verify.main([
+        "--identity", "--segments", str(fam), "--sample", "all", "--pace", "0",
+        *pin(fam), "--json", str(tmp_path / "remote.json")]) == 1
+    profiles = json.loads((tmp_path / "remote.json").read_text())["shared_profiles"]
+    assert any(row["signature"] == fq_verify.ATT_MISSING for row in profiles)
+
+
+def test_identity_derived_rejects_parent_metadata_repoint(served, tmp_path):
+    srv_tmp, _ = served
+    build_repo(srv_tmp / "repo", "shared_h_v1")
+    assert prime(srv_tmp, "segments-sh", ["--expand"]) == 0
+    fam = srv_tmp / "primed" / "segments-sh" / "expanded"
+    idx = json.loads((fam / "index-k3.json").read_text())
+    seg = fam / idx["3"]["file"]
+    raw = seg.read_bytes()
+    old = b"layer-003.k3.safetensors"
+    new = b"layer-004.k3.safetensors"
+    assert old in raw and len(old) == len(new)
+    seg.write_bytes(raw.replace(old, new, 1))
+    assert fq_verify.main([
+        "--identity", "--segments", str(fam), *pin(fam),
+        "--parent", str(srv_tmp / "primed" / "segments-sh" / "shared-h"),
+        "--json", str(tmp_path / "repoint.json")]) == 1
+    assert not json.loads((tmp_path / "repoint.json").read_text())[
+        "layers"][0]["metadata_matches_attestation"]
+
+
+def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False):
+    repo, _, publisher = build_source(tmp_path, "pub", ks=(3,))
+
+    def local_path(url):
+        marker = f"/test/pub/resolve/{REV}/"
+        assert marker in url
+        return repo / url.split(marker, 1)[1]
+
+    def get_range(url, start, end, timeout=600.0):
+        data = local_path(url).read_bytes()[start:end]
+        assert len(data) == end - start
+        return data, {"commit": REV, "total": local_path(url).stat().st_size}
+
+    def get_full(url, timeout=600.0):
+        path = local_path(url)
+        if not path.exists():
+            raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+        return path.read_bytes(), {"commit": REV}
+    monkeypatch.setattr(fq_fetch, "http_get_range", get_range)
+    monkeypatch.setattr(fq_fetch, "http_get_full", get_full)
+    out = tmp_path / "fetched"
+    policy = write_policy(tmp_path / "recipe.json", {layer: [3] * E for layer in LAYERS})
+    argv = ["--policy", str(policy), "--out", str(out), "--source",
+            f"test/pub@{REV}", "--trust-signer", publisher,
+            "--sign-key", str(tmp_path / "local.key")]
+    if unsafe:
+        argv += ["--header-trust", "unsafe"]
+    assert fq_fetch.main(argv) == 0
+    return out, publisher
+
+
+def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(tmp_path, monkeypatch)
+    local = signer_of(fam)
+    argv = ["--identity", "--check", "fetched", "--segments", str(fam),
+            "--trust-signer", local, "--upstream-trust-signer", publisher,
+            "--json", str(tmp_path / "fetched.json")]
+    assert fq_verify.main(argv) == 0
+    report = json.loads((tmp_path / "fetched.json").read_text())
+    assert report["summary"]["segments_verified"] > 0
+
+    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    saved = copied.read_text()
+    copied.unlink()
+    assert fq_verify.main(argv) == 1
+    copied.write_text(saved)
+    wrong_pin = "de" * 32
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(fam),
+        "--trust-signer", local, "--upstream-trust-signer", wrong_pin]) == 1
+    unsafe_fam, unsafe_publisher = _fetched_workspace(
+        tmp_path / "unsafe", monkeypatch, unsafe=True)
+    unsafe_argv = ["--identity", "--check", "fetched", "--segments", str(unsafe_fam),
+                  "--trust-signer", signer_of(unsafe_fam),
+                  "--upstream-trust-signer", unsafe_publisher]
+    assert fq_verify.main(unsafe_argv) == 1
+    assert fq_verify.main(unsafe_argv + ["--accept-unsafe-header-plan"]) == 0
