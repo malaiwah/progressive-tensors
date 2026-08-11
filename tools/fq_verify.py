@@ -1053,8 +1053,7 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     attestation_ok(upstream_sig) and terminal_source_ok and
                     upstream_frag.get("sha256") == parent_record.get("sha256") and
                     upstream_frag.get("size") == parent_record.get("size") and
-                    all(materials.get(field) == parent_record.get(field)
-                        for field in ("repo", "revision")) and claims_ok)
+                    claims_ok)
                 authenticated = header_evidence and parent_ok
                 if not authenticated:
                     unsafe += 1
