@@ -626,3 +626,32 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
                   "--upstream-trust-signer", unsafe_publisher]
     assert fq_verify.main(unsafe_argv) == 1
     assert fq_verify.main(unsafe_argv + ["--accept-unsafe-header-plan"]) == 0
+
+
+def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(tmp_path, monkeypatch)
+    local = signer_of(fam)
+    argv = ["--identity", "--check", "fetched", "--segments", str(fam),
+            "--trust-signer", local, "--upstream-trust-signer", publisher]
+    local_att = next((fam / "attestations").glob("layer-*.k*.jsonl"))
+    saved_local = local_att.read_text()
+    resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"experts": []}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"header_sha256": "0" * 64}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+
+    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    upstream = json.loads(base64.b64decode(
+        json.loads(copied.read_text().splitlines()[0])["payload"]))
+    digests = list(upstream["expert_sha256"].items())
+    upstream["expert_sha256"] = dict(digests[:len(digests) // 2])
+    other = dict(upstream)
+    other["expert_sha256"] = dict(digests[len(digests) // 2:])
+    publisher_key = fq_repack.Signer(tmp_path / "pub.key")
+    copied.write_text(publisher_key.sign_line(upstream) + "\n" +
+                      publisher_key.sign_line(other) + "\n")
+    assert fq_verify.main(argv) == 0

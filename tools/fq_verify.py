@@ -333,9 +333,10 @@ def load_attestation(fam: Path, stem: str, verifier: fq_trust.Verifier,
 
 def load_attestation_path(path: Path, verifier: fq_trust.Verifier,
                           fragment_file: str) -> tuple[dict | None, str]:
-    """Verify a copied publisher JSONL without trusting its directory name."""
+    """Merge every verified copied publisher line that covers one fragment."""
     if not path.exists():
         return None, ATT_MISSING
+    merged: dict | None = None
     reasons = []
     for n, raw in enumerate(path.read_text().splitlines(), 1):
         if not raw.strip():
@@ -347,10 +348,21 @@ def load_attestation_path(path: Path, verifier: fq_trust.Verifier,
         except (TrustError, json.JSONDecodeError, TypeError) as e:
             reasons.append(f"line {n}: {e}")
             continue
-        if (payload.get("fragment") or {}).get("file") == fragment_file:
-            return payload, (ATT_NOT_CHECKED if verifier.rung == fq_trust.RUNG_NONE
-                             else ATT_VERIFIED)
-    return None, f"BAD: {'; '.join(reasons) or 'no signed line names this fragment'}"
+        if (payload.get("fragment") or {}).get("file") != fragment_file:
+            continue
+        if merged is None:
+            merged = dict(payload)
+            merged["expert_sha256"] = dict(payload["expert_sha256"])
+        elif any(merged.get(field) != payload.get(field)
+                 for field in ("fragment", "predicate", "materials")):
+            reasons.append(f"line {n}: conflicting signed fragment claims")
+            continue
+        else:
+            merged["expert_sha256"].update(payload["expert_sha256"])
+    if merged is None:
+        return None, f"BAD: {'; '.join(reasons) or 'no signed line names this fragment'}"
+    state = ATT_NOT_CHECKED if verifier.rung == fq_trust.RUNG_NONE else ATT_VERIFIED
+    return merged, state
 
 def attestation_ok(state: str | None) -> bool:
     """Only a positive verification counts.  MISSING, BAD and (on the
@@ -963,12 +975,21 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                              ((payload or {}).get("derivation") or {}).get("rule") ==
                              "range_subset_v1")
             parent_rows = []
+            covered_experts: list[str] = []
             for parent_record in parents:
                 repo, revision = parent_record.get("repo"), parent_record.get("revision")
                 parent_file = parent_record.get("file")
                 keyid = parent_record.get("keyid")
-                valid_parent = all(isinstance(v, str) and v for v in
-                                   (repo, revision, parent_file, keyid))
+                claimed_experts = parent_record.get("experts")
+                valid_experts = (isinstance(claimed_experts, list) and
+                                 bool(claimed_experts) and
+                                 all(str(eid) in entry["experts"]
+                                     for eid in claimed_experts))
+                if valid_experts:
+                    covered_experts.extend(str(eid) for eid in claimed_experts)
+                valid_parent = (valid_experts and
+                                all(isinstance(v, str) and v for v in
+                                    (repo, revision, parent_file, keyid)))
                 parent_verifier = by_key.get(keyid) if valid_parent else None
                 copied = (fam / "attestations" /
                           (f"{repo.replace('/', '__')}@{revision[:12]}"
@@ -980,17 +1001,29 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     (None, "BAD: publisher key is not independently pinned"))
                 upstream_frag = (upstream_payload or {}).get("fragment") or {}
                 materials = (upstream_payload or {}).get("materials") or {}
+                header_method = parent_record.get("header_authentication")
+                if header_method == "attested-header-digest":
+                    header_evidence = (
+                        parent_record.get("header_sha256") ==
+                        upstream_frag.get("header_sha256") and
+                        isinstance(upstream_frag.get("body_offset"), int))
+                elif header_method == "full-fragment":
+                    # The parent fragment SHA is verified immediately below.
+                    header_evidence = True
+                else:
+                    header_evidence = False
+                claims_ok = valid_experts and all(
+                    (upstream_payload or {}).get("expert_sha256", {}).get(str(eid)) ==
+                    (payload or {}).get("expert_sha256", {}).get(str(eid))
+                    for eid in claimed_experts)
                 parent_ok = (
                     valid_parent and upstream_payload is not None and
                     attestation_ok(upstream_sig) and
                     upstream_frag.get("sha256") == parent_record.get("sha256") and
                     upstream_frag.get("size") == parent_record.get("size") and
                     all(materials.get(field) == parent_record.get(field)
-                        for field in ("repo", "revision")) and
-                    all(upstream_payload.get("expert_sha256", {}).get(str(eid)) ==
-                        (payload or {}).get("expert_sha256", {}).get(str(eid))
-                        for eid in parent_record.get("experts", [])))
-                authenticated = parent_record.get("header_authenticated") is True
+                        for field in ("repo", "revision")) and claims_ok)
+                authenticated = header_evidence and parent_ok
                 if not authenticated:
                     unsafe += 1
                 release = ("claimed-but-not-copied" if
@@ -999,10 +1032,13 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 parent_rows.append({
                     "repo": repo, "revision": revision, "file": parent_file,
                     "signature": upstream_sig, "match": parent_ok,
-                    "header_authenticated": authenticated,
+                    "experts": claimed_experts, "header_authenticated": authenticated,
                     "release_coverage": release})
-            parents_ok = bool(parent_rows) and all(p["match"] for p in parent_rows)
-            headers_ok = all(p["header_authenticated"] for p in parent_rows)
+            expected_experts = set(entry["experts"])
+            coverage_ok = (bool(parent_rows) and set(covered_experts) == expected_experts and
+                           len(covered_experts) == len(set(covered_experts)))
+            parents_ok = coverage_ok and all(p["match"] for p in parent_rows)
+            headers_ok = parents_ok and all(p["header_authenticated"] for p in parent_rows)
             ok = (bool(binding) and binding_ok(binding) and digest_bad == 0 and
                   provenance_ok and parents_ok and attestation_ok(sig) and
                   (headers_ok or args.accept_unsafe_header_plan))
@@ -1011,6 +1047,7 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 "layer": layer, "k": k, "file": entry["file"], **binding,
                 "signature": sig, "expert_sha_mismatches": digest_bad,
                 "provenance_match": provenance_ok, "parents": parent_rows,
+                "parent_expert_coverage": coverage_ok,
                 "header_plan_authenticated": headers_ok, "match": ok})
             print(f"fetched layer {layer:3d} k{k}: "
                   f"{'CHAIN VERIFIED' if ok else 'CHAIN MISMATCH'} "
