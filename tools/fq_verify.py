@@ -209,6 +209,12 @@ def binding_ok(binding: dict) -> bool:
 CHUNK = 1 << 24
 PROJS = ("gate_proj", "up_proj", "down_proj")
 
+
+def is_immutable_revision(value) -> bool:
+    """A resolved Git/HF object ID, never a mutable branch or tag name."""
+    return (isinstance(value, str) and len(value) >= 40 and
+            all(c in "0123456789abcdef" for c in value))
+
 # load_attestation() states.  Only VERIFIED is evidence; NOT_CHECKED exists
 # solely because the operator passed --insecure-skip-signatures and asked to
 # be told nothing is proven.
@@ -1012,8 +1018,10 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 if valid_experts:
                     covered_experts.extend(str(eid) for eid in claimed_experts)
                 valid_parent = (valid_experts and
-                                all(isinstance(v, str) and v for v in
-                                    (repo, revision, parent_file, keyid)))
+                                isinstance(repo, str) and bool(repo) and
+                                is_immutable_revision(revision) and
+                                isinstance(parent_file, str) and bool(parent_file) and
+                                is_sha256(keyid))
                 parent_verifier = by_key.get(keyid) if valid_parent else None
                 copied = (fam / "attestations" /
                           (f"{repo.replace('/', '__')}@{revision[:12]}"
@@ -1048,18 +1056,19 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     parent_record.get("role") == "source_fragment" and
                     (upstream_payload or {}).get("predicate") == "repack-of" and
                     isinstance(material_file, str) and bool(material_file))
+                release_claim = parent_record.get("signed_release_manifest", False)
+                release_ok = release_claim is False
+                release = ("not-release-covered" if release_ok else
+                           "claimed-release-not-available-offline")
                 parent_ok = (
                     valid_parent and upstream_payload is not None and
                     attestation_ok(upstream_sig) and terminal_source_ok and
                     upstream_frag.get("sha256") == parent_record.get("sha256") and
                     upstream_frag.get("size") == parent_record.get("size") and
-                    claims_ok)
+                    claims_ok and release_ok)
                 authenticated = header_evidence and parent_ok
                 if not authenticated:
                     unsafe += 1
-                release = ("claimed-but-not-copied" if
-                           parent_record.get("signed_release_manifest") else
-                           "not-release-covered")
                 parent_rows.append({
                     "repo": repo, "revision": revision, "file": parent_file,
                     "signature": upstream_sig, "match": parent_ok,

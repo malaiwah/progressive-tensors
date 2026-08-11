@@ -648,6 +648,14 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
            lambda p: p["parents"][0].pop("header_sha256"))
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"revision": "main"}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"signed_release_manifest": True}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
 
     copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
     saved_copied = copied.read_text()
