@@ -68,12 +68,14 @@ def test_metrics_identical():
 
 
 def test_evidence_source_slug_is_injective_and_case_preserving():
-    nested = fq_verify.evidence_source_slug("Org/Repo", "ab" * 20,
+    assert fq_verify.evidence_source_slug is fq_fetch.evidence_source_slug
+    revision = "ab" * 20
+    nested = fq_verify.evidence_source_slug("Org/Repo", revision,
                                              "family/nested")
-    literal = fq_verify.evidence_source_slug("Org/Repo", "ab" * 20,
+    literal = fq_verify.evidence_source_slug("Org/Repo", revision,
                                               "family__nested")
-    assert nested == "Org%2FRepo@abababababab:family%2Fnested"
-    assert literal == "Org%2FRepo@abababababab:family__nested"
+    assert nested == f"Org%2FRepo@{revision}:family%2Fnested"
+    assert literal == f"Org%2FRepo@{revision}:family__nested"
     assert nested != literal
 
 
@@ -607,18 +609,6 @@ def _fetched_workspace(tmp_path, monkeypatch, *, unsafe=False):
     if unsafe:
         argv += ["--header-trust", "unsafe"]
     assert fq_fetch.main(argv) == 0
-    # fq_fetch serializes this signed locator in current produced subsets.
-    # Keep this verifier fixture explicit while the synthetic legacy helper
-    # remains independent of the fetch implementation under test.
-    evidence_source = f"test%2Fpub@{REV[:12]}:"
-    legacy_source = next((out / "attestations").glob("test__pub@*"))
-    legacy_source.rename(out / "attestations" / evidence_source)
-    for att in (out / "attestations").glob("layer-*.k*.jsonl"):
-        resign(att, tmp_path / "local.key", lambda p: [
-            parent.update({
-                "subdir": "",
-                "evidence_source": evidence_source,
-            }) for parent in p["parents"]])
     return out, publisher
 
 
@@ -630,6 +620,13 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
             "--json", str(tmp_path / "fetched.json")]
     assert fq_verify.main(argv) == 0
     assert fq_verify.detect_check(fam, None) == "fetched"
+    fetch_report = fam / "fq-fetch-report.json"
+    saved_report = fetch_report.read_text()
+    legacy_report = json.loads(saved_report)
+    legacy_report.pop("evidence_locator_schema")
+    fetch_report.write_text(json.dumps(legacy_report))
+    assert fq_verify.detect_check(fam, None) == "derived"
+    fetch_report.write_text(saved_report)
     report = json.loads((tmp_path / "fetched.json").read_text())
     assert report["summary"]["segments_verified"] > 0
 
@@ -656,9 +653,10 @@ def test_identity_fetched_uses_signed_nested_evidence_locator(tmp_path, monkeypa
     local = signer_of(fam)
     layer = LAYERS[0]
     local_att = att_lines(fam, f"layer-{layer:03d}.k3")
-    nested = f"test%2Fpub@{REV[:12]}:family%2Fnested"
+    nested = fq_fetch.evidence_source_slug("test/pub", REV, "family/nested")
+    root = fq_fetch.evidence_source_slug("test/pub", REV)
     copied = next((fam / "attestations").glob(
-        f"test%2Fpub@{REV[:12]}:/layer-{layer:03d}.k3.jsonl"))
+        f"{root}/layer-{layer:03d}.k3.jsonl"))
     target = fam / "attestations" / nested / copied.name
     target.parent.mkdir()
     copied.rename(target)

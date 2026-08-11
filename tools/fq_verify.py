@@ -92,13 +92,13 @@ import random
 import struct
 import sys
 import time
-from urllib.parse import quote
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from fq_repack import EXPERT_RE, PROJ_ORDER, expert_key, read_header  # noqa: E402
 from fq_assemble import SegmentReader  # noqa: E402
 import fq_prime  # noqa: E402  (Transport, SHARED_RE, parse_int_set)
+import fq_fetch  # noqa: E402
 import fq_trust  # noqa: E402
 from fq_trust import TrustError  # noqa: E402
 
@@ -217,11 +217,7 @@ def is_immutable_revision(value) -> bool:
             all(c in "0123456789abcdef" for c in value))
 
 
-def evidence_source_slug(repo: str, revision: str, subdir: str) -> str | None:
-    """Injective canonical name of a copied upstream evidence directory."""
-    if not isinstance(repo, str) or not isinstance(subdir, str):
-        return None
-    return f"{quote(repo, safe='')}@{revision[:12]}:{quote(subdir, safe='')}"
+evidence_source_slug = fq_fetch.evidence_source_slug
 
 # load_attestation() states.  Only VERIFIED is evidence; NOT_CHECKED exists
 # solely because the operator passed --insecure-skip-signatures and asked to
@@ -1028,7 +1024,8 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     covered_experts.extend(str(eid) for eid in claimed_experts)
                 expected_source = (evidence_source_slug(repo, revision, subdir)
                                    if isinstance(repo, str) and
-                                   is_immutable_revision(revision) else None)
+                                   is_immutable_revision(revision) and
+                                   isinstance(subdir, str) else None)
                 valid_parent = (valid_experts and bool(expected_source) and
                                 evidence_source == expected_source and
                                 isinstance(parent_file, str) and bool(parent_file) and
@@ -1509,11 +1506,17 @@ def render_md(report: dict) -> str:
 def detect_check(segments: Path, source: Path | None) -> str:
     if source is not None:
         return "local"
-    # fq_fetch writes this alongside each locally signed range subset.  It is
-    # only a mode selector, never a trust input; --check fetched still requires
-    # independently pinned publisher attestations.
-    if (segments / "fq-fetch-report.json").exists():
-        return "fetched"
+    # The explicit producer format marker selects fetched verification.  An
+    # older report retains the previous derived/remote auto behavior rather
+    # than being sent to a checker whose signed locator fields it cannot have.
+    report_path = segments / "fq-fetch-report.json"
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            report = {}
+        if report.get("evidence_locator_schema") == fq_fetch.EVIDENCE_LOCATOR_SCHEMA:
+            return "fetched"
     manifest_path = segments / "fq-manifest.json"
     predicate = None
     if manifest_path.exists():
