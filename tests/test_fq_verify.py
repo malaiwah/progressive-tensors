@@ -67,6 +67,18 @@ def test_metrics_identical():
     assert m["max_abs"] == 0.0
 
 
+def test_evidence_source_slug_is_injective_and_case_preserving():
+    assert fq_verify.evidence_source_slug is fq_fetch.evidence_source_slug
+    revision = "ab" * 20
+    nested = fq_verify.evidence_source_slug("Org/Repo", revision,
+                                             "family/nested")
+    literal = fq_verify.evidence_source_slug("Org/Repo", revision,
+                                              "family__nested")
+    assert nested == f"Org%2FRepo@{revision}:family%2Fnested"
+    assert literal == f"Org%2FRepo@{revision}:family__nested"
+    assert nested != literal
+
+
 def test_metrics_perturbed():
     rs = np.random.RandomState(1)
     a = rs.randn(128, 96)
@@ -608,10 +620,17 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
             "--json", str(tmp_path / "fetched.json")]
     assert fq_verify.main(argv) == 0
     assert fq_verify.detect_check(fam, None) == "fetched"
+    fetch_report = fam / "fq-fetch-report.json"
+    saved_report = fetch_report.read_text()
+    legacy_report = json.loads(saved_report)
+    legacy_report.pop("evidence_locator_schema")
+    fetch_report.write_text(json.dumps(legacy_report))
+    assert fq_verify.detect_check(fam, None) == "derived"
+    fetch_report.write_text(saved_report)
     report = json.loads((tmp_path / "fetched.json").read_text())
     assert report["summary"]["segments_verified"] > 0
 
-    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    copied = next((fam / "attestations").glob("test%2Fpub@*/layer-*.k*.jsonl"))
     saved = copied.read_text()
     copied.unlink()
     assert fq_verify.main(argv) == 1
@@ -627,6 +646,27 @@ def test_identity_fetched_chain_and_unsafe_policy(tmp_path, monkeypatch):
                   "--upstream-trust-signer", unsafe_publisher]
     assert fq_verify.main(unsafe_argv) == 1
     assert fq_verify.main(unsafe_argv + ["--accept-unsafe-header-plan"]) == 0
+
+
+def test_identity_fetched_uses_signed_nested_evidence_locator(tmp_path, monkeypatch):
+    fam, publisher = _fetched_workspace(tmp_path, monkeypatch)
+    local = signer_of(fam)
+    layer = LAYERS[0]
+    local_att = att_lines(fam, f"layer-{layer:03d}.k3")
+    nested = fq_fetch.evidence_source_slug("test/pub", REV, "family/nested")
+    root = fq_fetch.evidence_source_slug("test/pub", REV)
+    copied = next((fam / "attestations").glob(
+        f"{root}/layer-{layer:03d}.k3.jsonl"))
+    target = fam / "attestations" / nested / copied.name
+    target.parent.mkdir()
+    copied.rename(target)
+    resign(local_att, tmp_path / "local.key", lambda p: [
+        parent.update({"subdir": "family/nested", "evidence_source": nested})
+        for parent in p["parents"]])
+    assert fq_verify.main([
+        "--identity", "--check", "fetched", "--segments", str(fam),
+        "--layers", str(layer), "--trust-signer", local,
+        "--upstream-trust-signer", publisher]) == 0
 
 
 def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monkeypatch):
@@ -654,11 +694,14 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)
     resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].update({"revision": "ab" * 32}))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
            lambda p: p["parents"][0].update({"signed_release_manifest": True}))
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)
-
-    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    copied = next((fam / "attestations").glob("test%2Fpub@*/layer-*.k*.jsonl"))
     saved_copied = copied.read_text()
     resign(copied, tmp_path / "pub.key",
            lambda p: p["materials"].pop("file"))
@@ -668,8 +711,7 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
            lambda p: p.update({"predicate": "derived-from"}))
     assert fq_verify.main(argv) == 1
     copied.write_text(saved_copied)
-
-    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    copied = next((fam / "attestations").glob("test%2Fpub@*/layer-*.k*.jsonl"))
     upstream = json.loads(base64.b64decode(
         json.loads(copied.read_text().splitlines()[0])["payload"]))
     # Materials describes the publisher fragment's source, not the artifact
