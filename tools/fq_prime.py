@@ -782,6 +782,8 @@ def write_family_outputs(fam_dir: Path, layers_state: dict, *, which: str,
         per_k[str(k)] = {
             "index": f"index-k{k}.json",
             "layers": [min(covered), max(covered)] if covered else [],
+            "layer_coverage": {
+                "schema": "fq-layer-coverage/1", "layers": covered},
             "segment_count": len(idx),
             "num_experts": max((len(e["experts"]) for e in idx.values()), default=0),
             "predicate": predicate,

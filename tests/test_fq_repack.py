@@ -221,15 +221,15 @@ def test_manifest_fields(workspace):
 
 # ------------------------------------------- FINDING 2: multi-K state/manifest
 
-def write_snapshot(root: Path, k: int) -> Path:
+def write_snapshot(root: Path, k: int, layers=LAYERS) -> Path:
     """A snapshot whose expert payloads (and trellis sizes) are K-specific."""
     root.mkdir(parents=True, exist_ok=True)
-    for i, layer in enumerate(LAYERS):
+    for i, layer in enumerate(layers):
         write_shard(root / f"model-layer-{layer:03d}.safetensors", layer,
                     scramble=bool(i), k=k)
     (root / "MANIFEST.sha256").write_text("\n".join(
         f"{hashlib.sha256((root / f'model-layer-{L:03d}.safetensors').read_bytes()).hexdigest()}"
-        f"  model-layer-{L:03d}.safetensors" for L in LAYERS) + "\n")
+        f"  model-layer-{L:03d}.safetensors" for L in layers) + "\n")
     return root
 
 
@@ -287,12 +287,33 @@ def test_k3_k4_k3_sequence_keeps_per_k_indexes_correct(multi_k):
         ent = m["per_k"][str(k)]
         assert ent["index"] == f"index-k{k}.json"
         assert ent["layers"] == [min(LAYERS), max(LAYERS)]
+        assert ent["layer_coverage"] == {
+            "schema": "fq-layer-coverage/1", "layers": LAYERS}
         assert ent["segment_count"] == len(LAYERS)
         assert ent["num_experts"] == E
         assert "repack-of" in ent["provenance"]
     assert m["per_k"]["4"]["source_repo"] == "test/source-k4"
     assert m["per_k"]["3"]["source_repo"] == "test/source-repo"
     assert sorted(m["sources"]) == ["test/source-k4", "test/source-repo"]
+
+
+def test_sparse_per_k_manifest_round_trips_exact_coverage(tmp_path):
+    """A per-K interval must not disguise absent layers as published coverage."""
+    expected = [*range(3, 11), *range(35, 51)]
+    snap = write_snapshot(tmp_path / "sparse-snap", 5, expected)
+    out, key = tmp_path / "sparse-out", tmp_path / "sign.key"
+
+    assert run_k(snap, out, key, 5) == 0
+
+    index = json.loads((out / "index-k5.json").read_text())
+    coverage = json.loads((out / "fq-manifest.json").read_text())["per_k"]["5"]
+    assert sorted(int(layer) for layer in index) == expected
+    assert coverage["layers"] == [3, 50]
+    assert coverage["layer_coverage"] == {
+        "schema": "fq-layer-coverage/1", "layers": expected}
+    assert not set(range(11, 35)).intersection(
+        coverage["layer_coverage"]["layers"])
+    _assert_index_sane(out, 5, expected)
 
 
 def test_resume_does_not_cross_contaminate_ks(multi_k):

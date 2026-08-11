@@ -519,9 +519,11 @@ def build_manifest(state: dict, existing: dict, *, base_model: str, layout: str,
         info = entry.get("index") or {}
         ent = per_k.setdefault(str(k), {
             "index": f"index-k{k}.json", "predicate": "repack-of",
-            "layers": [layer, layer], "segment_count": 0, "num_experts": 0,
-            "sources": [], "signers": []})
+            "layers": [layer, layer],
+            "layer_coverage": {"schema": "fq-layer-coverage/1", "layers": []},
+            "segment_count": 0, "num_experts": 0, "sources": [], "signers": []})
         ent["layers"] = [min(ent["layers"][0], layer), max(ent["layers"][1], layer)]
+        ent["layer_coverage"]["layers"].append(layer)
         ent["segment_count"] += 1
         ent["num_experts"] = max(ent["num_experts"], len(info.get("experts", {})))
         who = {"repo": src.get("repo"), "revision": src.get("revision")}
@@ -537,6 +539,7 @@ def build_manifest(state: dict, existing: dict, *, base_model: str, layout: str,
         all_layers.append(layer)
         num_experts = max(num_experts, len(info.get("experts", {})))
     for ent in per_k.values():
+        ent["layer_coverage"]["layers"].sort()
         ent["provenance"] = "; ".join(
             f"repack-of {s['repo']}@{(s['revision'] or '')[:8]}"
             for s in ent["sources"])
@@ -545,6 +548,11 @@ def build_manifest(state: dict, existing: dict, *, base_model: str, layout: str,
             ent["source_revision"] = ent["sources"][0]["revision"]
     for k_s, ent in (existing.get("per_k") or {}).items():
         if k_s not in per_k and (out / f"index-k{k_s}.json").exists():
+            ent = dict(ent)
+            covered = sorted(int(layer) for layer in json.loads(
+                (out / f"index-k{k_s}.json").read_text()))
+            ent["layer_coverage"] = {
+                "schema": "fq-layer-coverage/1", "layers": covered}
             per_k[k_s] = ent  # a K this run knows nothing about: keep as-is
             if ent.get("source_repo"):
                 sources.add(ent["source_repo"])

@@ -83,6 +83,33 @@ def test_every_schema_is_valid_json_schema():
         assert schema.get("title") and schema.get("description")
 
 
+def test_sparse_per_k_coverage_preserves_legacy_and_exact_contracts():
+    """Legacy v1 extrema remain valid; new coverage is explicitly versioned."""
+    exact_layers = [*range(3, 11), *range(35, 51)]
+    legacy = {
+        "schema": "fq-manifest/1",
+        "predicate": "repack-of",
+        "layout": "rank_sliced_tp4",
+        "k_variants": [5],
+        "tensor_index": "index-k5.json",
+        "per_k": {"5": {"index": "index-k5.json", "layers": [3, 50]}},
+    }
+    check("fq-manifest-1", legacy)
+    assert "layer_coverage" not in legacy["per_k"]["5"]
+    legacy_with_historical_domain = json.loads(json.dumps(legacy))
+    legacy_with_historical_domain["per_k"]["5"]["layers"] = [-1, 50]
+    check("fq-manifest-1", legacy_with_historical_domain)
+
+    exact = json.loads(json.dumps(legacy))
+    exact["per_k"]["5"]["layer_coverage"] = {
+        "schema": "fq-layer-coverage/1",
+        "layers": exact_layers,
+    }
+    check("fq-manifest-1", exact)
+    assert 11 not in exact["per_k"]["5"]["layer_coverage"]["layers"]
+    assert 34 not in exact["per_k"]["5"]["layer_coverage"]["layers"]
+
+
 # ---------------------------------------------------- freshly emitted output
 
 @pytest.fixture()
@@ -159,6 +186,12 @@ def test_release_output_matches_the_schema(emitted):
      "fq-segment-index-1", "sha256 is the wrong length"),
     ({"payload": "e30=", "signature": "AA==", "keyid": "nope"},
      "fq-attestation-1", "keyid is not a key"),
+    ({"schema": "fq-manifest/1", "predicate": "repack-of",
+      "layout": "rank_sliced_tp4", "k_variants": [5],
+      "tensor_index": "index-k5.json",
+      "per_k": {"5": {"layers": [3, 50], "layer_coverage": {
+          "schema": "fq-layer-coverage/1", "layers": [3, 3]}}}},
+     "fq-manifest-1", "duplicate exact per-K layer"),
 ])
 def test_malformed_documents_are_rejected(doc, name, why):
     assert list(validator(name).iter_errors(doc)), f"schema accepted {why}"

@@ -295,6 +295,13 @@ def test_both_families_and_expansion_bit_exact(served):
     exm = json.loads((ex / "fq-manifest.json").read_text())
     assert exm["layout"] == "rank_sliced_tp4" and exm["predicate"] == "derived-from"
     assert exm["parent_family"] == "segments-sh/shared-h"
+    for family, manifest in ((sh, shm), (ex, exm)):
+        for k_s, coverage in manifest["per_k"].items():
+            published = sorted(int(layer) for layer in json.loads(
+                (family / coverage["index"]).read_text()))
+            assert coverage["layers"] == [published[0], published[-1]]
+            assert coverage["layer_coverage"] == {
+                "schema": "fq-layer-coverage/1", "layers": published}
     root = json.loads((out.parent / "fq-manifest.json").read_text())
     assert {f["path"] for f in root["families"]} == {
         "segments-sh/shared-h", "segments-sh/expanded"}
