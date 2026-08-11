@@ -897,10 +897,10 @@ def test_missing_expert_is_reported_not_silently_skipped(tmp_path, served, capsy
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 5, 3, 3]})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
     assert "no source carries it" in capsys.readouterr().err
-    assert set(json.loads((out / "index-k3.json").read_text())
-               [str(LAYERS[0])]["experts"]) == {"0", "2", "3"}
+    assert not list(out.glob("*.safetensors"))
 
 def test_published_commit_is_strict_via_signed_parent_relation(
         tmp_path, served, monkeypatch, capsys):
@@ -1518,10 +1518,10 @@ def test_missing_expert_digest_is_never_fetched(tmp_path, served, capsys):
     policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
-         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
     assert "no attested digest" in capsys.readouterr().err
-    index = json.loads((out / "index-k3.json").read_text())
-    assert "1" not in index[str(LAYERS[0])]["experts"]
+    assert not list(out.glob("*.safetensors"))
 
 
 def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys):
@@ -1534,3 +1534,186 @@ def test_no_attest_leaves_an_unsigned_tree_and_says_so(tmp_path, served, capsys)
          "--no-attest"])
     assert not (out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl").exists()
     assert "--insecure" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("field", "value", "needle"), [
+    ("schema", "fq-attestation/0", "expected"),
+    ("predicate", "equivalence-of", "not accepted"),
+])
+def test_signed_upstream_schema_and_predicate_are_fail_closed(
+        tmp_path, served, capsys, field, value, needle):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _resign(_att_path(repo, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__(field, value))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    assert needle in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_fetched_derivation_preserves_parent_predicate_and_identity(tmp_path, served):
+    _, _, out, _, _ = _fetch_all(tmp_path, served)
+    manifest = json.loads((out / "fq-manifest.json").read_text())
+    assert manifest["predicate"] == "derived-from"
+    assert manifest["parent_predicates"] == ["repack-of"]
+    segment = out / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    hlen = struct.unpack("<Q", segment.read_bytes()[:8])[0]
+    header = json.loads(segment.read_bytes()[8:8 + hlen])
+    assert header["__metadata__"]["predicate"] == "derived-from"
+    payload = _payload(out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
+    assert payload["predicate"] == "derived-from"
+    assert payload["parents"][0]["predicate"] == "repack-of"
+    assert payload["parents"][0]["identity"]["base_revision"] == REV
+
+
+@pytest.mark.parametrize("field", ("base_model", "layout", "num_experts"))
+def test_incompatible_signed_parent_identity_cannot_mix(
+        tmp_path, served, capsys, field):
+    key = tmp_path / "shared.key"
+    repo_a, _, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _, _ = build_source(tmp_path, "b", ks=(3,), key=key, salt="b")
+    different = {"base_model": "other/base", "layout": "other_layout",
+                 "num_experts": E + 1}[field]
+    _resign(_att_path(repo_b, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__(field, different))
+    if field in ("base_model", "layout"):
+        manifest = json.loads((repo_b / "fq-manifest.json").read_text())
+        manifest[field] = different
+        (repo_b / "fq-manifest.json").write_text(json.dumps(manifest))
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    select = tmp_path / "select.json"
+    select.write_text(json.dumps(
+        {"experts": {str(LAYERS[0]): {"1": "test/b"}}}))
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/a@{REV}",
+         "--source", f"test/b@{REV}", "--select", select,
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    assert "incompatible" in capsys.readouterr().err
+    assert not list(out.glob("*.safetensors"))
+
+
+def test_incompatible_authenticated_tensor_schema_cannot_mix(tmp_path, served, capsys):
+    key = tmp_path / "shared.key"
+    repo_a, _, pub = build_source(tmp_path, "a", ks=(3,), key=key)
+    repo_b, _, _ = build_source(tmp_path, "b", ks=(3,), key=key, salt="b")
+    segment = repo_b / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = bytearray(segment.read_bytes())
+    hlen = struct.unpack("<Q", raw[:8])[0]
+    raw[8:8 + hlen] = raw[8:8 + hlen].replace(b'"F16"', b'"I16"')
+    segment.write_bytes(raw)
+    _resign(_att_path(repo_b, LAYERS[0], 3), key, lambda payload: payload[
+        "fragment"].update({
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "header_sha256": hashlib.sha256(raw[:8 + hlen]).hexdigest(),
+        }))
+    served["mount"]("test/a", repo_a)
+    served["mount"]("test/b", repo_b)
+    select = tmp_path / "select.json"
+    select.write_text(json.dumps(
+        {"experts": {str(LAYERS[0]): {"1": "test/b"}}}))
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "fetched",
+         "--source", f"test/a@{REV}", "--source", f"test/b@{REV}",
+         "--select", select, "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "tensor names/dtypes/shapes" in capsys.readouterr().err
+
+
+def test_explicit_provider_and_digest_selection_fail_closed(tmp_path, served, capsys):
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    select = tmp_path / "select.json"
+    select.write_text(json.dumps(
+        {"experts": {str(LAYERS[0]): {"1": "missing/provider"}}}))
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{REV}",
+         "--select", select, "--prefer-sha", "0" * 64,
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)],
+        expect=1)
+    err = capsys.readouterr().err
+    assert "requested provider" in err and "matched no requested expert" in err
+    assert not list(out.glob("*.safetensors"))
+
+
+@pytest.mark.parametrize("ref", ("main", "v1.2.3"))
+def test_symbolic_ref_is_resolved_and_serialized_as_a_commit(tmp_path, served, ref):
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    out = tmp_path / "fetched"
+    run(["--policy", policy, "--out", out, "--source", f"test/pub@{ref}",
+         "--trust-signer", pub, "--trust-root", trust_root(tmp_path, pub)])
+    report = json.loads((out / "fq-fetch-report.json").read_text())
+    source = report["sources"][0]
+    assert source["repo"] == "test/pub"
+    assert source["revision"] == source["resolved_commit"] == REV
+    assert source["requested_revision"] == ref
+    assert source["pinned"] is True
+    payload = _payload(out / "attestations" / f"layer-{LAYERS[0]:03d}.k3.jsonl")
+    assert payload["parents"][0]["revision"] == REV
+    assert payload["parents"][0]["requested_revision"] == ref
+
+
+def test_symbolic_ref_commit_drift_and_missing_commit_fail_closed(
+        tmp_path, served, monkeypatch, capsys):
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    original_range = fq_fetch.http_get_range
+    monkeypatch.setattr(
+        fq_fetch, "http_get_range",
+        lambda *args, **kwargs: (lambda result: (result[0], {"commit": "f" * 40,
+                                                             "total": result[1]["total"]}))(
+            original_range(*args, **kwargs)))
+    run(["--policy", policy, "--out", tmp_path / "drift",
+         "--source", "test/pub@main", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "repository drift" in capsys.readouterr().err
+
+    original_full = fq_fetch.http_get_full
+    monkeypatch.setattr(fq_fetch, "http_get_full",
+                        lambda *args, **kwargs: (original_full(*args, **kwargs)[0], {}))
+    run(["--policy", policy, "--out", tmp_path / "missing",
+         "--source", "test/pub@main", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "did not identify an immutable" in capsys.readouterr().err
+
+
+def test_layer_k_and_authenticated_header_predicate_must_match(
+        tmp_path, served, capsys):
+    key = tmp_path / "pub.key"
+    repo, _, pub = build_source(tmp_path, "pub", ks=(3,), key=key)
+    _resign(_att_path(repo, LAYERS[0], 3), key,
+            lambda payload: payload.__setitem__("layer", LAYERS[0] + 1))
+    served["mount"]("test/pub", repo)
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
+    run(["--policy", policy, "--out", tmp_path / "wrong-layer",
+         "--source", f"test/pub@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "not requested layer" in capsys.readouterr().err
+
+    repo, _, pub = build_source(tmp_path, "header", ks=(3,), key=key)
+    segment = repo / f"layer-{LAYERS[0]:03d}.k3.safetensors"
+    raw = bytearray(segment.read_bytes())
+    hlen = struct.unpack("<Q", raw[:8])[0]
+    raw[8:8 + hlen] = raw[8:8 + hlen].replace(b"repack-of", b"encode-of")
+    segment.write_bytes(raw)
+    _resign(_att_path(repo, LAYERS[0], 3), key, lambda payload: payload[
+        "fragment"].update({
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "header_sha256": hashlib.sha256(raw[:8 + hlen]).hexdigest(),
+        }))
+    served["mount"]("test/header", repo)
+    run(["--policy", policy, "--out", tmp_path / "wrong-header",
+         "--source", f"test/header@{REV}", "--trust-signer", pub,
+         "--trust-root", trust_root(tmp_path, pub)], expect=1)
+    assert "header predicate" in capsys.readouterr().err
