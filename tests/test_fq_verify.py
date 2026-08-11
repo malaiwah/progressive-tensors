@@ -644,6 +644,21 @@ def test_identity_fetched_binds_parent_coverage_header_and_jsonl(tmp_path, monke
            lambda p: p["parents"][0].update({"header_sha256": "0" * 64}))
     assert fq_verify.main(argv) == 1
     local_att.write_text(saved_local)
+    resign(local_att, tmp_path / "local.key",
+           lambda p: p["parents"][0].pop("header_sha256"))
+    assert fq_verify.main(argv) == 1
+    local_att.write_text(saved_local)
+
+    copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
+    saved_copied = copied.read_text()
+    resign(copied, tmp_path / "pub.key",
+           lambda p: p["materials"].pop("file"))
+    assert fq_verify.main(argv) == 1
+    copied.write_text(saved_copied)
+    resign(copied, tmp_path / "pub.key",
+           lambda p: p.update({"predicate": "derived-from"}))
+    assert fq_verify.main(argv) == 1
+    copied.write_text(saved_copied)
 
     copied = next((fam / "attestations").glob("test__pub@*/layer-*.k*.jsonl"))
     upstream = json.loads(base64.b64decode(

@@ -181,6 +181,11 @@ def fragment_binding(path: Path, entry: dict, payload: dict) -> dict:
     }
 
 
+def is_sha256(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64 and
+            all(c in "0123456789abcdef" for c in value))
+
+
 def binding_ok(binding: dict) -> bool:
     return all(binding.values())
 CHUNK = 1 << 24
@@ -970,6 +975,7 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 span_sha256(seg, entry["body_offset"] + lo,
                             entry["body_offset"] + hi)
                 for eid, (lo, hi) in entry["experts"].items())
+            meta = segment_meta(fam, entry)
             parents = (payload or {}).get("parents") or []
             provenance_ok = ((payload or {}).get("predicate") == "derived-from" and
                              ((payload or {}).get("derivation") or {}).get("rule") ==
@@ -1002,10 +1008,13 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                 upstream_frag = (upstream_payload or {}).get("fragment") or {}
                 materials = (upstream_payload or {}).get("materials") or {}
                 header_method = parent_record.get("header_authentication")
+                claimed_header = parent_record.get("header_sha256")
+                publisher_header = upstream_frag.get("header_sha256")
                 if header_method == "attested-header-digest":
                     header_evidence = (
-                        parent_record.get("header_sha256") ==
-                        upstream_frag.get("header_sha256") and
+                        is_sha256(claimed_header) and
+                        is_sha256(publisher_header) and
+                        claimed_header == publisher_header and
                         isinstance(upstream_frag.get("body_offset"), int))
                 elif header_method == "full-fragment":
                     # The parent fragment SHA is verified immediately below.
@@ -1016,9 +1025,15 @@ def cmd_identity_fetched(args) -> tuple[int, dict]:
                     (upstream_payload or {}).get("expert_sha256", {}).get(str(eid)) ==
                     (payload or {}).get("expert_sha256", {}).get(str(eid))
                     for eid in claimed_experts)
+                material_file = materials.get("file")
+                terminal_source_ok = (
+                    parent_record.get("role") == "source_fragment" and
+                    (upstream_payload or {}).get("predicate") == "repack-of" and
+                    isinstance(material_file, str) and bool(material_file) and
+                    meta.get("source_file") == material_file)
                 parent_ok = (
                     valid_parent and upstream_payload is not None and
-                    attestation_ok(upstream_sig) and
+                    attestation_ok(upstream_sig) and terminal_source_ok and
                     upstream_frag.get("sha256") == parent_record.get("sha256") and
                     upstream_frag.get("size") == parent_record.get("size") and
                     all(materials.get(field) == parent_record.get(field)
