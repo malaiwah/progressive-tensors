@@ -398,6 +398,24 @@ def test_legacy_trust_signer_tokens_remain_supported(repacked, monkeypatch, kind
                     "--trust-signer", token) == 0
 
 
+def test_bare_pub_filename_cannot_override_trust_root_key_id(repacked, monkeypatch):
+    """A local same-named .pub file cannot replace a publisher's key-id pin."""
+    snap, segments, tmp = repacked
+    pub = signer_of(segments)
+    token = "publisher.pub"
+    root = write_trust_root(tmp / "FINGERPRINTS", (pub, token, "active"))
+    (tmp / token).write_text(
+        fq_repack.Signer(tmp / "attacker.key").pub_hex + "\n")
+    monkeypatch.chdir(tmp)
+
+    ppath = policy_file(tmp, {str(l): [3] * E for l in LAYERS})
+    out = tmp / "asm-key-id-precedence"
+    assert assemble(segments, snap, ppath, out, "--trust-root", str(root),
+                    "--trust-signer", token) == 0
+    record = json.loads((out / "fq-assembly.json").read_text())
+    assert record["verification"]["trusted_signers"] == [pub]
+
+
 def test_trust_signer_rejections_match_shared_resolver(repacked):
     """Short, ambiguous, unknown, and revoked pins fail with fq_trust's text."""
     snap, segments, tmp = repacked

@@ -120,7 +120,7 @@ from fq_repack import (  # noqa: E402
     read_header,
     sha256_file,
 )
-from fq_trust import TrustError, Verifier as TrustVerifier  # noqa: E402
+from fq_trust import TrustError, TrustRoot, Verifier as TrustVerifier  # noqa: E402
 
 TOOL_VERSION = "fq_assemble/2"
 ATTESTATION_SCHEMA = "fq-attestation/2"
@@ -351,7 +351,8 @@ def _resolve_explicit_signer(token: str, trust_root: Path | None) -> str:
     """Resolve one explicit pin with the shared trust-root contract.
 
     Preserve assembler's legacy ``ed25519:`` spelling and bare local ``.pub``
-    filenames while handing their canonical values to fq_trust.
+    filenames while handing their canonical values to fq_trust.  A trust-root
+    key id always wins over a same-named local file.
     """
     spec = token.strip()
     if spec.lower().startswith("ed25519:"):
@@ -359,7 +360,12 @@ def _resolve_explicit_signer(token: str, trust_root: Path | None) -> str:
     pub_path = Path(spec)
     if (pub_path.suffix.lower() == ".pub" and pub_path.is_file()
             and os.sep not in spec):
-        spec = f".{os.sep}{spec}"
+        try:
+            root = TrustRoot.load(trust_root)
+        except TrustError as e:
+            raise VerificationError(str(e)) from e
+        if not any(record["key_id"] == spec for record in root.records):
+            spec = f".{os.sep}{spec}"
     try:
         verifier = TrustVerifier.resolve(
             trust_signer=spec, trust_root=trust_root)
