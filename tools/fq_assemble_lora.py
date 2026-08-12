@@ -308,8 +308,13 @@ def compute_hadamard_vectors(
 ) -> dict[str, torch.Tensor]:
     """Compute the suh and svh vectors that EXL3 stores alongside trellis.
 
-    These are the per-block sign vectors and scales from regularize().
-    The exact format must match what exl3_gemm expects.
+    EXL3 checkpoint format (from SIQ model inspection):
+    - suh: (input_size,) float16 — per-row sign+scale vector
+    - svh: (output_size,) float16 — per-column sign+scale vector
+
+    The regularize() function applies:
+      1. svh = sign * out_scales (per-column)
+      2. suh = sign * in_scales / (-cbs) (per-row, after column Hadamard)
     """
     k, n = w.shape
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -320,17 +325,17 @@ def compute_hadamard_vectors(
     mean = out_scales.mean().item()
     if mean > 1e-30:
         out_scales = out_scales / mean
-    sv_full = (sv * out_scales + 1e-10).float()
+    svh = (sv * out_scales.squeeze(0) + 1e-10).half()  # (n,) float16
 
     # After column Hadamard
-    w_col = (w / sv_full).contiguous()
+    w_col = (w / svh.float().unsqueeze(0)).contiguous()
     had_n_mat = ghd(HADAMARD_BLOCK, device, torch.float, 1.0 / math.sqrt(HADAMARD_BLOCK))
     w_col = (w_col.view(k, n // HADAMARD_BLOCK, HADAMARD_BLOCK) @ had_n_mat).view(k, n).contiguous()
 
-    in_scales = block_rms(w_col, dim=1, keepdim=True).clamp(min=1e-30)
-    su_full = (su.unsqueeze(1) * in_scales / (-cbs) + 1e-10).float()
+    in_scales = block_rms(w_col, dim=1, keepdim=True).clamp(min=1e-30).squeeze(1)
+    suh = (su * in_scales / (-cbs) + 1e-10).half()  # (k,) float16
 
-    return {"suh": su_full.squeeze().contiguous(), "svh": sv_full.squeeze().contiguous()}
+    return {"suh": suh.contiguous(), "svh": svh.contiguous()}
 
 
 # ── Encoding Pipeline ─────────────────────────────────────────────────────
@@ -655,7 +660,7 @@ def cmd_encode(args) -> int:
                 tensors[f"{prefix}.trellis"] = exp_data["base"][f"{proj}_trellis"]
                 tensors[f"{prefix}.suh"] = exp_data["base"][f"{proj}_suh"]
                 tensors[f"{prefix}.svh"] = exp_data["base"][f"{proj}_svh"]
-                tensors[f"{prefix}.mcg"] = torch.tensor([0xCBAC1FED], dtype=torch.uint32).view(torch.int32)
+                tensors[f"{prefix}.mcg"] = torch.tensor(0xCBAC1FED, dtype=torch.uint32).view(torch.int32)
         if tensors:
             save_safetensors(tensors, base_dir / f"model-layer-{layer:03d}.safetensors")
             print(f"  Layer {layer}: {len(tensors)} base tensors", flush=True)
