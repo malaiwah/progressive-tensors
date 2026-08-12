@@ -655,7 +655,7 @@ def cmd_encode(args) -> int:
                 tensors[f"{prefix}.trellis"] = exp_data["base"][f"{proj}_trellis"]
                 tensors[f"{prefix}.suh"] = exp_data["base"][f"{proj}_suh"]
                 tensors[f"{prefix}.svh"] = exp_data["base"][f"{proj}_svh"]
-                tensors[f"{prefix}.mcg"] = torch.tensor([0xCBAC1FED], dtype=torch.int32)
+                tensors[f"{prefix}.mcg"] = torch.tensor([0xCBAC1FED], dtype=torch.uint32).view(torch.int32)
         if tensors:
             save_safetensors(tensors, base_dir / f"model-layer-{layer:03d}.safetensors")
             print(f"  Layer {layer}: {len(tensors)} base tensors", flush=True)
