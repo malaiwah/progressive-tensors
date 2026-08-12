@@ -579,7 +579,7 @@ def cmd_encode(args) -> int:
                 for proj in PROJECTIONS:
                     if proj not in expert_weights[exp_id]:
                         continue
-                    w = expert_weights[exp_id][proj].to(device)
+                    w = expert_weights[exp_id][proj].T.contiguous().to(device)  # (in, out) for EXL3 trellis layout
                     result = encode_expert_msrt(
                         w, base_k, stages, device, ghd, tcp, tcpi, qtf, cbs, ext)
                     del w
