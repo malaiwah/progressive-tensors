@@ -223,17 +223,23 @@ def quantize_trellis_packed(
     tcp: Any,
     tcpi: Any,
     qtf: Any,
+    ext: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize and return BOTH reconstructed values and packed trellis indices.
 
     Returns (reconstructed_float, packed_trellis_int16) where packed_trellis
     has shape (k // 16, n // 16, K * 16) dtype int16 — the EXL3 storage format.
+
+    The quantize_tiles function returns raw Viterbi path indices of shape
+    (n_tiles, 256) — one int16 per weight element. ext.pack_trellis compresses
+    these to (n_tiles, K * 16) packed indices, which is what the EXL3 checkpoint
+    and vLLM loader expect (validated at exl3.py:2099-2102).
     """
     k, n = data.shape
     tiles_n = n // 16
     weight_q = torch.zeros_like(data)
-    # Packed trellis: (tiles_k, tiles_n, K*16) int16
-    packed = torch.zeros(k // 16, tiles_n, K * 16, dtype=torch.int16, device=device)
+    # Raw (unpacked) indices: (tiles_k, tiles_n, 256) int16
+    raw_indices = torch.zeros(k // 16, tiles_n, 256, dtype=torch.int16, device=device)
     qa = {"K": K, "mcg": True}
     perm = tcp(device)
     perm_i = tcpi(device)
@@ -244,11 +250,20 @@ def quantize_trellis_packed(
         tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
         tiles = tiles[:, perm].contiguous()
         quant_w, quant_idx = qtf(tiles, qa)
-        # Store packed indices
-        packed[tk] = quant_idx.reshape(tiles_n, K * 16)
+        # Store raw indices — quant_idx has shape (n_tiles, 256)
+        raw_indices[tk] = quant_idx
         # Reconstruct
         quant_w = quant_w[:, perm_i].reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, n)
         weight_q[bi:bi + 16] = quant_w
+
+    # Pack the raw indices to EXL3 format: (tiles_k, tiles_n, K * 16) int16
+    if ext is not None and hasattr(ext, "pack_trellis"):
+        packed_shape = (k // 16, tiles_n, 256 * K // 16)
+        packed = torch.zeros(packed_shape, dtype=torch.int16, device=device)
+        ext.pack_trellis(packed, raw_indices.contiguous(), K)
+    else:
+        # Fallback: store raw indices (unpacked) — for testing without ext
+        packed = raw_indices
 
     return weight_q, packed
 
@@ -260,6 +275,7 @@ def rescaled_trellis_quantize(
     device: torch.device,
     tcp: Any, tcpi: Any, qtf: Any,
     cbs: float,
+    ext: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """Rescale residual to match codebook range, quantize, return (recon, packed, scale).
 
@@ -269,13 +285,14 @@ def rescaled_trellis_quantize(
     """
     residual_rms = residual.square().mean().sqrt().item()
     if residual_rms < 1e-12:
+        packed_w = 256 * K_res // 16 if ext else 256
         return base_q, torch.zeros(
-            residual.shape[0] // 16, residual.shape[1] // 16, K_res * 16,
+            residual.shape[0] // 16, residual.shape[1] // 16, packed_w,
             dtype=torch.int16, device=device), 1.0
 
     scale = abs(cbs) / residual_rms
     scaled = residual * scale
-    recon_packed, packed = quantize_trellis_packed(scaled, K_res, device, tcp, tcpi, qtf)
+    recon_packed, packed = quantize_trellis_packed(scaled, K_res, device, tcp, tcpi, qtf, ext)
     recon = base_q + recon_packed / scale
     return recon, packed, scale
 
@@ -325,6 +342,7 @@ def encode_expert_msrt(
     device: torch.device,
     ghd: Any, tcp: Any, tcpi: Any, qtf: Any,
     cbs: float,
+    ext: Any = None,
 ) -> dict[str, Any]:
     """Encode one expert weight matrix with MSRT.
 
@@ -336,7 +354,7 @@ def encode_expert_msrt(
     w_reg = regularize(w_bf16, device, ghd, cbs)
 
     # Base tier
-    base_recon, base_packed = quantize_trellis_packed(w_reg, base_k, device, tcp, tcpi, qtf)
+    base_recon, base_packed = quantize_trellis_packed(w_reg, base_k, device, tcp, tcpi, qtf, ext)
     had_vectors = compute_hadamard_vectors(w_bf16, device, ghd, cbs)
 
     result = {
@@ -353,7 +371,7 @@ def encode_expert_msrt(
     for stage in stages:
         residual = w_reg - current_recon
         recon, packed, scale = rescaled_trellis_quantize(
-            current_recon, residual, stage["k"], device, tcp, tcpi, qtf, cbs)
+            current_recon, residual, stage["k"], device, tcp, tcpi, qtf, cbs, ext)
         result["stages"].append({
             "trellis": packed.cpu(),
             "suh": had_vectors["suh"].cpu(),  # Same Hadamard vectors
@@ -558,7 +576,7 @@ def cmd_encode(args) -> int:
                         continue
                     w = expert_weights[exp_id][proj].to(device)
                     result = encode_expert_msrt(
-                        w, base_k, stages, device, ghd, tcp, tcpi, qtf, cbs)
+                        w, base_k, stages, device, ghd, tcp, tcpi, qtf, cbs, ext)
                     del w
                     torch.cuda.empty_cache()
 
