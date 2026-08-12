@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 # Add tools to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
