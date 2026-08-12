@@ -121,28 +121,28 @@ def bootstrap_encoder(encoder_source: str) -> tuple[Any, ...]:
     # Load the extension
     spec = importlib.util.spec_from_file_location(
         "exllamav3.ext", str(pkg_root / "ext.py"))
-    m = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.ext"] = m
-    spec.loader.exec_module(m)
+    ext_mod = importlib.util.module_from_spec(spec)
+    sys.modules["exllamav3.ext"] = ext_mod
+    spec.loader.exec_module(ext_mod)
 
     # Load Hadamard
     spec = importlib.util.spec_from_file_location(
         "exllamav3.util.hadamard", str(pkg_root / "util" / "hadamard.py"))
-    m = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.util.hadamard"] = m
-    spec.loader.exec_module(m)
+    had_mod = importlib.util.module_from_spec(spec)
+    sys.modules["exllamav3.util.hadamard"] = had_mod
+    spec.loader.exec_module(had_mod)
 
     # Load quantize module
     quant_path = pkg_root / "modules" / "quant" / "exl3_lib" / "quantize.py"
     spec = importlib.util.spec_from_file_location(
         "exllamav3.modules.quant.exl3_lib.quantize", str(quant_path))
-    m = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.modules.quant.exl3_lib.quantize"] = m
-    spec.loader.exec_module(m)
+    quant_mod = importlib.util.module_from_spec(spec)
+    sys.modules["exllamav3.modules.quant.exl3_lib.quantize"] = quant_mod
+    spec.loader.exec_module(quant_mod)
 
-    return (m.exllamav3_ext, m.get_hadamard_dt,
-            m.tensor_core_perm, m.tensor_core_perm_i,
-            m.quantize_tiles, m.codebook_scale)
+    return (ext_mod.exllamav3_ext, had_mod.get_hadamard_dt,
+            quant_mod.tensor_core_perm, quant_mod.tensor_core_perm_i,
+            quant_mod.quantize_tiles, quant_mod.codebook_scale)
 
 
 # ── Quantization Primitives ────────────────────────────────────────────────
