@@ -35,11 +35,6 @@ Usage:
     --recipe recipes/fruit-k2-k3k4-cart.json \\
     --out ./output \\
     --encoder-source /opt/fruit-pip/exllamav3
-
-The tool requires the exllamav3 encoder (quantize_tiles, codebook_scale,
-Hadamard transform) to perform trellis quantization. It does NOT require
-vLLM or flash_attn — the encoder is loaded via the same bootstrap pattern
-used in the PoC scripts.
 """
 from __future__ import annotations
 
@@ -62,10 +57,10 @@ CARTRIDGE_SCHEMA = "fq-cartridge/1"
 ADAPTER_CONFIG_SCHEMA = "fq-cartridge-adapter/1"
 HADAMARD_BLOCK = 128
 
-# Expert tensor name pattern in source checkpoints
+# Expert tensor name pattern — matches both BF16 (.weight) and EXL3 (.rank0.trellis)
 EXPERT_RE_PATTERN = (
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
-    r"(gate_proj|up_proj|down_proj)(?:\.rank(\d+))?$"
+    r"(gate_proj|up_proj|down_proj)\.(?:rank\d+\.)?(?:weight|trellis)$"
 )
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
@@ -509,12 +504,17 @@ def cmd_encode(args) -> int:
 
     # Parse expert filters
     expert_filters = []
+    hot_experts = recipe.get("hot_experts", list(range(96)))  # default: first 96
     for stage in stages:
-        if stage["experts"] == "all":
+        exp_spec = stage["experts"]
+        if exp_spec == "all":
             expert_filters.append(None)
+        elif isinstance(exp_spec, str) and exp_spec in ("hot96", "hot"):
+            expert_filters.append({l: hot_experts for l in moe_layers})
+        elif isinstance(exp_spec, list):
+            expert_filters.append({l: exp_spec for l in moe_layers})
         else:
-            # Same expert list for all layers (could be per-layer in future)
-            expert_filters.append({l: stage["experts"] for l in moe_layers})
+            expert_filters.append(None)
 
     # Load source weights and encode
     from safetensors import safe_open
@@ -622,6 +622,7 @@ def cmd_encode(args) -> int:
     # Write base checkpoint
     print("\nWriting base checkpoint...", flush=True)
     base_dir = out_dir / "base"
+    base_dir.mkdir(parents=True, exist_ok=True)
     # Simplified: write all experts for each layer into one shard
     for layer in moe_layers:
         if layer not in write_results:
