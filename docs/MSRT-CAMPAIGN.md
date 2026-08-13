@@ -157,6 +157,49 @@ overlap; require **≥350 Mbps measured** before committing the fleet. Below tha
 stage bytes on a regional filesystem with a CPU VM instead of paying GPUs to
 wait.
 
+## 3.5 Rehearsal: this procedure, run whole
+
+**Measured.** The complete procedure below — `plan`, `skeleton`, `encode`,
+resume check, `finalize`, two `fq-combine-cartridges` products and a pinned-key
+rejection — was run end to end on the GLM-5.2-SIQ-Fruit proxy (11 MoE layers,
+256 experts, 512-wide) on one RTX 5090, using the same nine-node recipe shape as
+the GLM graph:
+
+| Step | Result |
+|---|---|
+| `plan` | 88 blocks, 8,448 matrices, 9 passes/matrix, 14.0 bpw emitted |
+| `skeleton` | 16 shards |
+| `encode` | 88/88 blocks, 67m19s, **0.4778 s/matrix committed** of which 0.4752 quantizing (**0.54% commit overhead**), 1.12 GPU-h |
+| resume | re-run skipped all 88 blocks: `nothing to do` |
+| `finalize` | re-hashed and verified 792 expert fragments + 16 skeleton shards; published 9 assemblies at 2.0/3.0/4.0/4.0/5.0 and 3.0/4.0/5.0/5.0 bpw |
+| combine `k2-k5like` | 88 shards, 67,584 tensors, 256 experts x 11 layers |
+| combine `k2-k4like-direct --experts 0-95` | **33 shards**, 12,672 tensors, 96 experts |
+| wrong `--trust-key` | refused |
+
+**Measured** decode of those published products through the runtime's own
+`ext.reconstruct`, worst of 3 experts x 3 projections in layer 3 block 0, against
+the BF16 source:
+
+| Product | MSE | vs its K2 base |
+|---|---:|---:|
+| `base/k2` alone | 1.517e-04 | 1x |
+| `k4like-hot96` (K2 + K2 residual) | 1.044e-05 | **14.5x** |
+| `k5like` (K2 + K2 + K1 residuals) | 2.877e-06 | **52.7x** |
+
+Both products measure 1.40x the mean MSE their deepest stage attested, which is
+the expected worst-of-nine to block-mean spread, not a decode error. The
+narrowed product carries block 2 (experts 64–95) and not block 3 (96–127): a
+consumer wanting the hot 96 downloads 33 of 88 shards.
+
+The commit overhead here (0.54%) corroborates the 0.37% measured on a real
+GLM-5.2 block in §2 — writing, hashing and signing every fragment is not what
+this campaign costs.
+
+Two operational failures were found by running it, not by reading it: two
+launchers with two keys produced a campaign `finalize` correctly refused (§4.3),
+and a stage shard written without its Hadamard sign vectors was caught by the
+combiner's component check rather than by the encoder.
+
 ## 4. Rental procedure
 
 Set once:
@@ -182,6 +225,9 @@ attestation pins.
 
 ### 4.0 Gates before the fleet
 
+0. Rehearse the whole procedure on a small MoE checkpoint first (§3.5): it costs
+   about one GPU-hour and it is the only step that exercises finalize, the
+   products and the trust path at campaign scale.
 1. `pytest tests/ -q` — full suite green.
 2. On the rented card:
    `FQ_ENCODER_SOURCE=$ENC FQ_PARITY_SOURCE=<small per-layer BF16 checkpoint>
@@ -267,8 +313,14 @@ claimed with an `O_EXCL` lock, so two launchers pointed at one campaign cannot
 burn GPU hours on the same block; the launcher clears stale claims once, before
 it forks.
 
-**Run one launcher at a time.** The work split is disjoint within a launcher,
-not across launchers.
+**Run one launcher at a time, with one key.** The work split is disjoint within
+a launcher, not across launchers, and claims prevent duplicate *work* — not
+mixed *identity*. Observed in rehearsal: two launchers, each with its own
+`--sign-key`, split the 88 blocks between them and finished the whole encode;
+`finalize` then refused the campaign — `fragments are signed by 3 different
+keys` — and 82 GPU-minutes had to be re-run. Keep the key file for the life of
+the campaign, outside whatever the cleanup script deletes; a resumed run must
+publish under the signer its earlier fragments already named.
 
 ### 4.4 Resume after preemption
 
