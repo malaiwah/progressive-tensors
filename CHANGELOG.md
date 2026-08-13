@@ -59,14 +59,20 @@ measured, what is implemented, and what is not.
   does *not*, and what an attacker with full control of the artifact
   repository can and cannot do under fingerprint pinning.
 - **JSON Schemas** in [`schemas/`](schemas/) for `fq-segment/1` (segment
-  metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`
-  and `fq-release/1` — derived from real emitted artifacts and re-validated
-  against freshly emitted documents on every CI run.
+  metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`,
+  `fq-cartridge/1`, and `fq-release/1` — derived from real emitted artifacts
+  and re-validated against freshly emitted documents on every CI run.
 - **Packaging** — `pyproject.toml` with console entry points (`fq-repack`,
   `fq-assemble`, `fq-fetch`, `fq-prime`, `fq-verify`, `fq-release`,
   `fq-eps`), a hashed universal dev lock (`requirements-dev.txt`), and
   GitHub Actions CI running the suite on ubuntu-latest and macos-latest for
   Python 3.11 / 3.12 / 3.13, plus wheel-build and trust-root jobs.
+- **MSRT cartridge tools** — `fq-assemble-lora` creates a complete EXL3 base
+  checkpoint plus validated, sharded full-rank residual cartridges;
+  `fq-combine-cartridges` validates and combines separately encoded stages;
+  `fq-measure-mse-fruit` compares the actual SIQ checkpoint and MSRT variants
+  in original weight space. These custom cartridges are explicitly not
+  standard PEFT/LoRA adapters and require an EXL3 MSRT-aware runtime.
 - **[docs/PRIOR-ART.md](docs/PRIOR-ART.md)** — commissioned independent
   prior-art review, and the single narrow claim this project makes.
 

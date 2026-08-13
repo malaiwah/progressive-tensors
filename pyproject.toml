@@ -35,6 +35,7 @@ hub = ["huggingface_hub>=0.23"]
 # the bare wheel and runs `--help` on all of them to keep that true.
 numeric = ["numpy>=1.24"]
 charts = ["numpy>=1.24", "matplotlib>=3.7"]
+quant = ["torch>=2.3", "safetensors>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/malaiwah/progressive-tensors"
@@ -49,6 +50,9 @@ fq-prime = "fq_prime:main"
 fq-verify = "fq_verify:main"
 fq-release = "fq_release:main"
 fq-eps = "fq_eps:main"
+fq-assemble-lora = "fq_assemble_lora:main"
+fq-combine-cartridges = "fq_combine_cartridges:main"
+fq-measure-mse-fruit = "fq_measure_mse_fruit:main"
 
 # The tools are flat, mutually-importing single-file modules (they add their
 # own directory to sys.path when run as scripts).  Ship them as top-level
@@ -65,12 +69,14 @@ sources = ["tools"]
 [tool.hatch.build.targets.wheel.force-include]
 "keys/FINGERPRINTS" = "fq_data/keys/FINGERPRINTS"
 "schemas" = "fq_data/schemas"
+"recipes/fruit-k2-k3k4-cart.json" = "fq_data/recipes/fruit-k2-k3k4-cart.json"
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/tools",
   "/tests",
   "/schemas",
+  "/recipes",
   "/keys",
   "/docs",
   "/README.md",

@@ -62,6 +62,7 @@ from fq_assemble import (  # noqa: E402
     check_out_dir,
     regenerate_manifest,
     regenerate_shard_index,
+    sha256_file,
 )
 from fq_repack import PROJ_ORDER  # noqa: E402
 
@@ -747,6 +748,8 @@ def _stage_tensor_names(
 
 def write_adapter_config(
     directory: Path,
+    base_k: int,
+    base_manifest_sha256: str,
     stages: list[dict[str, Any]],
     shards: list[str],
     tensor_count: int,
@@ -754,6 +757,8 @@ def write_adapter_config(
     """Write the explicit custom MSRT runtime contract."""
     config = {
         "schema": ADAPTER_CONFIG_SCHEMA,
+        "base_k": base_k,
+        "base_manifest_sha256": base_manifest_sha256,
         "format": "exl3-msrt-full-rank",
         "standard_lora_compatible": False,
         "runtime_operation": (
@@ -897,18 +902,19 @@ def cmd_encode(args) -> int:
 
         if expert_count == 0 or projection_count == 0:
             raise CartridgeError("encoding produced no experts or projections")
+        write_base_metadata(base_dir, base_k, layers, experts_per_layer)
+        base_manifest_sha256 = sha256_file(base_dir / "MANIFEST.sha256")
         for stage in stages:
             label = stage["label"]
             if not stage_shards[label]:
                 raise CartridgeError(
                     f"stage {label!r} selected no experts in the source")
             write_adapter_config(
-                cartridge_dir / label, [stage],
+                cartridge_dir / label, base_k, base_manifest_sha256, [stage],
                 stage_shards[label], stage_tensor_counts[label])
         write_adapter_config(
-            cartridge_dir / "combined", stages,
+            cartridge_dir / "combined", base_k, base_manifest_sha256, stages,
             combined_shards, combined_tensor_count)
-        write_base_metadata(base_dir, base_k, layers, experts_per_layer)
 
         summary = {
             "tool": TOOL_VERSION,
