@@ -160,49 +160,67 @@ isolated 2.96 s. The loop therefore runs within ~5% of the sum of its kernels.
 | **Graph saving, trellis kernels** | **1.83x** | **1.94x** |
 | Nominal trellis bytes saved | 2.5x (14 vs 35 bpw) | 2.9x (12 vs 35 bpw) |
 
-Fleet projection at the live JarvisLabs spot price of $0.99/GPU-hour. A roofline
-weighting of the measured per-K mix (K1 is memory-bound, 1.79 -> 1.60 TB/s;
-K2/K3 lean on SM count, 170 -> 188 SMs) puts the parity-card centre at
-`0.724 x 1.122 + 0.276 x 0.904 = 1.062`:
+Fleet projection at the live JarvisLabs spot price of $0.99/GPU-hour.
+**[DERIVED]** A roofline weighting of the measured per-K mix (K1 is memory-bound,
+1.79 -> 1.60 TB/s, a 1.122 time factor; K2/K3 lean on SM count, 170 -> 188 SMs, a
+0.904 time factor) is **recipe-specific**, because the two graphs do not have the
+same K1 share:
+
+| Graph | K1 share of kernel time | roofline time factor |
+|---|---:|---:|
+| `dag` | 5 x 1.618 / 11.182 = 0.7235 | **1.0617** |
+| `lean` | 3 x 1.618 / 7.946 = 0.6109 | **1.0372** |
 
 | Assumption | `dag` GPU-h | `dag` compute | `lean` GPU-h | `lean` compute |
 |---|---:|---:|---:|---:|
-| RTX PRO 6000 10% faster | 168 | $166 | 119 | $118 |
-| **roofline centre (+6.2%)** | **198** | **$197** | **141** | **$139** |
-| RTX PRO 6000 25% slower | 234 | $231 | 166 | $164 |
+| duration x0.90 (faster card) | 168 | $167 | 119 | $118 |
+| **roofline centre** | **198** | **$196** | **138** | **$136** |
+| duration x1.25 (slower card) | 234 | $231 | 166 | $164 |
 
-8-GPU compute wall at the roofline centre: **24.8 h** (`dag`), **17.6 h**
-(`lean`).
+The outer rows are *duration* multipliers, not throughput claims: x0.90 is a 10%
+shorter run, which is 11% more throughput. 8-GPU compute wall at the roofline
+centre: **24.8 h** (`dag`), **17.2 h** (`lean`).
 
 **Compute wall is not elapsed wall.** Nothing overlaps the first source window
-or the final output drain, and finalize pauses the GPUs (§4.6): **measured 908
-MB/s** of verify throughput (8.72 GB campaign re-read and re-hashed in 10.26 s,
-warm cache), so finalize is `min(908 MB/s, volume read rate)` — 21 min for the
-lean campaign on a 1 GB/s volume, 38 min at 500 MB/s. Realistic elapsed time at
-the roofline centre and 350 Mbps is **27–30 h** (`dag`) or **20–22 h** (`lean`).
+or the final output drain, and finalize pauses the GPUs (§4.6). **[MEASURED]**
+finalize re-read and re-hashed a 9.32 GB campaign (8.68 GiB) in 10.263 s = **908
+MB/s**, warm cache, one core. **[UNMEASURED]** extrapolating that 123x to a cold
+1.146 TB tree: the pass is then bounded by `min(hash rate, volume read rate)` and
+by filesystem metadata on 4,256 block files plus their sidecars, so budget **21
+min at 1 GB/s, 38 min at 500 MB/s, and verify it on the rehearsal**.
+**[DERIVED]** elapsed time at the roofline centre and 350 Mbps is **27–30 h**
+(`dag`) or **20–22 h** (`lean`).
 
-Because the lean campaign shrinks compute by 29% but bytes by only 6%, it is the
-more I/O-bound of the two: hiding transfer under compute needs **360 Mbps**
-(`lean`) versus **273 Mbps** (`dag`).
+**[DERIVED]** Because the lean campaign shrinks compute by 29% but bytes by only
+6%, it is the more I/O-bound of the two. Against the *rental* compute wall above,
+hiding all logical WAN under compute needs **348 Mbps** (`lean`) versus **258
+Mbps** (`dag`) — campaign averages only. The first window (203.9 GB) and the final
+base drain (536.6 GB) overlap nothing by construction (§4.5), so they are elapsed
+time whatever the link does; §2.1 prices them as idle-GPU tails.
 
-Budget for the recommended `lean` graph: **$160 planning centre, $200
+Budget for the recommended `lean` graph: **$160 planning centre, $220
 authorization cap** — engineering contingencies, not statistical bounds.
 
-| Item | Cost |
-|---|---:|
-| Compute, roofline centre (fast card $118, slow card $164) | $139 |
-| Eight GPUs idle through the first stage and finalize (§2.1) | $12 |
-| 1.6 TB persistent storage, ~19 h of fleet plus tails | $5–$11 |
-| Gates: one block $0.22, one 8-GPU layer $1.73 | $2 |
-| CPU VM for finalize and the 3.4 h final drain | $1–$3 |
-| **Planning centre** | **$160** |
-| Contingency: one 8-layer-window redo (13.96 GPU-h) | $14 |
-| **Authorization cap** | **$200** |
+| Item | Centre | Worst |
+|---|---:|---:|
+| Compute (roofline centre; duration x1.25 card) | $136 | $164 |
+| Eight GPUs idle through the first stage and finalize (§2.1) | $12 | $12 |
+| 1.6 TB persistent storage (elapsed; two full days) | $5 | $11 |
+| Gates: one block $0.22, one 8-GPU layer $1.73 | $2 | $2 |
+| CPU VM for finalize and the 3.4 h final drain | $2 | $3 |
+| Sub-total | **$157** | **$192** |
+| Contingency: one 8-layer-window redo (13.96 GPU-h) | — | $14 |
+| **Planning centre / authorization cap** | **$160** | **$220** |
 
-A routine spot preemption with persistent storage loses at most the in-flight
-block per GPU: 1.74 GPU-h / $1.73 for all eight, not a window. Forgetting the §4.5
-release gate costs $27 and is the single largest avoidable line item. For the
-`dag` graph add $54–$60 of compute: **$215 centre, $270 cap**.
+The cap is the worst column plus one window redo, plus $14 of slack; at $200 the
+same arithmetic came to $206 and had none. **[DERIVED, conditional]** a routine
+spot preemption with persistent storage loses at most the in-flight block per GPU
+— 1.74 GPU-h / $1.73 for all eight, not a window — which follows from the block
+commit protocol (§4.4) but assumes the provider's volume survives the preemption,
+that `$KEY` and `$REPO` survive on it (§4.5 checklist), and that `hf download`
+resumes. None of those three is measured here. Forgetting the §4.5 release gate
+costs $27 and is the single largest avoidable line item. For the `dag` graph add
+$60 of compute: **$220 centre, $290 cap**.
 
 ### 2.1 Fleet size
 
@@ -336,6 +354,27 @@ launchers with two keys produced a campaign `finalize` correctly refused (§4.3)
 and a stage shard written without its Hadamard sign vectors was caught by the
 combiner's component check rather than by the encoder.
 
+### 3.6 Rehearsal of the *procedure*, through the driver
+
+**Measured.** `tools/msrt_campaign.sh` was then run end to end on the same proxy
+with the **lean** recipe and two windows (`3-8`, `9-13`), against a `--local-dir`
+source staged by a stand-in hub client:
+
+| Step | Result |
+|---|---|
+| window `3-8` | staged 11 files, skeleton wrote 11, **48 blocks at 0.3399 s/matrix** |
+| retirement | deleted layers 003–008; kept the skeleton-only shards and everything window 2 still needed |
+| window `9-13` | staged only the 5 new files, skeleton wrote 5 (11 already complete, 0 absent), **40 blocks at 0.3406 s/matrix** |
+| release gate | printed before finalize, which used no GPU |
+| `finalize` | both bases published, **7 assemblies** at 2.0/3.0/4.0/5.0 and 3.0/4.0/5.0 bpw |
+| products | `k2-k5like` 88 shards / 67,584 tensors / 256 experts; `k2-k4like-direct --experts 0-95` **33 of 88 shards** / 12,672 tensors |
+| decode | 2.877e-06 (`k5like`) and 1.044e-05 (`hot96`), **bit-identical to the hand-run campaign** despite a different signing key, different windows and a different driver |
+
+The lean rate on this proxy is 0.3399 s/matrix against 0.4778 for `dag`, a ratio of
+**0.7115** — a third independent measurement of the same 0.709/0.711 ratio (§2).
+The identical decode MSE from two independently driven campaigns is the
+determinism claim (§4.4) holding across whole campaigns, not just shards.
+
 ## 4. Rental procedure
 
 Set once:
@@ -350,7 +389,8 @@ export KEY=/data/keys/glm52-campaign.key   # on the volume, NEVER inside $CAMPAI
 export REPO=/data/progressive-tensors      # the checkout, ON the volume
 export RECIPE=$REPO/recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
 export ENC=/opt/exllamav3-python/exllamav3
-export HF_XET_CACHE=/data/xet-cache        # keep the chunk cache off the root disk
+export HF_XET_CACHE=/data/xet-cache        # if Xet is used at all, keep it here
+export HF_HUB_DISABLE_XET=1                # source staging: see below
 
 # metadata first: every later command resolves layers through the index
 hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
@@ -360,6 +400,14 @@ hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
 
 Everything is `export`ed because the staging and cleanup snippets below run
 Python from a heredoc and read these names from the environment.
+
+**Disable Xet for source staging, keep it for uploads.** Every source shard is
+downloaded exactly once and then deleted, so the Xet chunk cache can only grow
+against the same 1.6 TB volume the campaign needs — its occupancy is not in the
+peak timeline in §3 and it is not bounded by anything in this procedure.
+`HF_HUB_DISABLE_XET=1` removes that variable from the download side. Unset it for
+the *uploads* in §4.5, where chunk deduplication is what makes the second base's
+identical skeleton copy nearly free.
 
 **Stage with `--local-dir`, never into the HF cache.** A cache download writes
 payload into `<cache>/blobs/<sha>` and puts a *symlink* in `snapshots/<rev>/`;
@@ -397,10 +445,11 @@ and what it costs; the driver is what you should actually run.
 0. Rehearse the whole procedure on a small MoE checkpoint first (§3.5): it costs
    about one GPU-hour and it is the only step that exercises finalize, the
    products and the trust path at campaign scale.
-1. `pytest tests/ -q` — full suite green.
+1. `(cd "$REPO" && pytest tests/ -q)` — full suite green.
 2. On the rented card:
-   `FQ_ENCODER_SOURCE=$ENC FQ_PARITY_SOURCE=<small per-layer BF16 checkpoint>
-   pytest tests/test_msrt_decode_parity.py -q`. Thirteen tests prove, with the
+   `FQ_ENCODER_SOURCE=$ENC FQ_PARITY_SOURCE=$PROXY \
+   pytest "$REPO/tests/test_msrt_decode_parity.py" -q`, where `$PROXY` is a small
+   per-layer BF16 MoE checkpoint. Thirteen tests prove, with the
    runtime's own `ext.reconstruct`, that a *published* campaign decodes to the
    MSE it attested — encode, finalize, combine under a pinned key, then decode
    the combined adapter against the source weights.
@@ -505,14 +554,14 @@ attest what it copied:
 
 ```bash
 curl -s "https://huggingface.co/api/models/$REPO_ID/tree/$REV?recursive=1" \
-  > source-tree.json     # lfs.oid is the sha256 of each file
+  > "$CAMPAIGN/source-tree.json"    # lfs.oid is the sha256 of each file
 ```
 
 ### 4.2 Skeleton (once per window)
 
 ```bash
 fq-assemble-lora skeleton "${COMMON[@]}" "${IDENTITY[@]}" \
-  --sign-key "$KEY" --source-digests source-tree.json
+  --sign-key "$KEY" --source-digests "$CAMPAIGN/source-tree.json"
 ```
 
 Copies non-expert tensors out of whatever shards are present and reports how

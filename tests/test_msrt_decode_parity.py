@@ -201,7 +201,8 @@ def test_published_campaign_decodes_to_its_measured_reconstruction(tmp_path):
         encoder_source=Path(ENCODER_SOURCE), device="cuda:0", devices=None,
         layers=None, shard_index=0, shard_count=1, force=False,
         tile_batch=lora.TILE_BATCH, sign_key=tmp_path / "sign.key",
-        base_model="local/parity", base_revision="a" * 40)
+        base_model="local/parity", base_revision="a" * 40,
+        source_digests=None)
     assert lora.cmd_skeleton(args) == 0
     # One block is enough to prove the contract and keeps the test minutes long.
     args.shard_count = max(
@@ -219,7 +220,7 @@ def test_published_campaign_decodes_to_its_measured_reconstruction(tmp_path):
     assert combine.combine(SimpleNamespace(
         root=campaign, assembly="k5like", out=adapter, experts="0,1",
         layers=None, force=False, trust_key=key,
-        insecure_unsigned=False)) == 0
+        base=campaign / "base" / "k2", insecure_unsigned=False)) == 0
 
     device = torch.device("cuda:0")
     base_shard = campaign / "base" / "k2" / lora.block_name(layer, 0)
