@@ -120,7 +120,8 @@ export WINDOWS="$WINDOWS"
 export FQ="${FQ:-fq-assemble-lora}"
 export REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 export DRIVER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
-export PATH="$(dirname "$(command -v "${FQ_CMD[0]}" || echo /usr/bin/false)"):\$PATH"
+export PATH="$(dirname "$(command -v "${FQ_CMD[0]}" ||
+  echo "$CAMPAIGN/.no-campaign-tool-resolved/x")"):\$PATH"
 ENV
 fi
 
@@ -232,8 +233,13 @@ fi
 # the campaign, the key, the recipe, the source metadata, this driver and the CLI
 # it calls must all be on the one filesystem that gets reattached.
 gate_failed=0
+case ${REHEARSAL:-0} in
+  0|1) ;;
+  *) echo "REHEARSAL must be 0 or 1, not '${REHEARSAL}': refusing to guess" >&2
+     exit 2;;
+esac
 gate_note() {
-  if [[ -n ${REHEARSAL:-} ]]; then echo "rehearsal, not enforced: $1" >&2
+  if [[ ${REHEARSAL:-0} == 1 ]]; then echo "rehearsal, not enforced: $1" >&2
   else echo "$1" >&2; gate_failed=1; fi
 }
 mount_of() { findmnt -no TARGET --target "$1" 2>/dev/null; }
@@ -246,9 +252,15 @@ set REHEARSAL=1 if no rented fleet is at stake."
 fi
 driver_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 cli_path=$(command -v "${FQ_CMD[0]}" || true)
+if [[ -z $cli_path ]]; then
+  gate_note "the campaign tool '${FQ_CMD[0]}' does not resolve here, so it
+cannot be on the filesystem that gets reattached: finalize would have nothing to
+run. Install it under the volume (see the runbook's venv step) and re-run."
+  cli_path=/nonexistent/campaign-tool
+fi
 for path in "$KEY" "$RECIPE" "$SRC/model.safetensors.index.json" \
             "$SRC/config.json" "$ENV_FILE" "$CAMPAIGN" \
-            "$driver_path" ${cli_path:+"$cli_path"}; do
+            "$driver_path" "$cli_path"; do
   if [[ ! -e $path ]]; then
     gate_note "MISSING, finalize would fail after the release: $path"
   elif [[ $(mount_of "$path") != "$campaign_mount" ]]; then
