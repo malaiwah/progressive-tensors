@@ -12,7 +12,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_assemble_lora as lora
 
-
 RECIPE = Path(__file__).parent.parent / "recipes" / "fruit-k2-k3k4-cart.json"
 
 

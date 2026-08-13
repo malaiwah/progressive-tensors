@@ -21,14 +21,18 @@ import pytest
 jsonschema = pytest.importorskip("jsonschema")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
-import fq_fetch  # noqa: E402,F401  (imported for its emitted documents)
-import fq_release  # noqa: E402
-import fq_assemble_lora  # noqa: E402
-import fq_repack  # noqa: E402
-from test_fq_fetch import (REV, build_source, served, trust_root,  # noqa: E402,F401
-                           write_policy)
-from test_fq_repack import LAYERS  # noqa: E402
+import fq_assemble_lora
+import fq_fetch  # imported for its emitted documents
+import fq_release
+from test_fq_fetch import (
+    REV,
+    build_source,
+    trust_root,
+    write_policy,
+)
+from test_fq_repack import LAYERS
 
+pytest_plugins = ("test_fq_fetch",)
 
 
 def _schemas_dir() -> Path | None:
