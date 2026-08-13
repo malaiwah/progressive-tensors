@@ -167,6 +167,13 @@ def test_release_output_matches_the_schema(emitted):
           pointer="#/$defs/payload", label="release payload")
 
 
+def test_fruit_cartridge_recipe_matches_schema():
+    recipe = (
+        Path(__file__).parent.parent / "recipes" / "fruit-k2-k3k4-cart.json"
+    )
+    check("fq-cartridge-1", json.loads(recipe.read_text()), label=recipe.name)
+
+
 # ----------------------------------------------- documents that must NOT pass
 
 @pytest.mark.parametrize("doc,name,why", [

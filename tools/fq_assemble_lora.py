@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""fq_assemble_lora — Encode MSRT residual cartridges as LoRA-compatible adapters.
+"""fq_assemble_lora — Encode BF16 weights as MSRT EXL3 cartridges.
 
-Given a BF16 (or EXL3) source checkpoint and a cartridge recipe, this tool:
-  1. Quantizes the base tier (K2 or K3) into standard EXL3 trellis format
-  2. Computes residuals, rescales, and quantizes each residual stage
-  3. Emits two outputs:
-     - A base checkpoint (standard EXL3 safetensors, loads normally in vLLM)
-     - One or more cartridge adapters (safetensors with per-stage trellis
-       tensors, loadable as LoRA adapters via vLLM's add_lora API)
+Given a BF16 checkpoint and an ``fq-cartridge/1`` recipe, this tool:
+  1. emits a complete, loadable EXL3 base checkpoint;
+  2. quantizes selected residual stages with MSRT; and
+  3. emits sharded custom cartridge adapters plus an explicit runtime contract.
 
-The cartridge adapter is NOT a low-rank LoRA — it contains full-rank trellis-
-quantized residual weights. The vLLM EXL3 LoRA wrapper (Exl3LoRAMoMethod)
-applies them by running additional exl3_gemm passes and summing with rescaling.
+Cartridges are full-rank additive trellis weights, not PEFT/LoRA matrices.
+Their execution pattern is LoRA-like (base GEMM plus correction GEMMs), but
+standard vLLM/SGLang ``add_lora`` APIs cannot load them without an EXL3 MSRT
+runtime implementation. The emitted ``fq-cartridge-adapter/1`` config records
+that custom contract instead of claiming standard LoRA compatibility.
 
 MSRT (Multi-Stage Rescaled Trellis) is described in:
   research/fungible-quant/poc/V50-LOW-BITRATE-MSRT.md
@@ -42,102 +41,163 @@ import argparse
 import json
 import math
 import os
+import re
+import shutil
 import struct
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # Base installs must still support --help.
+    torch = None
+
+sys.path.insert(0, str(Path(__file__).parent))
+from fq_assemble import (  # noqa: E402
+    AssemblyError,
+    StagedOutput,
+    check_out_dir,
+    regenerate_manifest,
+    regenerate_shard_index,
+)
+from fq_repack import PROJ_ORDER  # noqa: E402
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-TOOL_VERSION = "fq_assemble_lora/1"
+TOOL_VERSION = "fq_assemble_lora/2"
 CARTRIDGE_SCHEMA = "fq-cartridge/1"
 ADAPTER_CONFIG_SCHEMA = "fq-cartridge-adapter/1"
 HADAMARD_BLOCK = 128
-
-# Expert tensor name pattern — matches both BF16 (.weight) and EXL3 (.rank0.trellis)
-EXPERT_RE_PATTERN = (
+MCG_SENTINEL_SIGNED = 0xCBAC1FED - (1 << 32)
+LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+BF16_EXPERT_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
-    r"(gate_proj|up_proj|down_proj)\.(?:rank\d+\.)?(?:weight|trellis)$"
+    r"(gate_proj|up_proj|down_proj)\.weight$"
 )
+PROJECTIONS = tuple(sorted(PROJ_ORDER, key=PROJ_ORDER.get))
 
-PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+class CartridgeError(RuntimeError):
+    """A recipe, source checkpoint, or encoded artifact is invalid."""
+
+
+def require_quant_dependencies() -> None:
+    if torch is None:
+        raise CartridgeError(
+            "MSRT encoding requires the 'quant' extra: "
+            "pip install 'progressive-tensors[quant]'")
+    try:
+        import safetensors  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise CartridgeError(
+            "MSRT encoding requires the 'quant' extra: "
+            "pip install 'progressive-tensors[quant]'") from exc
 
 
 # ── EXL3 Encoder Bootstrap ────────────────────────────────────────────────
 
-def bootstrap_encoder(encoder_source: str) -> tuple[Any, ...]:
-    """Load the EXL3 encoder without importing all of exllamav3.
-
-    Returns (ext, get_hadamard_dt, tensor_core_perm, tensor_core_perm_i,
-             quantize_tiles, codebook_scale).
-    """
+@contextmanager
+def bootstrap_encoder(encoder_source: str):
+    """Load trusted EXL3 encoder modules temporarily and restore sys.modules."""
     import importlib.util
     import types
 
-    pkg_root = Path(encoder_source)
-    pkg = types.ModuleType("exllamav3")
-    pkg.__path__ = [str(pkg_root)]
-    sys.modules["exllamav3"] = pkg
+    pkg_root = Path(encoder_source).expanduser().resolve()
+    required = (
+        pkg_root / "ext.py",
+        pkg_root / "util" / "hadamard.py",
+        pkg_root / "modules" / "quant" / "exl3_lib" / "quantize.py",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise CartridgeError(
+            f"--encoder-source {pkg_root} is not an exllamav3 checkout; "
+            f"missing {missing}")
 
-    for sub in ["util", "modules", "modules.quant", "modules.quant.exl3_lib"]:
-        full = f"exllamav3.{sub}"
-        m = types.ModuleType(full)
-        m.__path__ = [str(pkg_root / sub.replace(".", "/"))]
-        sys.modules[full] = m
+    names = [
+        "exllamav3",
+        "exllamav3.util",
+        "exllamav3.modules",
+        "exllamav3.modules.quant",
+        "exllamav3.modules.quant.exl3_lib",
+        "exllamav3.util.progress",
+        "exllamav3.util.memory",
+        "exllamav3.util.tensor",
+        "exllamav3.ext",
+        "exllamav3.util.hadamard",
+        "exllamav3.modules.quant.exl3_lib.quantize",
+    ]
+    previous = {name: sys.modules.get(name) for name in names}
+    try:
+        pkg = types.ModuleType("exllamav3")
+        pkg.__path__ = [str(pkg_root)]
+        sys.modules["exllamav3"] = pkg
+        for sub in ["util", "modules", "modules.quant", "modules.quant.exl3_lib"]:
+            full = f"exllamav3.{sub}"
+            module = types.ModuleType(full)
+            module.__path__ = [str(pkg_root / sub.replace(".", "/"))]
+            sys.modules[full] = module
 
-    # Stub progress/memory to avoid flash_attn dependency
-    _stub = types.ModuleType("exllamav3.util.progress")
-    class _DPB:
-        def __init__(self, *a, **kw): pass
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def update(self, *a): pass
-        def new_task(self, *a, **kw): pass
-    _stub.ProgressBar = _DPB
-    sys.modules["exllamav3.util.progress"] = _stub
+        progress = types.ModuleType("exllamav3.util.progress")
 
-    _stub = types.ModuleType("exllamav3.util.memory")
-    _stub.free_mem = lambda: None
-    _stub.list_gpu_tensors = lambda: []
-    sys.modules["exllamav3.util.memory"] = _stub
+        class _DisabledProgress:
+            def __init__(self, *args, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def update(self, *args): pass
+            def new_task(self, *args, **kwargs): pass
 
-    _stub = types.ModuleType("exllamav3.util")
-    _stub.__path__ = [str(pkg_root / "util")]
-    _stub.cuda_sync_active = lambda *a, **kw: torch.cuda.synchronize()
-    sys.modules["exllamav3.util"] = _stub
+        progress.ProgressBar = _DisabledProgress
+        sys.modules["exllamav3.util.progress"] = progress
 
-    _stub = types.ModuleType("exllamav3.util.tensor")
-    _stub.save_tensor_image = lambda *a, **kw: None
-    sys.modules["exllamav3.util.tensor"] = _stub
+        memory = types.ModuleType("exllamav3.util.memory")
+        memory.free_mem = lambda: None
+        memory.list_gpu_tensors = lambda: []
+        sys.modules["exllamav3.util.memory"] = memory
 
-    # Load the extension
-    spec = importlib.util.spec_from_file_location(
-        "exllamav3.ext", str(pkg_root / "ext.py"))
-    ext_mod = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.ext"] = ext_mod
-    spec.loader.exec_module(ext_mod)
+        util = types.ModuleType("exllamav3.util")
+        util.__path__ = [str(pkg_root / "util")]
+        util.cuda_sync_active = (
+            lambda *args, **kwargs:
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+        )
+        sys.modules["exllamav3.util"] = util
 
-    # Load Hadamard
-    spec = importlib.util.spec_from_file_location(
-        "exllamav3.util.hadamard", str(pkg_root / "util" / "hadamard.py"))
-    had_mod = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.util.hadamard"] = had_mod
-    spec.loader.exec_module(had_mod)
+        tensor = types.ModuleType("exllamav3.util.tensor")
+        tensor.save_tensor_image = lambda *args, **kwargs: None
+        sys.modules["exllamav3.util.tensor"] = tensor
 
-    # Load quantize module
-    quant_path = pkg_root / "modules" / "quant" / "exl3_lib" / "quantize.py"
-    spec = importlib.util.spec_from_file_location(
-        "exllamav3.modules.quant.exl3_lib.quantize", str(quant_path))
-    quant_mod = importlib.util.module_from_spec(spec)
-    sys.modules["exllamav3.modules.quant.exl3_lib.quantize"] = quant_mod
-    spec.loader.exec_module(quant_mod)
+        def load(name: str, path: Path):
+            spec = importlib.util.spec_from_file_location(name, str(path))
+            if spec is None or spec.loader is None:
+                raise CartridgeError(f"cannot load encoder module {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
 
-    return (ext_mod.exllamav3_ext, had_mod.get_hadamard_dt,
+        ext_mod = load("exllamav3.ext", required[0])
+        had_mod = load("exllamav3.util.hadamard", required[1])
+        quant_mod = load(
+            "exllamav3.modules.quant.exl3_lib.quantize", required[2])
+        ext = getattr(ext_mod, "exllamav3_ext", None)
+        if not callable(getattr(ext, "pack_trellis", None)):
+            raise CartridgeError(
+                f"{pkg_root}: exllamav3 extension lacks pack_trellis")
+        yield (
+            ext, had_mod.get_hadamard_dt,
             quant_mod.tensor_core_perm, quant_mod.tensor_core_perm_i,
-            quant_mod.quantize_tiles, quant_mod.codebook_scale)
+            quant_mod.quantize_tiles, quant_mod.codebook_scale,
+        )
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 # ── Quantization Primitives ────────────────────────────────────────────────
@@ -145,6 +205,74 @@ def bootstrap_encoder(encoder_source: str) -> tuple[Any, ...]:
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     """RMS along a dimension."""
     return x.square().mean(dim=dim, keepdim=keepdim).sqrt()
+
+
+def validate_quant_shape(w: torch.Tensor, *, who: str = "weight") -> tuple[int, int]:
+    """Return a valid EXL3 matrix shape or raise a useful error."""
+    if w.ndim != 2:
+        raise ValueError(f"{who}: expected a 2-D BF16 weight, got shape {tuple(w.shape)}")
+    k, n = w.shape
+    if k % HADAMARD_BLOCK or n % HADAMARD_BLOCK:
+        raise ValueError(
+            f"{who}: shape {(k, n)} must be divisible by Hadamard block "
+            f"{HADAMARD_BLOCK} on both axes")
+    if k % 16 or n % 16:
+        raise ValueError(f"{who}: shape {(k, n)} must be divisible by trellis tile 16")
+    return k, n
+
+
+def _finite_fp16_scale(x: torch.Tensor, sign: torch.Tensor) -> torch.Tensor:
+    """Round scales once while keeping every divisor finite and non-zero."""
+    minimum = torch.finfo(torch.float16).tiny
+    safe = sign * x.abs().clamp_min(minimum)
+    rounded = safe.to(torch.float16)
+    if not torch.isfinite(rounded).all() or (rounded == 0).any():
+        raise ValueError("Hadamard scale vector contains zero or non-finite values")
+    return rounded
+
+
+def regularize_with_vectors(
+    w: torch.Tensor,
+    device: torch.device,
+    ghd: Any,
+    cbs: float,
+    had_k: int = HADAMARD_BLOCK,
+    had_n: int = HADAMARD_BLOCK,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Regularize with the exact FP16 vectors that the checkpoint stores."""
+    k, n = validate_quant_shape(w)
+    if not math.isfinite(float(cbs)) or float(cbs) == 0:
+        raise ValueError(f"codebook_scale must be finite and non-zero, got {cbs!r}")
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    su_sign = (torch.randn(k, generator=g).sign() + 1e-5).sign().to(device)
+    sv_sign = (torch.randn(n, generator=g).sign() + 1e-5).sign().to(device)
+
+    out_scales = block_rms(w, dim=0)
+    mean = out_scales.mean()
+    if torch.isfinite(mean) and mean.item() > 0:
+        out_scales = out_scales / mean
+    svh = _finite_fp16_scale(out_scales, sv_sign)
+    transformed = (w / svh.float().unsqueeze(0)).contiguous()
+
+    had_n_mat = ghd(had_n, device, torch.float, 1.0 / math.sqrt(had_n))
+    transformed = (
+        transformed.view(k, n // had_n, had_n) @ had_n_mat
+    ).view(k, n).contiguous()
+
+    in_scales = block_rms(transformed, dim=1)
+    suh_sign = su_sign * (-1.0 if cbs > 0 else 1.0)
+    suh = _finite_fp16_scale(in_scales / abs(float(cbs)), suh_sign)
+    transformed = (transformed / suh.float().unsqueeze(1)).contiguous()
+
+    had_k_mat = ghd(had_k, device, torch.float, 1.0 / math.sqrt(had_k))
+    transformed = (
+        had_k_mat @ transformed.view(k // had_k, had_k, n)
+    ).view(k, n).contiguous()
+    if not torch.isfinite(transformed).all():
+        raise ValueError("regularized weight contains non-finite values")
+    return transformed, suh.contiguous(), svh.contiguous()
 
 
 def regularize(
@@ -156,33 +284,42 @@ def regularize(
     had_n: int = HADAMARD_BLOCK,
     seed: int = 0,
 ) -> torch.Tensor:
-    """Apply Hadamard regularization (in-place transform, returns new tensor).
+    """Compatibility wrapper returning only the regularized weight."""
+    return regularize_with_vectors(
+        w, device, ghd, cbs, had_k=had_k, had_n=had_n, seed=seed
+    )[0]
 
-    This matches the EXL3 regularize() used in the PoC scripts (v35-v52).
-    The Hadamard is orthogonal, so MSE in regularized space = MSE in original.
-    """
-    k, n = w.shape
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    su = (torch.randn(k, generator=g).sign() + 1e-5).sign().float().to(device)
-    sv = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(device)
 
-    out_scales = block_rms(w, dim=0, keepdim=True)
-    mean = out_scales.mean().item()
-    if mean > 1e-30:
-        out_scales = out_scales / mean
-    sv = (sv * out_scales + 1e-10).float()
-    w = (w / sv).contiguous()
-
-    had_n_mat = ghd(had_n, device, torch.float, 1.0 / math.sqrt(had_n))
-    w = (w.view(k, n // had_n, had_n) @ had_n_mat).view(k, n).contiguous()
-
-    in_scales = block_rms(w, dim=1, keepdim=True).clamp(min=1e-30)
-    su = (su.unsqueeze(1) * in_scales / (-cbs) + 1e-10).float()
-    w = (w / su).contiguous()
-
+def inverse_regularize(
+    w_reg: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    device: torch.device,
+    ghd: Any,
+    had_k: int = HADAMARD_BLOCK,
+    had_n: int = HADAMARD_BLOCK,
+) -> torch.Tensor:
+    """Invert regularization using the exact serialized FP16 scale vectors."""
+    k, n = validate_quant_shape(w_reg, who="reconstruction")
     had_k_mat = ghd(had_k, device, torch.float, 1.0 / math.sqrt(had_k))
-    w = (had_k_mat @ w.view(k // had_k, had_k, n)).view(k, n).contiguous()
-    return w
+    restored = (
+        had_k_mat.transpose(0, 1)
+        @ w_reg.view(k // had_k, had_k, n)
+    ).view(k, n)
+    restored = restored * suh.float().unsqueeze(1)
+    had_n_mat = ghd(had_n, device, torch.float, 1.0 / math.sqrt(had_n))
+    restored = (
+        restored.view(k, n // had_n, had_n)
+        @ had_n_mat.transpose(0, 1)
+    ).view(k, n)
+    restored = restored * svh.float().unsqueeze(0)
+    return restored.contiguous()
+
+
+def _validate_k(K: int, *, who: str = "K") -> int:
+    if isinstance(K, bool) or not isinstance(K, int) or not 1 <= K <= 8:
+        raise ValueError(f"{who} must be an integer in 1..8, got {K!r}")
+    return K
 
 
 def quantize_trellis(
@@ -193,12 +330,9 @@ def quantize_trellis(
     tcpi: Any,
     qtf: Any,
 ) -> torch.Tensor:
-    """Quantize a 2D tensor with EXL3 trellis at K bits.
-
-    Returns the dequantized (reconstructed) tensor, NOT the packed indices.
-    The trellis tiles are 16×16, processed row-by-row in blocks of 16.
-    """
-    k, n = data.shape
+    """Quantize a valid 2-D EXL3 matrix and return its reconstruction."""
+    _validate_k(K)
+    k, n = validate_quant_shape(data)
     tiles_n = n // 16
     weight_q = torch.zeros_like(data)
     qa = {"K": K, "mcg": True}
@@ -206,13 +340,16 @@ def quantize_trellis(
     perm_i = tcpi(device)
 
     for bi in range(0, k, 16):
-        rows = data[bi:bi + 16]
-        tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
-        tiles = tiles[:, perm].contiguous()
-        quant_w, _ = qtf(tiles, qa)
-        quant_w = quant_w[:, perm_i].reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, n)
+        tiles = (
+            data[bi:bi + 16].reshape(16, tiles_n, 16)
+            .permute(1, 0, 2).reshape(tiles_n, 256)
+        )
+        quant_w, _ = qtf(tiles[:, perm].contiguous(), qa)
+        quant_w = (
+            quant_w[:, perm_i].reshape(tiles_n, 16, 16)
+            .permute(1, 0, 2).reshape(16, n)
+        )
         weight_q[bi:bi + 16] = quant_w
-
     return weight_q
 
 
@@ -223,48 +360,42 @@ def quantize_trellis_packed(
     tcp: Any,
     tcpi: Any,
     qtf: Any,
-    ext: Any = None,
+    ext: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize and return BOTH reconstructed values and packed trellis indices.
-
-    Returns (reconstructed_float, packed_trellis_int16) where packed_trellis
-    has shape (k // 16, n // 16, K * 16) dtype int16 — the EXL3 storage format.
-
-    The quantize_tiles function returns raw Viterbi path indices of shape
-    (n_tiles, 256) — one int16 per weight element. ext.pack_trellis compresses
-    these to (n_tiles, K * 16) packed indices, which is what the EXL3 checkpoint
-    and vLLM loader expect (validated at exl3.py:2099-2102).
-    """
-    k, n = data.shape
+    """Return reconstruction plus the runtime-compatible packed EXL3 trellis."""
+    _validate_k(K)
+    if ext is None or not callable(getattr(ext, "pack_trellis", None)):
+        raise RuntimeError(
+            "the selected exllamav3 build lacks pack_trellis; refusing to "
+            "write raw Viterbi indices as an EXL3 checkpoint")
+    k, n = validate_quant_shape(data)
     tiles_n = n // 16
     weight_q = torch.zeros_like(data)
-    # Raw (unpacked) indices: (tiles_k, tiles_n, 256) int16
-    raw_indices = torch.zeros(k // 16, tiles_n, 256, dtype=torch.int16, device=device)
+    raw_indices = torch.zeros(
+        k // 16, tiles_n, 256, dtype=torch.int16, device=device
+    )
     qa = {"K": K, "mcg": True}
     perm = tcp(device)
     perm_i = tcpi(device)
 
     for bi in range(0, k, 16):
         tk = bi // 16
-        rows = data[bi:bi + 16]
-        tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
-        tiles = tiles[:, perm].contiguous()
-        quant_w, quant_idx = qtf(tiles, qa)
-        # Store raw indices — quant_idx has shape (n_tiles, 256)
+        tiles = (
+            data[bi:bi + 16].reshape(16, tiles_n, 16)
+            .permute(1, 0, 2).reshape(tiles_n, 256)
+        )
+        quant_w, quant_idx = qtf(tiles[:, perm].contiguous(), qa)
         raw_indices[tk] = quant_idx
-        # Reconstruct
-        quant_w = quant_w[:, perm_i].reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, n)
+        quant_w = (
+            quant_w[:, perm_i].reshape(tiles_n, 16, 16)
+            .permute(1, 0, 2).reshape(16, n)
+        )
         weight_q[bi:bi + 16] = quant_w
 
-    # Pack the raw indices to EXL3 format: (tiles_k, tiles_n, K * 16) int16
-    if ext is not None and hasattr(ext, "pack_trellis"):
-        packed_shape = (k // 16, tiles_n, 256 * K // 16)
-        packed = torch.zeros(packed_shape, dtype=torch.int16, device=device)
-        ext.pack_trellis(packed, raw_indices.contiguous(), K)
-    else:
-        # Fallback: store raw indices (unpacked) — for testing without ext
-        packed = raw_indices
-
+    packed = torch.zeros(
+        (k // 16, tiles_n, K * 16), dtype=torch.int16, device=device
+    )
+    ext.pack_trellis(packed, raw_indices.contiguous(), K)
     return weight_q, packed
 
 
@@ -275,26 +406,26 @@ def rescaled_trellis_quantize(
     device: torch.device,
     tcp: Any, tcpi: Any, qtf: Any,
     cbs: float,
-    ext: Any = None,
+    ext: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Rescale residual to match codebook range, quantize, return (recon, packed, scale).
-
-    The rescaling is the key MSRT innovation (v35 breakthrough):
-      scale = |codebook_scale| / RMS(residual)
-      quantized = trellis(residual * scale) / scale
-    """
+    """Quantize one rescaled residual into runtime-compatible trellis form."""
+    _validate_k(K_res, who="residual K")
+    k, n = validate_quant_shape(residual, who="residual")
+    if ext is None or not callable(getattr(ext, "pack_trellis", None)):
+        raise RuntimeError("exllamav3 pack_trellis is required")
     residual_rms = residual.square().mean().sqrt().item()
+    if not math.isfinite(residual_rms):
+        raise ValueError("residual RMS is non-finite")
     if residual_rms < 1e-12:
-        packed_w = 256 * K_res // 16 if ext else 256
         return base_q, torch.zeros(
-            residual.shape[0] // 16, residual.shape[1] // 16, packed_w,
+            k // 16, n // 16, K_res * 16,
             dtype=torch.int16, device=device), 1.0
 
-    scale = abs(cbs) / residual_rms
-    scaled = residual * scale
-    recon_packed, packed = quantize_trellis_packed(scaled, K_res, device, tcp, tcpi, qtf, ext)
-    recon = base_q + recon_packed / scale
-    return recon, packed, scale
+    scale = abs(float(cbs)) / residual_rms
+    recon_scaled, packed = quantize_trellis_packed(
+        residual * scale, K_res, device, tcp, tcpi, qtf, ext
+    )
+    return base_q + recon_scaled / scale, packed, scale
 
 
 # ── Hadamard Vectors ──────────────────────────────────────────────────────
@@ -306,36 +437,9 @@ def compute_hadamard_vectors(
     cbs: float,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Compute the suh and svh vectors that EXL3 stores alongside trellis.
-
-    EXL3 checkpoint format (from SIQ model inspection):
-    - suh: (input_size,) float16 — per-row sign+scale vector
-    - svh: (output_size,) float16 — per-column sign+scale vector
-
-    The regularize() function applies:
-      1. svh = sign * out_scales (per-column)
-      2. suh = sign * in_scales / (-cbs) (per-row, after column Hadamard)
-    """
-    k, n = w.shape
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    su = (torch.randn(k, generator=g).sign() + 1e-5).sign().float().to(device)
-    sv = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(device)
-
-    out_scales = block_rms(w, dim=0, keepdim=True)
-    mean = out_scales.mean().item()
-    if mean > 1e-30:
-        out_scales = out_scales / mean
-    svh = (sv * out_scales.squeeze(0) + 1e-10).half()  # (n,) float16
-
-    # After column Hadamard
-    w_col = (w / svh.float().unsqueeze(0)).contiguous()
-    had_n_mat = ghd(HADAMARD_BLOCK, device, torch.float, 1.0 / math.sqrt(HADAMARD_BLOCK))
-    w_col = (w_col.view(k, n // HADAMARD_BLOCK, HADAMARD_BLOCK) @ had_n_mat).view(k, n).contiguous()
-
-    in_scales = block_rms(w_col, dim=1, keepdim=True).clamp(min=1e-30).squeeze(1)
-    suh = (su * in_scales / (-cbs) + 1e-10).half()  # (k,) float16
-
-    return {"suh": suh.contiguous(), "svh": svh.contiguous()}
+    """Return the same finite FP16 vectors used by regularization."""
+    _, suh, svh = regularize_with_vectors(w, device, ghd, cbs, seed=seed)
+    return {"suh": suh, "svh": svh}
 
 
 # ── Encoding Pipeline ─────────────────────────────────────────────────────
@@ -347,388 +451,494 @@ def encode_expert_msrt(
     device: torch.device,
     ghd: Any, tcp: Any, tcpi: Any, qtf: Any,
     cbs: float,
-    ext: Any = None,
+    ext: Any,
 ) -> dict[str, Any]:
-    """Encode one expert weight matrix with MSRT.
-
-    Returns dict with:
-      - base: {trellis, suh, svh} for the base tier
-      - stages: list of {trellis, suh, svh, scale} for each residual stage
-      - mse: reconstruction MSE vs original
-    """
-    w_reg = regularize(w_bf16, device, ghd, cbs)
-
-    # Base tier
-    base_recon, base_packed = quantize_trellis_packed(w_reg, base_k, device, tcp, tcpi, qtf, ext)
-    had_vectors = compute_hadamard_vectors(w_bf16, device, ghd, cbs)
-
+    """Encode one matrix and measure the reconstruction actually emitted."""
+    _validate_k(base_k, who="base_k")
+    w_reg, suh, svh = regularize_with_vectors(w_bf16, device, ghd, cbs)
+    base_recon, base_packed = quantize_trellis_packed(
+        w_reg, base_k, device, tcp, tcpi, qtf, ext
+    )
     result = {
         "base": {
             "trellis": base_packed.cpu(),
-            "suh": had_vectors["suh"].cpu(),
-            "svh": had_vectors["svh"].cpu(),
+            "suh": suh.cpu(),
+            "svh": svh.cpu(),
         },
-        "stages": [],
+        "stages": {},
     }
 
     current_recon = base_recon
-
     for stage in stages:
+        label = stage["label"]
         residual = w_reg - current_recon
-        recon, packed, scale = rescaled_trellis_quantize(
-            current_recon, residual, stage["k"], device, tcp, tcpi, qtf, cbs, ext)
-        result["stages"].append({
+        current_recon, packed, scale = rescaled_trellis_quantize(
+            current_recon, residual, stage["k"], device,
+            tcp, tcpi, qtf, cbs, ext
+        )
+        result["stages"][label] = {
             "trellis": packed.cpu(),
-            "suh": had_vectors["suh"].cpu(),  # Same Hadamard vectors
-            "svh": had_vectors["svh"].cpu(),
+            "suh": suh.cpu(),
+            "svh": svh.cpu(),
             "scale": scale,
-        })
-        current_recon = recon
+        }
 
-    result["mse"] = (w_reg - current_recon).pow(2).mean().item()
+    reconstructed = inverse_regularize(
+        current_recon, suh, svh, device, ghd
+    )
+    result["mse"] = (
+        w_bf16.float() - reconstructed.float()
+    ).square().mean().item()
+    result["regularized_mse"] = (
+        w_reg - current_recon
+    ).square().mean().item()
     return result
 
 
 # ── Safetensors Output ────────────────────────────────────────────────────
 
 def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
-    """Save tensors as safetensors file."""
+    """Save an independent tensor mapping after validating finite metadata."""
     from safetensors.torch import save_file
+
+    if not tensors:
+        raise CartridgeError(f"refusing to write empty safetensors file {path}")
+    for name, tensor in tensors.items():
+        if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+            raise CartridgeError(f"{path}: tensor {name} contains non-finite values")
     path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(path))
 
 
-def write_base_checkpoint(
-    source_dir: Path,
-    out_dir: Path,
-    layer_results: dict[int, dict[int, dict[str, Any]]],
-    moe_layers: list[int],
-    tp: int = 1,
+def load_recipe(path: Path) -> dict[str, Any]:
+    """Load and semantically validate one fq-cartridge/1 recipe."""
+    try:
+        recipe = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CartridgeError(f"{path}: cannot read cartridge recipe ({exc})") from exc
+    if not isinstance(recipe, dict):
+        raise CartridgeError(f"{path}: recipe must be a JSON object")
+    if recipe.get("schema") != CARTRIDGE_SCHEMA:
+        raise CartridgeError(
+            f"{path}: schema must be {CARTRIDGE_SCHEMA!r}, "
+            f"got {recipe.get('schema')!r}")
+    _validate_k(recipe.get("base_k"), who="base_k")
+
+    layers = recipe.get("moe_layers")
+    if (not isinstance(layers, list) or not layers
+            or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                   for v in layers)
+            or len(set(layers)) != len(layers)):
+        raise CartridgeError("moe_layers must be a non-empty list of unique integers")
+    recipe["moe_layers"] = sorted(layers)
+
+    stages = recipe.get("stages")
+    if not isinstance(stages, list) or not stages:
+        raise CartridgeError("stages must be a non-empty list")
+    labels: set[str] = set()
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            raise CartridgeError(f"stage {index}: must be an object")
+        _validate_k(stage.get("k"), who=f"stage {index} k")
+        label = stage.get("label")
+        if not isinstance(label, str) or not LABEL_RE.fullmatch(label):
+            raise CartridgeError(
+                f"stage {index}: label must match {LABEL_RE.pattern}")
+        if label in labels:
+            raise CartridgeError(f"stage {index}: duplicate label {label!r}")
+        labels.add(label)
+        experts = stage.get("experts")
+        if experts == "all":
+            continue
+        if (not isinstance(experts, list)
+                or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                       for v in experts)
+                or len(set(experts)) != len(experts)):
+            raise CartridgeError(
+                f"stage {label!r}: experts must be 'all' or unique non-negative IDs")
+        stage["experts"] = sorted(experts)
+    return recipe
+
+
+def effective_bpw(recipe: dict[str, Any], expert_count: int) -> float:
+    """Nominal weight bits, excluding suh/svh metadata."""
+    if expert_count <= 0:
+        raise ValueError("expert_count must be positive")
+    total = expert_count * recipe["base_k"]
+    for stage in recipe["stages"]:
+        selected = expert_count if stage["experts"] == "all" else len(stage["experts"])
+        total += selected * stage["k"]
+    return total / expert_count
+
+
+def selected_stages(
+    stages: list[dict[str, Any]], expert_id: int
+) -> list[dict[str, Any]]:
+    """Resolve stage applicability before residual chaining begins."""
+    return [
+        stage for stage in stages
+        if stage["experts"] == "all" or expert_id in stage["experts"]
+    ]
+
+
+def resolve_layer_shards(source: Path, layers: list[int]) -> dict[int, Path]:
+    """Require the supported one-safetensors-file-per-layer BF16 layout."""
+    if not source.is_dir():
+        raise CartridgeError(f"--source {source} is not a directory")
+    if not (source / "config.json").is_file():
+        raise CartridgeError(f"--source {source} has no config.json")
+    resolved: dict[int, Path] = {}
+    for layer in layers:
+        candidates = [
+            source / f"model-layer-{layer:03d}.safetensors",
+            source / f"model-layer-{layer:04d}.safetensors",
+        ]
+        matches = [path for path in candidates if path.is_file()]
+        if len(matches) != 1:
+            suffix = (
+                "standard Hugging Face indexed shards are not supported by "
+                "this encoder; convert to per-layer BF16 shards first"
+                if not matches else f"ambiguous candidates: {matches}"
+            )
+            raise CartridgeError(f"layer {layer}: source shard missing; {suffix}")
+        resolved[layer] = matches[0]
+    return resolved
+
+
+def inspect_source_layer(keys: list[str], layer: int) -> dict[int, dict[str, str]]:
+    """Preflight exact BF16 expert coverage without loading weight payloads."""
+    experts: dict[int, dict[str, str]] = {}
+    for key in keys:
+        match = BF16_EXPERT_RE.fullmatch(key)
+        if not match:
+            continue
+        key_layer, expert, projection = (
+            int(match.group(1)), int(match.group(2)), match.group(3))
+        if key_layer != layer:
+            raise CartridgeError(
+                f"layer {layer} shard also contains BF16 expert tensor {key}")
+        if projection in experts.setdefault(expert, {}):
+            raise CartridgeError(
+                f"layer {layer} expert {expert}: duplicate {projection}")
+        experts[expert][projection] = key
+    if not experts:
+        raise CartridgeError(
+            f"layer {layer}: no BF16 routed expert .weight tensors found")
+    expected = set(PROJECTIONS)
+    for expert, projections in experts.items():
+        have = set(projections)
+        if have != expected:
+            raise CartridgeError(
+                f"layer {layer} expert {expert}: projections "
+                f"{sorted(have)} != {sorted(expected)}")
+    return experts
+
+
+def preserved_source_keys(keys: list[str]) -> list[str]:
+    """Source tensors copied byte-for-value into a rewritten MoE shard."""
+    return [key for key in keys if not BF16_EXPERT_RE.fullmatch(key)]
+
+
+def load_preserved_tensors(source_file: Any, keys: list[str]) -> dict[str, Any]:
+    """Materialize only non-expert tensors from an open source shard."""
+    return {
+        key: source_file.get_tensor(key)
+        for key in preserved_source_keys(keys)
+    }
+
+
+def copy_source_checkpoint(
+    source: Path, base_dir: Path, selected_shards: set[str]
 ) -> None:
-    """Write the base K checkpoint in standard EXL3 format.
-
-    The base checkpoint has the same structure as a normal EXL3 quant:
-    - config.json with hybrid_tr3_tail
-    - tier_bitmap.json
-    - model-layer-*.safetensors with trellis, suh, svh, mcg tensors
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy non-layer files from source
-    import shutil
-    for f in source_dir.iterdir():
-        if f.is_file() and not f.name.startswith("model-layer-"):
-            shutil.copy2(f, out_dir / f.name)
-
-    # Write base tensors into layer shards
-    for layer in moe_layers:
-        if layer not in layer_results:
+    """Copy all untouched checkpoint content, excluding stale integrity files."""
+    base_dir.mkdir(parents=True, exist_ok=True)
+    skip = selected_shards | {
+        "model.safetensors.index.json",
+        "MANIFEST.sha256",
+    }
+    for entry in source.iterdir():
+        if entry.name in skip:
             continue
-        tensors = {}
-        for exp_id, exp_data in layer_results[layer].items():
-            base = exp_data["base"]
-            for proj_idx, proj in enumerate(PROJECTIONS):
-                rank = 0  # TP=1 for Fruit model
-                prefix = f"model.layers.{layer}.mlp.experts.{exp_id}.{proj}.rank{rank}"
-                tensors[f"{prefix}.trellis"] = base["trellis"]
-                tensors[f"{prefix}.suh"] = base["suh"]
-                tensors[f"{prefix}.svh"] = base["svh"]
-                # mcg sentinel
-                import hashlib
-                mcg_val = 0xCBAC1FED
-                tensors[f"{prefix}.mcg"] = torch.tensor([mcg_val], dtype=torch.int32)
-
-        shard_path = out_dir / f"model-layer-{layer:03d}.safetensors"
-        save_safetensors(tensors, shard_path)
-        print(f"  Base layer {layer}: {len(tensors)} tensors -> {shard_path.name}", flush=True)
+        destination = base_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, destination)
+        elif entry.is_file():
+            shutil.copy2(entry, destination)
 
 
-def write_cartridge_adapter(
-    out_dir: Path,
-    layer_results: dict[int, dict[int, dict[str, Any]]],
-    stage_idx: int,
-    stage_label: str,
-    moe_layers: list[int],
-    expert_filter: dict[int, list[int]] | None = None,
-) -> Path:
-    """Write one cartridge stage as a LoRA-compatible safetensors adapter.
+def write_base_metadata(
+    base_dir: Path,
+    base_k: int,
+    layers: list[int],
+    experts_per_layer: dict[int, int],
+) -> None:
+    """Synchronize loader-visible EXL3 config, bitmap, index, and manifest."""
+    config_path = base_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CartridgeError(f"{config_path}: invalid source config ({exc})") from exc
+    if not isinstance(config, dict):
+        raise CartridgeError(f"{config_path}: config must be an object")
 
-    If expert_filter is provided, only the specified experts per layer are included.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tensors = {}
+    counts = set(experts_per_layer.values())
+    tail = config.setdefault("hybrid_tr3_tail", {})
+    if not isinstance(tail, dict):
+        raise CartridgeError("config.json: hybrid_tr3_tail must be an object")
+    tail.update({
+        "format": "exl3-trellis",
+        "bits": float(base_k),
+        "codebook": "mcg",
+        "moe_layers": [min(layers), max(layers)],
+        "tensor_schema": (
+            "model.layers.{L}.mlp.experts.{E}.{proj}.rank{rank}.{component}"),
+        "tp": 1,
+        "mcg_multiplier": 0xCBAC1FED,
+    })
+    if len(counts) == 1:
+        tail["experts_per_layer"] = next(iter(counts))
+    else:
+        tail.pop("experts_per_layer", None)
+    tail.pop("k_values", None)
+    tail.pop("bits_per_expert", None)
+    config["quantization_config"] = {
+        "quant_method": "exl3",
+        "bits": float(base_k),
+        "codebook": "mcg",
+        "version": "rank-sliced",
+    }
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    for layer in moe_layers:
-        if layer not in layer_results:
-            continue
-        for exp_id, exp_data in layer_results[layer].items():
-            if expert_filter and layer in expert_filter:
-                if exp_id not in expert_filter[layer]:
-                    continue
-            if stage_idx >= len(exp_data["stages"]):
-                continue
-            stage = exp_data["stages"][stage_idx]
-            for proj in PROJECTIONS:
-                rank = 0
-                prefix = f"model.layers.{layer}.mlp.experts.{exp_id}.{proj}.rank{rank}"
-                tensors[f"{prefix}.trellis_{stage_label}"] = stage["trellis"]
-                tensors[f"{prefix}.suh_{stage_label}"] = stage["suh"]
-                tensors[f"{prefix}.svh_{stage_label}"] = stage["svh"]
-                tensors[f"{prefix}.scale_{stage_label}"] = torch.tensor([stage["scale"]], dtype=torch.float32)
+    bitmap_path = base_dir / "tier_bitmap.json"
+    try:
+        bitmap = json.loads(bitmap_path.read_text()) if bitmap_path.exists() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CartridgeError(f"{bitmap_path}: invalid source bitmap ({exc})") from exc
+    if not isinstance(bitmap, dict):
+        raise CartridgeError(f"{bitmap_path}: bitmap must be an object")
+    for layer, count in experts_per_layer.items():
+        entry = bitmap.setdefault(str(layer), {})
+        if not isinstance(entry, dict):
+            entry = {}
+            bitmap[str(layer)] = entry
+        entry["k"] = [base_k] * count
+        entry["bits_per_expert"] = [base_k] * count
+    bitmap_path.write_text(json.dumps(bitmap, indent=2) + "\n")
 
-    adapter_path = out_dir / f"cartridge_{stage_label}.safetensors"
-    save_safetensors(tensors, adapter_path)
+    regenerate_shard_index(base_dir)
+    regenerate_manifest(base_dir)
 
-    # Write adapter_config.json
+
+def _stage_tensor_names(
+    layer: int, expert: int, projection: str, label: str,
+    result: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    prefix = (
+        f"model.layers.{layer}.mlp.experts.{expert}."
+        f"{projection}.rank0")
+    return {
+        f"{prefix}.trellis_{label}": result["trellis"],
+        f"{prefix}.suh_{label}": result["suh"],
+        f"{prefix}.svh_{label}": result["svh"],
+        f"{prefix}.scale_{label}": torch.tensor(
+            result["scale"], dtype=torch.float32),
+    }
+
+
+def write_adapter_config(
+    directory: Path,
+    stages: list[dict[str, Any]],
+    shards: list[str],
+    tensor_count: int,
+) -> None:
+    """Write the explicit custom MSRT runtime contract."""
     config = {
         "schema": ADAPTER_CONFIG_SCHEMA,
-        "stage_label": stage_label,
-        "stage_k": stage_idx,
-        "num_tensors": len(tensors),
+        "format": "exl3-msrt-full-rank",
+        "standard_lora_compatible": False,
+        "runtime_operation": (
+            "base_exl3_gemm + sum(stage_exl3_gemm / stage_scale)"),
+        "codebook": "mcg",
+        "mcg_multiplier": 0xCBAC1FED,
+        "mcg_ownership": "adapter-config",
+        "scale_shape": [],
+        "stages": [
+            {"label": stage["label"], "k": stage["k"],
+             "experts": stage["experts"]}
+            for stage in stages
+        ],
+        "shards": shards,
+        "num_tensors": tensor_count,
         "tool_version": TOOL_VERSION,
-    }
-    (out_dir / f"cartridge_{stage_label}_config.json").write_text(
-        json.dumps(config, indent=2) + "\n")
-
-    print(f"  Cartridge '{stage_label}': {len(tensors)} tensors -> {adapter_path.name}", flush=True)
-    return adapter_path
-
-
-# ── Main Encode Command ───────────────────────────────────────────────────
-
-def cmd_encode(args) -> int:
-    """Encode a BF16 checkpoint into base K + cartridge adapters."""
-    device = torch.device(args.device)
-    print(f"Device: {device}  GPU: {torch.cuda.get_device_name(0)}", flush=True)
-
-    # Bootstrap encoder
-    ext, ghd, tcp, tcpi, qtf, cbs = bootstrap_encoder(args.encoder_source)
-    print(f"codebook_scale = {cbs}", flush=True)
-
-    # Load recipe
-    recipe = json.loads(args.recipe.read_text())
-    base_k = recipe["base_k"]
-    stages = recipe["stages"]
-    moe_layers = recipe.get("moe_layers", [])
-    if not moe_layers:
-        # Auto-detect from source config
-        cfg_path = args.source / "config.json"
-        if cfg_path.exists():
-            cfg = json.loads(cfg_path.read_text())
-            tail = cfg.get("hybrid_tr3_tail", {})
-            if "moe_layers" in tail:
-                moe_layers = list(range(tail["moe_layers"][0], tail["moe_layers"][1] + 1))
-            else:
-                moe_layers = list(range(
-                    cfg.get("first_k_dense_replace", 3),
-                    cfg.get("num_hidden_layers", 13)))
-    print(f"Base K={base_k}, {len(stages)} cartridge stages, "
-          f"MoE layers {moe_layers[0]}-{moe_layers[-1]} ({len(moe_layers)} layers)", flush=True)
-
-    # Parse expert filters
-    expert_filters = []
-    hot_experts = recipe.get("hot_experts", list(range(96)))  # default: first 96
-    for stage in stages:
-        exp_spec = stage["experts"]
-        if exp_spec == "all":
-            expert_filters.append(None)
-        elif isinstance(exp_spec, str) and exp_spec in ("hot96", "hot"):
-            expert_filters.append({l: hot_experts for l in moe_layers})
-        elif isinstance(exp_spec, list):
-            expert_filters.append({l: exp_spec for l in moe_layers})
-        else:
-            expert_filters.append(None)
-
-    # Load source weights and encode
-    from safetensors import safe_open
-    layer_results: dict[int, dict[int, dict[str, Any]]] = {}
-    total_mse = 0.0
-    n_experts_total = 0
-
-    for layer in moe_layers:
-        shard_path = args.source / f"model-layer-{layer:03d}.safetensors"
-        if not shard_path.exists():
-            # Try other shard naming patterns
-            shard_path = args.source / f"model-layer-{layer:04d}.safetensors"
-            if not shard_path.exists():
-                print(f"  Layer {layer}: shard not found, skipping", flush=True)
-                continue
-
-        print(f"\nEncoding layer {layer}...", flush=True)
-        layer_results[layer] = {}
-
-        # Load expert weights from shard
-        with safe_open(str(shard_path), framework="pt") as f:
-            keys = list(f.keys())
-            # Find expert keys for this layer
-            import re
-            expert_pattern = re.compile(EXPERT_RE_PATTERN)
-            expert_weights: dict[int, dict[str, torch.Tensor]] = {}
-            for key in keys:
-                m = expert_pattern.match(key)
-                if m:
-                    l, e, proj = int(m.group(1)), int(m.group(2)), m.group(3)
-                    if l == layer:
-                        if e not in expert_weights:
-                            expert_weights[e] = {}
-                        expert_weights[e][proj] = f.get_tensor(key).float()
-
-            print(f"  Found {len(expert_weights)} experts", flush=True)
-
-            for exp_id in sorted(expert_weights.keys()):
-                for proj in PROJECTIONS:
-                    if proj not in expert_weights[exp_id]:
-                        continue
-                    w = expert_weights[exp_id][proj].T.contiguous().to(device)  # (in, out) for EXL3 trellis layout
-                    result = encode_expert_msrt(
-                        w, base_k, stages, device, ghd, tcp, tcpi, qtf, cbs, ext)
-                    del w
-                    torch.cuda.empty_cache()
-
-                    # Store under (exp_id, proj) — flatten for writing
-                    key = (exp_id, proj)
-                    if exp_id not in layer_results[layer]:
-                        layer_results[layer][exp_id] = {"base": {}, "stages": [[] for _ in stages], "mse": {}}
-                    layer_results[layer][exp_id]["base"][proj] = result["base"]
-                    for si, stage_result in enumerate(result["stages"]):
-                        layer_results[layer][exp_id]["stages"][si].append(stage_result)
-                    layer_results[layer][exp_id]["mse"][proj] = result["mse"]
-                    total_mse += result["mse"]
-                    n_experts_total += 1
-
-        # Print layer summary
-        layer_mses = []
-        for exp_data in layer_results[layer].values():
-            layer_mses.extend(exp_data["mse"].values())
-        avg = sum(layer_mses) / len(layer_mses) if layer_mses else 0
-        print(f"  Layer {layer}: avg MSE = {avg:.4e} ({len(layer_mses)} projections)", flush=True)
-
-    print(f"\nOverall avg MSE: {total_mse / max(n_experts_total, 1):.4e}", flush=True)
-
-    # Write outputs
-    out_dir = Path(args.out)
-    print(f"\nWriting outputs to {out_dir}...", flush=True)
-
-    # Restructure for writing: group by (layer, expert) -> {base: {trellis, suh, svh}, stages: [...]}
-    # The layer_results is already structured, but we need to reorganize for the writers
-    write_results: dict[int, dict[int, dict[str, Any]]] = {}
-    for layer, experts in layer_results.items():
-        write_results[layer] = {}
-        for exp_id, exp_data in experts.items():
-            # Merge projections into single base/stages
-            base_tensors = {}
-            for proj in PROJECTIONS:
-                if proj in exp_data["base"]:
-                    for tname, tval in exp_data["base"][proj].items():
-                        base_tensors[f"{proj}_{tname}"] = tval
-
-            stage_list = []
-            for si in range(len(stages)):
-                stage_tensors = {}
-                for proj in PROJECTIONS:
-                    if si < len(exp_data["stages"]) and proj == PROJECTIONS[0]:
-                        # Only need one copy of suh/svh per expert
-                        pass
-                if si < len(exp_data["stages"]):
-                    for proj_idx, proj in enumerate(PROJECTIONS):
-                        if proj_idx < len(exp_data["stages"][si]):
-                            stage = exp_data["stages"][si][proj_idx]
-                            stage_tensors[f"{proj}"] = stage
-                stage_list.append(stage_tensors)
-
-            write_results[layer][exp_id] = {
-                "base": base_tensors,
-                "stages": stage_list,
-                "mse": exp_data["mse"],
-            }
-
-    # Write base checkpoint
-    print("\nWriting base checkpoint...", flush=True)
-    base_dir = out_dir / "base"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    # Simplified: write all experts for each layer into one shard
-    for layer in moe_layers:
-        if layer not in write_results:
-            continue
-        tensors = {}
-        for exp_id, exp_data in write_results[layer].items():
-            for proj in PROJECTIONS:
-                if f"{proj}_trellis" not in exp_data["base"]:
-                    continue
-                rank = 0
-                prefix = f"model.layers.{layer}.mlp.experts.{exp_id}.{proj}.rank{rank}"
-                tensors[f"{prefix}.trellis"] = exp_data["base"][f"{proj}_trellis"]
-                tensors[f"{prefix}.suh"] = exp_data["base"][f"{proj}_suh"]
-                tensors[f"{prefix}.svh"] = exp_data["base"][f"{proj}_svh"]
-                tensors[f"{prefix}.mcg"] = torch.tensor(0xCBAC1FED, dtype=torch.uint32).view(torch.int32)
-        if tensors:
-            save_safetensors(tensors, base_dir / f"model-layer-{layer:03d}.safetensors")
-            print(f"  Layer {layer}: {len(tensors)} base tensors", flush=True)
-
-    # Copy non-layer files from source
-    import shutil
-    for f in args.source.iterdir():
-        if f.is_file() and not f.name.startswith("model-layer-"):
-            shutil.copy2(f, base_dir / f.name)
-
-    # Write cartridge adapters
-    print("\nWriting cartridge adapters...", flush=True)
-    cart_dir = out_dir / "cartridges"
-
-    for si, stage in enumerate(stages):
-        label = stage["label"]
-        expert_filter = expert_filters[si]
-        tensors = {}
-
-        for layer in moe_layers:
-            if layer not in write_results:
-                continue
-            for exp_id, exp_data in write_results[layer].items():
-                if expert_filter and layer in expert_filter:
-                    if exp_id not in expert_filter[layer]:
-                        continue
-                if si >= len(exp_data["stages"]):
-                    continue
-                stage_data = exp_data["stages"][si]
-                for proj in PROJECTIONS:
-                    if proj not in stage_data:
-                        continue
-                    rank = 0
-                    prefix = f"model.layers.{layer}.mlp.experts.{exp_id}.{proj}.rank{rank}"
-                    s = stage_data[proj]
-                    tensors[f"{prefix}.trellis_{label}"] = s["trellis"]
-                    tensors[f"{prefix}.suh_{label}"] = s["suh"]
-                    tensors[f"{prefix}.svh_{label}"] = s["svh"]
-                    tensors[f"{prefix}.scale_{label}"] = torch.tensor([s["scale"]], dtype=torch.float32)
-
-        adapter_path = cart_dir / f"cartridge_{label}.safetensors"
-        save_safetensors(tensors, adapter_path)
-        config = {
-            "schema": ADAPTER_CONFIG_SCHEMA,
-            "stage_label": label,
-            "stage_k": stage["k"],
-            "num_tensors": len(tensors),
-            "tool_version": TOOL_VERSION,
-            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        (cart_dir / f"cartridge_{label}_config.json").write_text(
-            json.dumps(config, indent=2) + "\n")
-        print(f"  Cartridge '{label}': {len(tensors)} tensors -> {adapter_path.name}", flush=True)
-
-    # Write summary
-    summary = {
-        "tool": TOOL_VERSION,
-        "base_k": base_k,
-        "stages": [{"k": s["k"], "label": s["label"],
-                     "experts": s["experts"]} for s in stages],
-        "moe_layers": moe_layers,
-        "overall_mse": total_mse / max(n_experts_total, 1),
-        "n_experts_encoded": n_experts_total,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    (out_dir / "encoding_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "adapter_config.json").write_text(
+        json.dumps(config, indent=2) + "\n")
+
+
+def cmd_encode(args) -> int:
+    """Encode a per-layer BF16 checkpoint into base EXL3 plus MSRT shards."""
+    require_quant_dependencies()
+    recipe = load_recipe(args.recipe)
+    base_k = recipe["base_k"]
+    stages = recipe["stages"]
+    layers = recipe["moe_layers"]
+    layer_shards = resolve_layer_shards(args.source, layers)
+    out_dir = check_out_dir(
+        args.out, source=args.source, policy=args.recipe)
+
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise CartridgeError(f"--device {device}: CUDA is unavailable")
+        device_name = torch.cuda.get_device_name(device)
+    else:
+        device_name = device.type
+    print(f"Device: {device} ({device_name})", flush=True)
+    print(
+        f"Base K={base_k}, {len(stages)} stages, "
+        f"MoE layers {layers[0]}-{layers[-1]} ({len(layers)} layers)",
+        flush=True)
+
+    staged = StagedOutput(out_dir, args.force)
+    work = staged.begin()
+    base_dir = work / "base"
+    cartridge_dir = work / "cartridges"
+    stage_shards: dict[str, list[str]] = {
+        stage["label"]: [] for stage in stages}
+    stage_tensor_counts = {stage["label"]: 0 for stage in stages}
+    combined_shards: list[str] = []
+    combined_tensor_count = 0
+    experts_per_layer: dict[int, int] = {}
+    total_mse = 0.0
+    total_regularized_mse = 0.0
+    expert_count = 0
+    projection_count = 0
+
+    try:
+        copy_source_checkpoint(
+            args.source, base_dir,
+            {path.name for path in layer_shards.values()})
+        from safetensors import safe_open
+
+        with bootstrap_encoder(args.encoder_source) as encoder:
+            ext, ghd, tcp, tcpi, qtf, cbs = encoder
+            print(f"codebook_scale = {cbs}", flush=True)
+            for layer in layers:
+                source_shard = layer_shards[layer]
+                print(f"\nEncoding layer {layer}...", flush=True)
+                with safe_open(str(source_shard), framework="pt") as source_file:
+                    keys = list(source_file.keys())
+                    experts = inspect_source_layer(keys, layer)
+                    experts_per_layer[layer] = len(experts)
+                    base_tensors = load_preserved_tensors(source_file, keys)
+                    stage_tensors: dict[str, dict[str, torch.Tensor]] = {
+                        stage["label"]: {} for stage in stages}
+                    layer_mses: list[float] = []
+
+                    for expert in sorted(experts):
+                        applicable = selected_stages(stages, expert)
+                        for projection in PROJECTIONS:
+                            source_name = experts[expert][projection]
+                            source_weight = source_file.get_tensor(source_name)
+                            if source_weight.ndim != 2:
+                                raise CartridgeError(
+                                    f"{source_name}: expected 2-D BF16 weight, "
+                                    f"got {tuple(source_weight.shape)}")
+                            weight = source_weight.float().T.contiguous().to(device)
+                            result = encode_expert_msrt(
+                                weight, base_k, applicable, device,
+                                ghd, tcp, tcpi, qtf, cbs, ext)
+                            prefix = (
+                                f"model.layers.{layer}.mlp.experts.{expert}."
+                                f"{projection}.rank0")
+                            base_tensors[f"{prefix}.trellis"] = (
+                                result["base"]["trellis"])
+                            base_tensors[f"{prefix}.suh"] = result["base"]["suh"]
+                            base_tensors[f"{prefix}.svh"] = result["base"]["svh"]
+                            base_tensors[f"{prefix}.mcg"] = torch.tensor(
+                                MCG_SENTINEL_SIGNED, dtype=torch.int32)
+                            for label, stage_result in result["stages"].items():
+                                stage_tensors[label].update(_stage_tensor_names(
+                                    layer, expert, projection, label, stage_result))
+                            total_mse += result["mse"]
+                            total_regularized_mse += result["regularized_mse"]
+                            layer_mses.append(result["mse"])
+                            projection_count += 1
+                            del weight, source_weight, result
+                        expert_count += 1
+
+                save_safetensors(base_tensors, base_dir / source_shard.name)
+                combined: dict[str, torch.Tensor] = {}
+                for stage in stages:
+                    label = stage["label"]
+                    tensors = stage_tensors[label]
+                    if not tensors:
+                        continue
+                    relative = f"{label}/{source_shard.name}"
+                    save_safetensors(tensors, cartridge_dir / relative)
+                    stage_shards[label].append(relative)
+                    stage_tensor_counts[label] += len(tensors)
+                    combined.update(tensors)
+                if combined:
+                    relative = f"combined/{source_shard.name}"
+                    save_safetensors(combined, cartridge_dir / relative)
+                    combined_shards.append(relative)
+                    combined_tensor_count += len(combined)
+                average = sum(layer_mses) / len(layer_mses)
+                print(
+                    f"  Layer {layer}: avg original-space MSE={average:.4e}; "
+                    f"{len(experts)} experts, {len(layer_mses)} projections",
+                    flush=True)
+                del base_tensors, stage_tensors, combined
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        if expert_count == 0 or projection_count == 0:
+            raise CartridgeError("encoding produced no experts or projections")
+        for stage in stages:
+            label = stage["label"]
+            if not stage_shards[label]:
+                raise CartridgeError(
+                    f"stage {label!r} selected no experts in the source")
+            write_adapter_config(
+                cartridge_dir / label, [stage],
+                stage_shards[label], stage_tensor_counts[label])
+        write_adapter_config(
+            cartridge_dir / "combined", stages,
+            combined_shards, combined_tensor_count)
+        write_base_metadata(base_dir, base_k, layers, experts_per_layer)
+
+        summary = {
+            "tool": TOOL_VERSION,
+            "base_k": base_k,
+            "effective_bpw_excluding_metadata": effective_bpw(
+                recipe, max(experts_per_layer.values())),
+            "stages": [
+                {"k": stage["k"], "label": stage["label"],
+                 "experts": stage["experts"]}
+                for stage in stages
+            ],
+            "moe_layers": layers,
+            "overall_mse_original_space": total_mse / projection_count,
+            "overall_mse_regularized_space": (
+                total_regularized_mse / projection_count),
+            "n_experts_encoded": expert_count,
+            "n_projections_encoded": projection_count,
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        (work / "encoding_summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n")
+        staged.commit()
+    except Exception:
+        staged.abort()
+        raise
+
     print(f"\nDone! Output: {out_dir}", flush=True)
-    print(f"  Overall MSE: {summary['overall_mse']:.4e}", flush=True)
+    print(
+        f"  Original-space MSE: "
+        f"{total_mse / projection_count:.4e}", flush=True)
     return 0
 
 
@@ -746,10 +956,17 @@ def main(argv=None) -> int:
     enc.add_argument("--encoder-source", required=True, type=Path,
                      help="Path to exllamav3 Python package")
     enc.add_argument("--device", default="cuda:0")
+    enc.add_argument(
+        "--force", action="store_true",
+        help="Replace a previous fq_assemble_lora output carrying its sentinel")
 
     args = p.parse_args(argv)
-    if args.command == "encode":
-        return cmd_encode(args)
+    try:
+        if args.command == "encode":
+            return cmd_encode(args)
+    except (AssemblyError, CartridgeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return 1
 
 
