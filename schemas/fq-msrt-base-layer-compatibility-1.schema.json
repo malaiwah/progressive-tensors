@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/malaiwah/progressive-tensors/schemas/fq-msrt-base-layer-compatibility-1.schema.json",
+  "title": "TP-invariant MSRT base layer compatibility payload",
+  "description": "Canonical logical routed-expert tensor records hashed to bind one locally loadable layer to exact base bytes independently of physical layout.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "k", "layer", "tensors"],
+  "properties": {
+    "schema": {"const": "fq-msrt-base-layer-compatibility/1"},
+    "k": {"type": "integer", "minimum": 2, "maximum": 6},
+    "layer": {"type": "integer", "minimum": 0},
+    "tensors": {
+      "type": "array",
+      "minItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "dtype", "shape", "sha256"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^model\\.layers\\.(0|[1-9][0-9]*)\\.mlp\\.experts\\.(0|[1-9][0-9]*)\\.(gate_proj|up_proj|down_proj)\\.(trellis|suh|svh|mcg)$"
+          },
+          "dtype": {"enum": ["I16", "F16", "I32"]},
+          "shape": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0},
+            "maxItems": 3
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

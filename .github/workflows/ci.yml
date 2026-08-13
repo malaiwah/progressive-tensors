@@ -71,7 +71,7 @@ jobs:
           VIRTUAL_ENV=.venv-base uv pip install dist/*.whl
           VIRTUAL_ENV=.venv-base uv pip list | grep -qi '^numpy ' \
             && { echo "numpy leaked into the base install"; exit 1; } || true
-          for cmd in fq-repack fq-assemble fq-fetch fq-prime fq-verify fq-release fq-eps; do
+          for cmd in fq-repack fq-assemble fq-assemble-lora fq-combine-cartridges fq-measure-mse-fruit fq-fetch fq-prime fq-verify fq-release fq-eps; do
             echo "--- $cmd --help"
             ./.venv-base/bin/$cmd --help > /dev/null
           done

@@ -18,6 +18,10 @@ fails the build.
 | [`fq-manifest-1`](fq-manifest-1.schema.json) | `fq-manifest.json` (family, fetched-subset, or multi-source root) | `fq_repack`, `fq_prime`, `fq_fetch` |
 | [`fq-policy-2`](fq-policy-2.schema.json) | the recipe: one K per expert per layer | you, or a solver |
 | [`fq-release-1`](fq-release-1.schema.json) | `fq-release.json` — one signature over every file of a release | `fq_release` |
+| [`fq-cartridge-assembly-2`](fq-cartridge-assembly-2.schema.json) | signed campaign plan binding residual shards to exact base bytes | `fq_assemble_lora` |
+| [`fq-cartridge-adapter-3`](fq-cartridge-adapter-3.schema.json) | self-contained, digest-pinned runtime cartridge manifest | `fq_combine_cartridges` |
+| [`fq-msrt-base-compatibility-2`](fq-msrt-base-compatibility-2.schema.json) | canonical root over per-layer TP-invariant base identities | `fq_assemble_lora`, verified by `fq_combine_cartridges --base` |
+| [`fq-msrt-base-layer-compatibility-1`](fq-msrt-base-layer-compatibility-1.schema.json) | canonical logical tensor payload hashed as one layer's TP-invariant base identity | `fq_assemble_lora`, verified by `fq_combine_cartridges --base` |
 
 One document deliberately has no schema yet: the `assembly-of` record
 `fq_assemble` writes (`fq-assembly.json`, declaring `fq-attestation/2`).
@@ -27,20 +31,30 @@ it lands when it stops moving, rather than freezing a guess.
 
 ## Stability
 
-**These are schema v1 (and policy v2), versioned but not yet frozen.** The
-version string in each document (`fq-segment/1`, `fq-attestation/1`, …) is a
-real contract in one direction: a document that declares v1 will always mean
-what v1 means. What is not yet promised is that v1 is *finished* — the freeze
-happens when CI and the verification tooling have shipped and been exercised
-against published artifacts. Until then, expect additive fields, not
-reinterpretations.
+Every version string (`fq-segment/1`, `fq-policy/2`,
+`fq-cartridge-adapter/3`, …) names a distinct contract. Required fields never
+change meaning within that version. A rename, retype, changed numerical
+meaning, or newly required field is a new version.
+
+The schema itself declares whether a particular contract is additive or
+closed. Existing discovery/provenance formats retain extension points where
+their schema permits `additionalProperties`. In contrast,
+`fq-cartridge-assembly/2` and `fq-cartridge-adapter/3` are **closed executable
+contracts**: producers and consumers reject unknown fields at every defined
+object boundary. Adding even an optional field to either contract requires a
+new schema version. Adapter/3 and assembly/2 are being coordinated pre-merge
+with their first runtime consumer and have not been published as stable
+artifacts; once merged, their exact closed shapes are immutable.
 
 Concretely, the compatibility rules we hold ourselves to now:
 
-- **Additive within a version.** New optional fields may appear (they do:
+- **Additive only where the schema says so.** New optional fields may appear in
+  open extension points (they do:
   `fq_prime` adds provenance keys, `fq_fetch` adds subset markers). Consumers
-  must ignore unknown keys; the schemas are open (`additionalProperties`)
-  wherever a producer legitimately extends.
+  ignore unknown keys only in those schema-declared open objects.
+- **Closed means exact.** Consumers of the cartridge adapter/assembly profiles
+  reject missing and unknown fields. Evolution is a new `/N`, never a silent
+  in-version addition.
 - **Required fields never change meaning.** Renaming, retyping or
   repurposing a required field is a version bump, full stop.
 - **Predicates are enumerated on purpose.** `repack-of`, `derived-from`,

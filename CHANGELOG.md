@@ -59,14 +59,95 @@ measured, what is implemented, and what is not.
   does *not*, and what an attacker with full control of the artifact
   repository can and cannot do under fingerprint pinning.
 - **JSON Schemas** in [`schemas/`](schemas/) for `fq-segment/1` (segment
-  metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`
-  and `fq-release/1` — derived from real emitted artifacts and re-validated
-  against freshly emitted documents on every CI run.
+  metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`,
+  `fq-cartridge/2`, `fq-cartridge-adapter/3`, `fq-cartridge-assembly/2`, and
+  `fq-release/1` — derived
+  from real emitted artifacts and re-validated against freshly emitted
+  documents on every CI run.
 - **Packaging** — `pyproject.toml` with console entry points (`fq-repack`,
   `fq-assemble`, `fq-fetch`, `fq-prime`, `fq-verify`, `fq-release`,
   `fq-eps`), a hashed universal dev lock (`requirements-dev.txt`), and
   GitHub Actions CI running the suite on ubuntu-latest and macos-latest for
   Python 3.11 / 3.12 / 3.13, plus wheel-build and trust-root jobs.
+- **MSRT cartridge campaign tools** — `fq-assemble-lora` encodes a whole
+  `fq-cartridge/2` graph in one pass over the weights: every declared base
+  tier becomes a complete EXL3 checkpoint, and every stage is a rescaled
+  trellis residual against the reconstruction of the `parent` it names, so
+  seven loadable products spanning 26 bits per weight cost seven quantization
+  passes emitting 12 (measured on real GLM-5.2 experts: 1.58x less trellis
+  kernel time and 2.17x fewer bytes than encoding each product separately; the
+  nine-product graph is 1.83x and 2.5x). Subcommands
+  `plan` / `skeleton` / `encode` / `finalize`; reads standard indexed Hugging
+  Face shards or per-layer shards without ever loading a whole shard; work is
+  addressed as (layer, 32-expert block), owned by an `flock` the kernel releases
+  however the owner dies, and committed as one atomic unit, so an interrupted or
+  preempted run resumes at block granularity and `--devices` runs one worker per
+  GPU over disjoint blocks. One campaign directory takes one launcher and one
+  signing key, both enforced rather than advised, and publication cannot overlap
+  encoding. `fq-combine-cartridges` turns one published
+  assembly plan into a self-contained `fq-cartridge-adapter/3` cartridge under
+  a pinned signer, narrowing a full-expert stage to the experts a consumer
+  actually wants — decided from the signed plan before any payload is read, and
+  checked against the base checkpoint it will be loaded onto.
+  `fq-measure-mse-fruit` compares the actual SIQ checkpoint against every
+  graph node through the production encoder itself. `fq-promote-campaign`
+  publishes a staged campaign to `main` in a single commit of server-side
+  copies, after verifying the branch carries every file the finalized campaign
+  holds. These custom cartridges are explicitly not standard PEFT/LoRA adapters
+  and require an EXL3 MSRT-aware runtime.
+- **Source-byte provenance is one transaction** — skeleton repacks and raw
+  encoder reads copy and SHA-256 one `O_NOFOLLOW` regular-file fd into private
+  `0600` staging, validate the inode before/after, deserialize only staged
+  bytes, and attest that observed digest directly. Hub/manifest digests and the
+  resume cache are strict expectations rather than substitutes for
+  observation; symlinks, FIFOs, nonregular files, source drift and stale cache
+  entries are refused.
+- **Versioned MSRT runtime binding** — the pre-merge closed
+  `fq-cartridge-assembly/2` and `fq-cartridge-adapter/3` contracts bind an
+  ordered residual chain to exact per-layer logical base identities plus a
+  TP-layout-invariant family root. Adapter/3 fixes base-owned rotations,
+  packed int16 trellis plus scalar float32 scale semantics, and an explicit
+  full-vs-rank-sharded layout/rank/axis map (unambiguous even at world size
+  one). Every shard carries size and SHA-256; producer/runtime share config,
+  shard, and total-size limits. `producer_verified_signer` records combiner
+  provenance only, not runtime authentication. The paired vLLM loader rejects
+  unversioned, incomplete, tampered, wrong-base, or wrong-TP cartridges before
+  tensor deserialization.
+- **Two recipes for GLM-5.2, priced against each other.**
+  `recipes/glm52-k2k3-dag.json` ships nine products including two that sell a
+  +1-bit upgrade to an installed 3 or 4 bpw tier;
+  `recipes/glm52-k2k3-lean.json` drops those two. Measured on 168 comparisons
+  across real GLM-5.2 layers and on all 88 blocks of a proxy rehearsal, the
+  narrow-step path they serve is 9.0% (K2 family) and 6.8% (K3) worse than
+  fetching the wider residual at the same bitrate, while costing twice the
+  kernel time — so the lean graph is the recommended rental: **132.6 GPU-hours
+  against 186.9**, both measured back to back on one RTX 5090.
+- **[tools/msrt_campaign.sh](tools/msrt_campaign.sh)** — the campaign as one
+  checked driver: window staging with last-use source retention, skeleton,
+  encode, retirement, and a `PHASE=finalize` pass for a CPU machine. Refuses a
+  `WINDOWS` list that does not cover the recipe exactly once, refuses to start
+  without an explicit `DEVICES`, and refuses to let the GPU fleet be released
+  until every prerequisite for finishing the campaign is on one persistent
+  filesystem.
+- **Signed provenance for every encoded fragment.** Each shard ships a
+  `fq-attestation/1` line beside it: `encode-of` for expert shards, naming the
+  sha256 of each expert's contiguous byte range, the encoder bundle (Python
+  modules *and* the compiled extension), the determinism scope, the effective
+  quant arguments, and the exact parent shard digest the residual corrects;
+  `repack-of` for skeleton shards, naming per-tensor digests and the source
+  file the bytes were copied from. Shard payloads carry no timestamp, so
+  re-encoding inside the declared scope reproduces them byte for byte.
+  `finalize` re-hashes all of it before publishing anything and refuses a
+  campaign that spans two signers or two encoder builds, whose stages do not
+  name the parents this campaign published, or that holds shards the recipe
+  does not describe. It is also resumable: a preemption during that
+  multi-terabyte pass costs the re-read, not the campaign.
+- **[docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md)** — the GLM-5.2 campaign
+  runbook: per-K trellis cost, both graphs measured as full 32-expert blocks on
+  real GLM-5.2 weights, the resulting 133 GPU-hour / 1.147 TB projection with
+  its measured/derived/unmeasured labels, exact window geometry from the pinned
+  index, fleet sizing, the gates to run before renting, and the resume, publish
+  and verification procedure — rehearsed end to end on a proxy.
 - **[docs/PRIOR-ART.md](docs/PRIOR-ART.md)** — commissioned independent
   prior-art review, and the single narrow claim this project makes.
 

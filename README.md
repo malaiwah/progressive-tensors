@@ -543,6 +543,55 @@ The encoder driver and capture tooling are documented at the immutable
 [research revision `69fbef710e558e9cf8e2ad634eccc774f9a806fb`](https://github.com/malaiwah/vllm-voipmonitor/tree/69fbef710e558e9cf8e2ad634eccc774f9a806fb/research/fungible-quant);
 they are not a supported runtime component of this repository.
 
+## Encode a progressive cartridge graph (`fq_assemble_lora`)
+
+A segment tree ships one bit-width per expert. An **MSRT cartridge graph**
+ships several, from one pass over the weights: a `fq-cartridge/2` recipe
+declares complete base tiers and *rescaled trellis residual stages*, each
+naming the `parent` reconstruction it corrects, so the products share their
+ancestors' work instead of re-encoding it.
+
+```bash
+# seven loadable products (K2, K3, and K4/K5-like cartridges over both bases)
+# in seven quantization passes emitting 12 bits per weight
+uv run tools/fq_assemble_lora.py plan --source <bf16-dir> \
+  --recipe recipes/glm52-k2k3-lean.json --block-size 32
+uv run tools/fq_assemble_lora.py skeleton --source <bf16-dir> \
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign --sign-key ~/.fq_keys/c.key
+uv run tools/fq_assemble_lora.py encode --source <bf16-dir> \
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign \
+  --encoder-source <exllamav3-pkg> --sign-key ~/.fq_keys/c.key \
+  --devices cuda:0,cuda:1
+uv run tools/fq_assemble_lora.py finalize --source <bf16-dir> \
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign --sign-key ~/.fq_keys/c.key
+
+# consumer: one product, narrowed to the experts you actually want upgraded,
+# under a pinned signer, checked against the base it will be loaded onto
+uv run tools/fq_combine_cartridges.py --root ./campaign \
+  --assembly k2-k4like-direct --out ./k4like-hot96 --experts 0-95 \
+  --trust-key <64-hex campaign signer> --base ./campaign/base/k2
+```
+
+For a whole campaign, `tools/msrt_campaign.sh` runs that sequence window by
+window with source retention, then hands off to a CPU machine for `finalize` and
+`fq-promote-campaign`, which publishes the result in one commit.
+
+Work is addressed as (layer, 32-expert block) and committed as one atomic unit,
+so a preempted run resumes at block granularity and `--devices` runs one worker
+per GPU over disjoint blocks. Block ownership is an `flock`, so a crashed worker
+frees its block and no launcher has to guess whether a claim is stale; one
+campaign directory takes one launcher and one signing key. Every shard ships a
+signed `fq-attestation/1` line naming the sha256 of each expert's byte range, the
+encoder bundle that produced it and — for a residual — the exact parent shard
+digest it corrects; `finalize` re-hashes all of it before publishing and the
+combiner re-checks it under a key you pin. Measured on real GLM-5.2 experts, the
+shared-parent graph costs **1.58x less trellis kernel time and 2.17x fewer
+bytes** than encoding the same seven products separately (1.83x and 2.5x for the
+nine-product `glm52-k2k3-dag.json`, whose two extra products sell +1-bit upgrades
+at measurably worse error — [docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md) §1.1
+prices the choice, and carries the per-K cost table, the full-campaign
+projection and the runbook).
+
 ## Status & roadmap
 
 | Piece | Status |
@@ -558,6 +607,8 @@ they are not a supported runtime component of this repository.
 | Mixed-size (true mixed-K) assembly + loader metadata | offline assembly is working and tested; serving an output remains subject to the runtime's TP4-only / EP-and-DP refusal and hardware constraints |
 | Four tiers in the artifact tree (K2/K3/K4/K5) | root K3 is complete (layers 3–78); root K2/K4/K5 are `encode-of` tiers; nested `sources/willfalco-*` contains community-primed material for layers 3–10. For current coverage, use `per_k[K].layer_coverage.layers` (`fq-layer-coverage/1`) or signed index keys for older manifests; `per_k[K].layers` is legacy extrema only |
 | Runtime progressive loader + live bit-width reallocation (vLLM/GG) | separate experimental research, TP-only and not wired as an end-to-end supported workflow; no live-reallocation claim is made by these tools |
+| MSRT cartridge graph (`fq_assemble_lora`, `fq_combine_cartridges`) | working, tested; encode→decode parity proven against the runtime's own `ext.reconstruct` on real GLM-5.2 experts. Publishing a full GLM-5.2 graph is costed and gated in [docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md) but **not yet run** |
+| Serving an MSRT cartridge | **blocked on runtime**: the reference EXL3 MSRT implementation ([local-inference-lab/vllm#299](https://github.com/local-inference-lab/vllm/pull/299)) is draft, TP=1, one model-wide slot, and materializes dense FP16 shadow weights, which GLM-5.2's 734 G routed weights do not fit on one node |
 | Packaging, CI (ubuntu + macOS, py3.11–3.13), JSON Schemas | landed this release |
 
 ## Prior art and positioning
