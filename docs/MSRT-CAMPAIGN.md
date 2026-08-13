@@ -445,11 +445,27 @@ COMMON=(--source "$SRC" --recipe "$RECIPE" --out "$CAMPAIGN" --block-size 32)
 directory: §4.5 requires terminating the GPU instances and reattaching the volume
 to a CPU VM, and `finalize` needs both the key and the tool after that handoff.
 
-**`tools/msrt_campaign.sh` is this whole procedure as one checked driver** —
-staging, skeleton, encode, last-use retirement, finalize, in order, with the
-identity flags and the window arithmetic already right. Run `DRY_RUN=1` first to
-print the exact command sequence. The sections below explain what each step does
-and what it costs; the driver is what you should actually run.
+**`tools/msrt_campaign.sh` is this whole procedure as one checked driver.** The
+sections below explain what each step does and what it costs; the driver is what
+you should actually run:
+
+```bash
+export DEVICES=cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7
+DRY_RUN=1 "$REPO/tools/msrt_campaign.sh"        # print the exact commands first
+"$REPO/tools/msrt_campaign.sh"                  # GPU phase: stage, encode, retire
+# ... release the fleet, reattach the volume to a CPU VM ...
+PHASE=finalize "$REPO/tools/msrt_campaign.sh"   # CPU phase: verify and publish
+```
+
+It refuses to start unless `DEVICES` is set — a default would run one GPU while
+eight are billed — and unless `WINDOWS` covers every recipe layer exactly once,
+which is the one value no tool can check for itself. `PHASE=encode` (the default)
+stops after the last window with a volume-prerequisite check, so the fleet can be
+released before the CPU-only publication pass; `PHASE=finalize` needs neither a
+GPU nor the encoder bundle. Each finished window leaves a marker bound to the
+recipe digest, revision, block size and window partition, so a rerun after a
+preemption skips completed windows instead of re-staging a terabyte, and a
+drifted rerun is refused rather than silently skipping work it never did.
 
 ### 4.0 Gates before the fleet
 
