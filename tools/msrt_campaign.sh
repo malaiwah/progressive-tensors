@@ -8,20 +8,31 @@
 # still needs.
 #
 #   REPO_ID=zai-org/GLM-5.2 REV=<40hex> SRC=/data/glm52-src \
-#   CAMPAIGN=/data/glm52-msrt KEY=~/.fq_keys/c.key ENC=/opt/exllamav3 \
-#   RECIPE=recipes/glm52-k2k3-lean.json DEVICES=cuda:0,cuda:1 \
-#     tools/msrt_campaign.sh
+#   CAMPAIGN=/data/glm52-msrt KEY=/data/keys/c.key ENC=/opt/exllamav3 \
+#   RECIPE=/data/progressive-tensors/recipes/glm52-k2k3-lean.json \
+#   DEVICES=cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
+#     /data/progressive-tensors/tools/msrt_campaign.sh
+#
+# Two phases. PHASE=encode (the default) stages, encodes and retires every
+# window, then stops so the GPU fleet can be released. PHASE=finalize runs the
+# publication pass on a CPU VM with the same volume attached.
 #
 # DRY_RUN=1 prints every command instead of running it.
 set -euo pipefail
 
 : "${REPO_ID:?set REPO_ID}" "${REV:?set REV}" "${SRC:?set SRC}"
 : "${CAMPAIGN:?set CAMPAIGN}" "${KEY:?set KEY}" "${RECIPE:?set RECIPE}"
-: "${ENC:?set ENC}"
 [[ $REV =~ ^[0-9a-f]{40}$ ]] || { echo "REV must be a 40-hex commit" >&2; exit 2; }
 
 BLOCK_SIZE=${BLOCK_SIZE:-32}
-DEVICES=${DEVICES:-cuda:0}
+if [[ ${PHASE:-encode} == encode ]]; then
+  # The CPU phase needs neither of these, and the encoder bundle does not
+  # survive the reattach; defaulting DEVICES would run one GPU while eight bill.
+  : "${ENC:?set ENC}"
+  : "${DEVICES:?set DEVICES to every GPU you are paying for, e.g. cuda:0,cuda:1}"
+fi
+[[ ${PHASE:-encode} == encode || ${PHASE:-encode} == finalize ]] ||
+  { echo "PHASE must be encode or finalize" >&2; exit 2; }
 WINDOWS=${WINDOWS:-"3-10 11-18 19-26 27-34 35-42 43-50 51-58 59-66 67-74 75-78"}
 read -r -a FQ_CMD <<< "${FQ:-fq-assemble-lora}"
 WORK=${WORK:-$CAMPAIGN/.driver}
@@ -87,9 +98,39 @@ PY
 }
 
 mkdir -p "$WORK"
+
+# A done-marker means "this window of THIS run is finished". Bind it to the
+# arguments that decide what a window contains, so a drifted rerun cannot skip
+# work it never did. The campaign sentinel already refuses recipe, revision and
+# block-size drift; the window partition is only known here.
+identity="recipe=$(sha256sum "$RECIPE" | cut -d' ' -f1) rev=$REV \
+block=$BLOCK_SIZE windows=$WINDOWS"
+if [[ -e $WORK/identity ]]; then
+  if [[ $(cat "$WORK/identity") != "$identity" ]]; then
+    echo "error: $WORK holds markers from a different run:" >&2
+    echo "  had:  $(cat "$WORK/identity")" >&2
+    echo "  want: $identity" >&2
+    echo "Use a fresh --out, or FORCE_WINDOWS=1 to ignore the markers." >&2
+    [[ -z ${FORCE_WINDOWS:-} ]] && exit 2
+  fi
+elif [[ $DRY_RUN != 1 ]]; then
+  printf '%s' "$identity" > "$WORK/identity"
+fi
+
+if [[ ${PHASE:-encode} == finalize ]]; then
+  # CPU phase: no GPU, no source payload, just the campaign and the key.
+  run "${FQ_CMD[@]}" finalize "${COMMON[@]}" "${IDENTITY[@]}" --sign-key "$KEY"
+  echo "=== finalized; upload the bases and promote (docs/MSRT-CAMPAIGN.md 4.5)"
+  exit 0
+fi
+
 read -r -a windows <<< "$WINDOWS"
 for index in "${!windows[@]}"; do
   window=${windows[$index]}
+  if [[ -e $WORK/done-$window && -z ${FORCE_WINDOWS:-} ]]; then
+    echo "=== window $window ($((index + 1))/${#windows[@]}): already complete ==="
+    continue
+  fi
   echo "=== window $window ($((index + 1))/${#windows[@]}) ==="
   stage "$window"
   # skeleton first: it mints the signing key, and eight encode workers racing to
@@ -105,7 +146,23 @@ for index in "${!windows[@]}"; do
     --encoder-source "$ENC" --devices "$DEVICES" --layers "$window"
   [[ -n ${UPLOAD_HOOK:-} ]] && run "$UPLOAD_HOOK" "$window"
   retire "$window" "${windows[@]:index+1}"
+  # Only now: `encode` above returns non-zero unless every block of this window
+  # is committed on disk, so this marker means the window is finished, not
+  # attempted. A rerun after a preemption skips it instead of re-downloading
+  # ~166 GB of source for nothing.
+  [[ $DRY_RUN == 1 ]] || : > "$WORK/done-$window"
 done
 
-echo "=== release the GPU fleet now: finalize and the final upload need none ==="
-run "${FQ_CMD[@]}" finalize "${COMMON[@]}" "${IDENTITY[@]}" --sign-key "$KEY"
+cat <<'NOTE'
+=== encode phase complete ===
+Everything below needs no GPU. Before releasing the fleet, confirm the campaign
+can be finished without it, then terminate the GPU instances, attach the volume
+to a CPU VM, and re-run this script with PHASE=finalize.
+NOTE
+for path in "$KEY" "$RECIPE" "$SRC/model.safetensors.index.json" \
+            "$SRC/config.json" "$CAMPAIGN"; do
+  [[ -e $path ]] || { echo "NOT on the volume, finalize would fail: $path" >&2
+                      exit 1; }
+done
+echo "volume holds the key, the recipe, the source metadata and the campaign"
+findmnt -no SOURCE,TARGET --target "$CAMPAIGN" || true

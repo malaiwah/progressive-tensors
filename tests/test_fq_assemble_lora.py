@@ -518,6 +518,67 @@ def test_plan_names_the_shards_no_layer_window_would_stage(
     assert not needed - staged, f"skeleton needs unstaged shards: {needed - staged}"
 
 
+def test_a_crash_between_two_node_commits_leaves_the_block_incomplete(
+    tmp_path: Path, monkeypatch
+):
+    """A half-rewritten block must never look finished.
+
+    A block is one consistency unit: a residual is only valid against the parent
+    bytes published beside it. If markers were retracted per node as each was
+    written, a crash after the base and before its stage would leave the base
+    with a fresh marker and the stage with its old, still-valid one -- so the
+    next run would skip the block and ship a residual built against a different
+    reconstruction. Only finalize's parent-digest check would notice, a campaign
+    later.
+    """
+    pytest.importorskip("torch")
+    source = build_source(tmp_path / "src", layers=(3,), experts=2)
+    recipe = write_recipe(tmp_path / "recipe.json", **DAG_RECIPE)
+    out = tmp_path / "campaign"
+    monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
+    assert lora.cmd_encode(encode_args(source, recipe, out, layers="3")) == 0
+
+    name = lora.block_name(3, 0)
+    labels = ("k2", "k2r1")
+    recipe_doc = lora.load_recipe(recipe)
+    before = {label: lora.read_digest(
+        lora.node_dir(out, recipe_doc, label), name) for label in labels}
+    assert all(before.values())
+
+    # Crash the second write of a forced re-encode.
+    real_write_shard, seen = lora.write_shard, []
+
+    def crash_after_first(tensors, directory, shard, metadata, **kwargs):
+        seen.append(directory.name)
+        if len(seen) > 1:
+            raise KeyboardInterrupt("preempted between two node commits")
+        return real_write_shard(tensors, directory, shard, metadata, **kwargs)
+
+    monkeypatch.setattr(lora, "write_shard", crash_after_first)
+    with pytest.raises(KeyboardInterrupt):
+        lora.cmd_encode(encode_args(source, recipe, out, layers="3", force=True))
+
+    # The node that was being written when the process died must not carry a
+    # marker, so the block cannot read as complete and cannot be skipped.
+    monkeypatch.setattr(lora, "write_shard", real_write_shard)
+    assert lora.read_digest(lora.node_dir(out, recipe_doc, labels[1]),
+                            name) is None
+    with lora.SourceCheckpoint(source) as opened:
+        item = lora.build_work_list(opened, recipe_doc, [3], 2)[0]
+        assert not lora.block_is_complete(
+            out, recipe_doc, lora.sha256_file(recipe), opened,
+            SOURCE_REVISION, item, 2)
+
+    # A plain resume therefore rewrites the whole block, and the stage it writes
+    # names the base digest that shipped beside it in the same pass.
+    assert lora.cmd_encode(encode_args(source, recipe, out, layers="3")) == 0
+    base_dir = lora.node_dir(out, recipe_doc, labels[0])
+    for label in labels:
+        assert lora.read_digest(lora.node_dir(out, recipe_doc, label), name)
+    stage = lora.read_attestation(lora.node_dir(out, recipe_doc, labels[1]), name)
+    assert stage["parents"][0]["sha256"] == lora.read_digest(base_dir, name)
+
+
 
 def test_one_campaign_directory_takes_one_launcher(tmp_path: Path):
     """Per-block claims cannot police two launchers; the campaign lock does.
@@ -568,6 +629,21 @@ def test_a_block_claim_is_ownership_not_a_leftover_file(tmp_path: Path):
     assert (out / "locks" / "layer-003-b000.lock").is_file()
     with lora.block_claim(out, 3, 0) as reclaimed:
         assert reclaimed is True           # released, so claimable again
+
+def test_publication_and_encoding_are_mutually_exclusive(tmp_path: Path):
+    """A launcher's lock dies with the launcher; its workers do not.
+
+    `finalize` re-reads and signs the whole campaign, so it must not overlap a
+    worker still rewriting blocks -- including one orphaned by a killed launcher,
+    which no longer holds the campaign lock. Workers hold this file shared for
+    their lifetime; finalize takes it exclusively.
+    """
+    out = tmp_path / "campaign"
+    with lora.worker_presence(out):
+        with pytest.raises(lora.CartridgeError, match="workers are still"):
+            with lora.no_workers_running(out):
+                pass
+
 
 # ── End to end, on CPU, with a stand-in quantizer ─────────────────────────
 

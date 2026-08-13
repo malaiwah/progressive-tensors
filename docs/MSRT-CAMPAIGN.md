@@ -84,11 +84,11 @@ block each, back to back (§2):
 | Nominal trellis bpw | 14 | **12** |
 | **Committed rate, measured** | 11.5276 s/matrix | **8.1775 s/matrix** |
 | Campaign, one RTX 5090 | 186.9 GPU-h | **132.6 GPU-h** |
-| Compute at $0.99, roofline centre | $197 | **$139** |
-| 8-GPU compute wall, roofline centre | 24.8 h | **17.6 h** |
-| Campaign on disk | 1.332 TB | **1.146 TB** |
-| Logical WAN | 2.876 TB | **2.691 TB** |
-| Throughput needed to hide I/O | 273 Mbps | 360 Mbps |
+| Compute at $0.99, roofline centre | $196 | **$136** |
+| 8-GPU compute wall, roofline centre | 24.8 h | **17.2 h** |
+| Campaign on disk | 1.330 TB | **1.147 TB** |
+| Logical WAN | 2.877 TB | **2.691 TB** |
+| Throughput needed to hide I/O | 258 Mbps | 348 Mbps |
 
 **Recommendation: rent for the lean recipe.** It saves **54.3 GPU-hours**
 (measured: the difference between two blocks on this card, scaled to 58,368
@@ -156,9 +156,9 @@ isolated 2.96 s. The loop therefore runs within ~5% of the sum of its kernels.
 | Passes per matrix | 9 | **7** |
 | Committed rate, measured | 11.5276 s | **8.1775 s** |
 | **Campaign, one RTX 5090** | **186.9 GPU-h** | **132.6 GPU-h** |
-| Same products encoded separately, kernel only | 20.47 s/matrix | 15.44 s/matrix |
-| **Graph saving, trellis kernels** | **1.83x** | **1.94x** |
-| Nominal trellis bytes saved | 2.5x (14 vs 35 bpw) | 2.9x (12 vs 35 bpw) |
+| Its own products encoded separately, kernel only | 20.470 s/matrix | 12.518 s/matrix |
+| **Graph saving, trellis kernels** | **1.83x** | **1.58x** |
+| Nominal trellis bytes saved | 2.5x (14 vs 35 bpw) | 2.17x (12 vs 26 bpw) |
 
 Fleet projection at the live JarvisLabs spot price of $0.99/GPU-hour.
 **[DERIVED]** A roofline weighting of the measured per-K mix (K1 is memory-bound,
@@ -225,19 +225,19 @@ $60 of compute: **$220 centre, $290 cap**.
 ### 2.1 Fleet size
 
 Compute hours are fixed; what a larger fleet buys is wall time, and what it costs
-is idle GPU during the serial tails. With `lean` at the roofline centre
-(140.8 GPU-h), a 1.133 h first-window stage and a 0.351 h finalize during which
+is idle GPU during the serial tails. With `lean` at its own roofline centre
+(137.5 GPU-h), a 1.133 h first-window stage and a 0.351 h finalize during which
 GPUs do nothing, total cost as a function of fleet size `n` is
-`140.8 x 0.99 + n x 0.99 x 1.484 + 0.2223 x elapsed`:
+`137.5 x 0.99 + n x 0.99 x 1.484 + 0.2223 x elapsed`:
 
 | GPUs | Compute wall | Elapsed | Total |
 |---:|---:|---:|---:|
-| 1 | 140.8 h | 142.3 h | $168.50 |
-| 2 | 70.4 h | 71.9 h | $154.68 |
-| 4 | 35.2 h | 36.7 h | **$149.98** |
-| 8 | 17.6 h | 19.1 h | $152.03 |
+| 1 | 137.5 h | 139.0 h | $168.50 |
+| 2 | 68.8 h | 70.3 h | $154.68 |
+| 4 | 34.4 h | 35.9 h | **$149.98** |
+| 8 | 17.2 h | 18.7 h | $152.03 |
 
-**Eight GPUs costs $2.05 more than the four-GPU optimum and finishes 17.6 h
+**Eight GPUs costs $2.05 more than the four-GPU optimum and finishes 17.2 h
 sooner**, so take eight — but only with the release gate in §4.5. Leaving eight
 GPUs attached through finalize and the 3.4 h final upload adds $27, which is more
 than ten times the entire benefit of the fleet-size choice.
@@ -305,8 +305,8 @@ needs 1.482 TB, leaving only ~118 GB, which is too tight — the extra 0.4 TB co
 ~$2.67 for two days. Rolling publication deletes *source* shards, never campaign
 output. A 1 TB volume cannot run either plan.
 
-Throughput sufficient to hide transfer under compute is **273 Mbps** (`dag`) or
-**360 Mbps** (`lean`, whose compute window is 29% shorter for 94% of the bytes);
+Throughput sufficient to hide transfer under compute is **258 Mbps** (`dag`) or
+**348 Mbps** (`lean`, whose compute window is 29% shorter for 94% of the bytes);
 require **≥400 Mbps measured** before committing the fleet to `lean`. Below that,
 stage bytes on a regional filesystem with a CPU VM instead of paying GPUs to
 wait.
@@ -391,6 +391,17 @@ export RECIPE=$REPO/recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
 export ENC=/opt/exllamav3-python/exllamav3
 export HF_XET_CACHE=/data/xet-cache        # if Xet is used at all, keep it here
 export HF_HUB_DISABLE_XET=1                # source staging: see below
+
+# the reviewed tree and the client, on the volume the CPU VM will inherit
+git clone https://github.com/malaiwah/progressive-tensors "$REPO"
+git -C "$REPO" checkout <the reviewed commit>
+python3 -m venv /data/venv && /data/venv/bin/pip install -q \
+  "$REPO"[quant] 'huggingface_hub[cli,hf_xet]'
+export PATH=/data/venv/bin:$PATH
+hf auth login                              # or export HF_TOKEN=...
+export PROXY=/data/parity-proxy            # small MoE checkpoint for gate 2
+
+mkdir -p "$CAMPAIGN/plans" "$SRC" /data/keys
 
 # metadata first: every later command resolves layers through the index
 hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
@@ -478,9 +489,10 @@ export GATE=/data/glm52-gate
 GATE_COMMON=(--source "$SRC" --recipe "$RECIPE" --out "$GATE" --block-size 32)
 
 # stage layer 40's payload (the metadata is already there from "Set once")
-fq-assemble-lora plan "${GATE_COMMON[@]}" --layers 40 --out-plan gate.json
+fq-assemble-lora plan "${GATE_COMMON[@]}" --layers 40 \
+  --out-plan "$CAMPAIGN/plans/gate.json"
 hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
-  $(python3 -c 'import json;print(" ".join(f"--include {s}" for L in json.load(open("gate.json"))["layers"] for s in L["shards"]))')
+  $(GATE_PLAN=$CAMPAIGN/plans/gate.json python3 -c 'import json,os;p=json.load(open(os.environ["GATE_PLAN"]));print(" ".join(f"--include {s}" for L in p["layers"] for s in L["shards"]))')
 
 # skeleton mints and binds the signing key; encode with --shard-count > 1 will
 # not create one, so this must come first even for a gate
@@ -505,6 +517,7 @@ rm -rf "$GATE"          # the real campaign must start from an empty --out
 `plan` reports the exact shard files each layer needs:
 
 ```bash
+mkdir -p "$CAMPAIGN/plans"
 fq-assemble-lora plan "${COMMON[@]}" --layers 3-10 \
   --out-plan "$CAMPAIGN/plans/3-10.json"
 WINDOW_PLAN=$CAMPAIGN/plans/3-10.json python3 - <<'PY'
@@ -634,7 +647,9 @@ world sees:
 
 ```bash
 export DEST=malaiwah/GLM-5.2-MSRT           # the destination repo
-export STAGING=refs/heads/staging           # never publish onto main directly
+export STAGING=staging                      # never publish onto main directly
+hf repos create "$DEST" --private || true   # once
+hf repos branch create "$DEST" "$STAGING" || true
 
 # per window, while the GPUs work on the next one: stages only. A base is not
 # loadable until finalize links the skeleton into it, so bases wait.
@@ -654,8 +669,12 @@ hf upload "$DEST" "$CAMPAIGN/assemblies" assemblies --revision "$STAGING"
 hf upload "$DEST" "$CAMPAIGN/campaign_summary.json" campaign_summary.json \
   --revision "$STAGING"
 
-# promote once, when every fragment is up: one ref move, not eleven commits
-hf repo branch merge "$DEST" "$STAGING" main   # or open a PR and merge it
+# promote once, when every fragment is up. Server-side copies in a single
+# commit: no payload moves, and no consumer can observe a partial family.
+"$REPO/tools/promote_campaign.py" --repo "$DEST" --from staging \
+  --summary "$CAMPAIGN/campaign_summary.json" --check
+"$REPO/tools/promote_campaign.py" --repo "$DEST" --from staging \
+  --summary "$CAMPAIGN/campaign_summary.json"
 ```
 
 Publishing onto a staging ref and promoting once is what keeps a consumer from

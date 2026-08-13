@@ -1561,6 +1561,17 @@ def bind_encoder_identity(out: Path, encoder_sha: str) -> None:
     they write the same value, and the write is atomic.
     """
     marker = out / SENTINEL
+    # Workers reach this concurrently, so the compare-and-set is serialized: two
+    # different builds must not both observe "unbound" and each record itself.
+    guard = os.open(out / f"{SENTINEL}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        _bind_encoder_locked(marker, encoder_sha)
+    finally:
+        os.close(guard)
+
+
+def _bind_encoder_locked(marker: Path, encoder_sha: str) -> None:
     try:
         found = json.loads(marker.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -1832,6 +1843,50 @@ def block_claim(out: Path, layer: int, block: int):
 
 CAMPAIGN_LOCK = ".fq-campaign.lock"
 CAMPAIGN_LOCK_ENV = "FQ_CAMPAIGN_LOCK_HELD"
+WORKERS_LOCK = ".fq-campaign.workers.lock"
+
+
+@contextmanager
+def worker_presence(out: Path):
+    """Shared, kernel-owned marker that one encode worker is alive.
+
+    The campaign lock is held by a *launcher*, so it disappears if the launcher
+    is killed while its workers keep running. Publication must not overlap those
+    orphans, and a worker must not start while publication is under way, so both
+    sides meet on this file: workers take it shared, `finalize` takes it
+    exclusive.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    handle = os.open(out / WORKERS_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            raise CartridgeError(
+                f"{out / WORKERS_LOCK} is held exclusively: finalize is "
+                f"publishing this campaign. Wait for it, then resume encoding."
+            ) from None
+        yield
+    finally:
+        os.close(handle)
+
+
+@contextmanager
+def no_workers_running(out: Path):
+    """Refuse to publish while any encode worker still holds this campaign."""
+    out.mkdir(parents=True, exist_ok=True)
+    handle = os.open(out / WORKERS_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise CartridgeError(
+                f"encode workers are still running against {out}: their claims "
+                f"are held in {WORKERS_LOCK}. A published campaign must be a "
+                f"quiet one -- stop them, or wait, before finalize.") from None
+        yield
+    finally:
+        os.close(handle)
 
 
 @contextmanager
@@ -1868,6 +1923,28 @@ def campaign_lock(out: Path, *, what: str):
         yield True
     finally:
         os.close(handle)
+
+
+def block_is_complete(
+    out: Path, recipe: dict[str, Any], recipe_sha: str,
+    source: SourceCheckpoint, base_revision: str, item: dict[str, Any],
+    block_size: int,
+) -> bool:
+    """Is every node of one (layer, block) committed on disk?"""
+    layer, block, experts = item["layer"], item["block"], item["experts"]
+    common = {
+        "schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
+        "base_revision": base_revision,
+        "layer": str(layer), "block": str(block),
+        "experts": ",".join(str(e) for e in experts),
+    }
+    for label, covered in block_outputs(recipe, experts).items():
+        expect = {**common, "label": label,
+                  "covered_experts": ",".join(str(e) for e in covered)}
+        if not shard_is_complete(node_dir(out, recipe, label),
+                                 block_name(layer, block), expect):
+            return False
+    return True
 
 
 def encode_block(
@@ -1907,6 +1984,17 @@ def encode_block(
     if complete and not force:
         return {"layer": layer, "block": block, "skipped": True}
     pending = plan
+    # Retract every marker in the block *before* quantizing, not per node as it
+    # is written. Otherwise a crash between two node commits leaves the nodes
+    # already rewritten carrying fresh markers and the rest carrying their old,
+    # still-valid ones: the block then looks complete to the next run, which
+    # skips it, and the mixture is only caught by finalize's parent-digest check
+    # after the fleet has been paid. Retracted first, a half-written block is
+    # visibly incomplete and gets re-encoded as a whole.
+    for directory, _expect, _covered in pending.values():
+        for marker in (digest_path(directory, name),
+                       attestation_path(directory, name)):
+            marker.unlink(missing_ok=True)
 
     base_labels = {base["label"] for base in recipe["bases"]}
     source_experts = source.experts(layer)
@@ -2047,7 +2135,7 @@ def cmd_encode(args) -> int:
 
     target = Path(args.out).expanduser().resolve()
     with SourceCheckpoint(args.source) as source, \
-            campaign_lock(target, what="encode"):
+            campaign_lock(target, what="encode"), worker_presence(target):
         base_model, base_revision = resolve_identity(args, source)
         signer = load_signer(args.sign_key,
                              create=args.shard_count == 1,
@@ -2185,6 +2273,26 @@ def _spawn_device_workers(args) -> int:
         raise CartridgeError(
             f"workers {failures} failed; see {logs}. Blocks already written "
             f"are complete: rerun the same command to resume.")
+    # Exit 0 from every worker is not the postcondition the caller needs. A
+    # worker skips a block another live worker holds -- including one orphaned by
+    # a killed launcher -- and still exits 0, so a driver that retires source
+    # bytes on success could advance past a window still being encoded. Assert
+    # the thing that matters instead: every block of this run is on disk.
+    with SourceCheckpoint(args.source) as source:
+        recipe_ = load_recipe(args.recipe)
+        pending = [
+            item for item in build_work_list(
+                source, recipe_, selected_layers(recipe_, args.layers),
+                args.block_size)
+            if not block_is_complete(out, recipe_, recipe_sha, source,
+                                     base_revision, item, args.block_size)
+        ]
+    if pending:
+        raise CartridgeError(
+            f"{len(pending)} of this run's blocks are not complete, e.g. "
+            f"{[(item['layer'], item['block']) for item in pending[:5]]}. "
+            f"Another worker holds them, or a worker exited without writing "
+            f"them: rerun the same command once those workers are done.")
     return 0
 
 
@@ -2315,9 +2423,9 @@ def cmd_finalize(args) -> int:
     recipe = load_recipe(args.recipe)
     recipe_sha = sha256_file(args.recipe)
     layers = recipe["moe_layers"]
-    with SourceCheckpoint(args.source) as source, \
-            campaign_lock(Path(args.out).expanduser().resolve(),
-                          what="finalize"):
+    target = Path(args.out).expanduser().resolve()
+    with campaign_lock(target, what="finalize"), no_workers_running(target), \
+            SourceCheckpoint(args.source) as source:
         base_model, base_revision = resolve_identity(args, source)
         out = prepare_out_dir(
             args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
@@ -2358,280 +2466,280 @@ def cmd_finalize(args) -> int:
             for shard, keys in sorted(skeleton_keys(source, layers).items())
         ]
 
-    missing: list[str] = []
-    broken: list[str] = []
-    digests: dict[str, dict[str, str]] = {}
-    signers: set[str] = set()
-    encoders: set[str] = set()
-    parents: dict[tuple[str, str], dict[str, Any] | None] = {}
-    attested = 0
+        missing: list[str] = []
+        broken: list[str] = []
+        digests: dict[str, dict[str, str]] = {}
+        signers: set[str] = set()
+        encoders: set[str] = set()
+        parents: dict[tuple[str, str], dict[str, Any] | None] = {}
+        attested = 0
 
-    def check(bucket: str, directory: Path, name: str,
-              expect: dict[str, str], group_kind: str) -> None:
-        """Publish nothing that is not on disk, hashed, and signed for.
+        def check(bucket: str, directory: Path, name: str,
+                  expect: dict[str, str], group_kind: str) -> None:
+            """Publish nothing that is not on disk, hashed, and signed for.
 
-        Every fragment is re-hashed from the bytes that survived, the recorded
-        block identity is re-checked so a copied shard cannot masquerade as a
-        different block, and its signed line must name the same digest and the
-        same per-span digests.
-        """
-        nonlocal attested
-        target = directory / name
-        recorded = read_digest(directory, name)
-        if not target.is_file() or recorded is None:
-            missing.append(f"{bucket}/{name}")
-            return
-        try:
-            if not shard_is_complete(directory, name, expect):
+            Every fragment is re-hashed from the bytes that survived, the recorded
+            block identity is re-checked so a copied shard cannot masquerade as a
+            different block, and its signed line must name the same digest and the
+            same per-span digests.
+            """
+            nonlocal attested
+            target = directory / name
+            recorded = read_digest(directory, name)
+            if not target.is_file() or recorded is None:
                 missing.append(f"{bucket}/{name}")
                 return
-            sha, body, spans = verify_shard(target, group_kind=group_kind)
-            payload = read_attestation(directory, name)
-        except CartridgeError as exc:
-            broken.append(str(exc))
-            return
-        if sha != recorded:
-            broken.append(
-                f"{bucket}/{name}: on-disk sha256 {sha} != recorded {recorded}")
-            return
-        fragment = payload.get("fragment") or {}
-        claimed = payload.get(
-            "expert_sha256" if group_kind == "expert" else "tensor_sha256")
-        if (fragment.get("sha256") != sha or fragment.get("file") != name
-                or fragment.get("size") != target.stat().st_size
-                or fragment.get("body_offset") != body):
-            broken.append(f"{bucket}/{name}: attestation names other bytes")
-            return
-        if claimed != spans:
-            broken.append(f"{bucket}/{name}: attested span digests do not hold")
-            return
-        if (payload.get("recipe_sha256") != recipe_sha
-                or payload.get("base_revision") != base_revision):
-            broken.append(f"{bucket}/{name}: attests a different source or recipe")
-            return
-        expected_predicate = "encode-of" if group_kind == "expert" else "repack-of"
-        if payload.get("predicate") != expected_predicate:
-            broken.append(
-                f"{bucket}/{name}: predicate {payload.get('predicate')!r} != "
-                f"{expected_predicate!r}")
-            return
-        if payload.get("materials", {}).get("encoder_sha256") is not None:
-            encoders.add(payload["materials"]["encoder_sha256"])
-        parents[(bucket, name)] = (payload.get("parents") or [None])[0]
-        digests.setdefault(bucket, {})[name] = sha
-        signers.add(payload["_keyid"])
-        attested += 1
+            try:
+                if not shard_is_complete(directory, name, expect):
+                    missing.append(f"{bucket}/{name}")
+                    return
+                sha, body, spans = verify_shard(target, group_kind=group_kind)
+                payload = read_attestation(directory, name)
+            except CartridgeError as exc:
+                broken.append(str(exc))
+                return
+            if sha != recorded:
+                broken.append(
+                    f"{bucket}/{name}: on-disk sha256 {sha} != recorded {recorded}")
+                return
+            fragment = payload.get("fragment") or {}
+            claimed = payload.get(
+                "expert_sha256" if group_kind == "expert" else "tensor_sha256")
+            if (fragment.get("sha256") != sha or fragment.get("file") != name
+                    or fragment.get("size") != target.stat().st_size
+                    or fragment.get("body_offset") != body):
+                broken.append(f"{bucket}/{name}: attestation names other bytes")
+                return
+            if claimed != spans:
+                broken.append(f"{bucket}/{name}: attested span digests do not hold")
+                return
+            if (payload.get("recipe_sha256") != recipe_sha
+                    or payload.get("base_revision") != base_revision):
+                broken.append(f"{bucket}/{name}: attests a different source or recipe")
+                return
+            expected_predicate = "encode-of" if group_kind == "expert" else "repack-of"
+            if payload.get("predicate") != expected_predicate:
+                broken.append(
+                    f"{bucket}/{name}: predicate {payload.get('predicate')!r} != "
+                    f"{expected_predicate!r}")
+                return
+            if payload.get("materials", {}).get("encoder_sha256") is not None:
+                encoders.add(payload["materials"]["encoder_sha256"])
+            parents[(bucket, name)] = (payload.get("parents") or [None])[0]
+            digests.setdefault(bucket, {})[name] = sha
+            signers.add(payload["_keyid"])
+            attested += 1
 
-    # A finalized base holds its own expert blocks *and* one hardlink per
-    # skeleton shard, because that is what makes it loadable. Finalize must
-    # therefore accept those names when it re-runs: a crash or preemption in the
-    # middle of a multi-terabyte finalize is a resume, not a lost campaign.
-    base_labels = {base["label"] for base in recipe["bases"]}
-    published_skeleton = {name for _d, name, _e, _g in skeleton_expected}
-    for label, entries in expected.items():
-        for directory, name, expect, group_kind in entries:
-            check(label, directory, name, expect, group_kind)
-        directory = node_dir(out, recipe, label)
-        allowed = {name for _d, name, _e, _g in entries}
-        if label in base_labels:
-            allowed |= published_skeleton
-        stale = sorted(path.name for path in directory.glob("model-*.safetensors")
-                       if path.name not in allowed)
+        # A finalized base holds its own expert blocks *and* one hardlink per
+        # skeleton shard, because that is what makes it loadable. Finalize must
+        # therefore accept those names when it re-runs: a crash or preemption in the
+        # middle of a multi-terabyte finalize is a resume, not a lost campaign.
+        base_labels = {base["label"] for base in recipe["bases"]}
+        published_skeleton = {name for _d, name, _e, _g in skeleton_expected}
+        for label, entries in expected.items():
+            for directory, name, expect, group_kind in entries:
+                check(label, directory, name, expect, group_kind)
+            directory = node_dir(out, recipe, label)
+            allowed = {name for _d, name, _e, _g in entries}
+            if label in base_labels:
+                allowed |= published_skeleton
+            stale = sorted(path.name for path in directory.glob("model-*.safetensors")
+                           if path.name not in allowed)
+            if stale:
+                raise CartridgeError(
+                    f"{directory} holds {len(stale)} shards this recipe does not "
+                    f"describe, e.g. {stale[:3]}. They would land in the "
+                    f"regenerated index next to the real ones: remove them or "
+                    f"encode into a fresh --out.")
+        for directory, name, expect, group_kind in skeleton_expected:
+            check("skeleton", directory, name, expect, group_kind)
+        expected_skeleton = {name for _d, name, _e, _g in skeleton_expected}
+        stale = sorted(path.name for path in skeleton.glob("model-*.safetensors")
+                       if path.name not in expected_skeleton)
         if stale:
             raise CartridgeError(
-                f"{directory} holds {len(stale)} shards this recipe does not "
-                f"describe, e.g. {stale[:3]}. They would land in the "
-                f"regenerated index next to the real ones: remove them or "
-                f"encode into a fresh --out.")
-    for directory, name, expect, group_kind in skeleton_expected:
-        check("skeleton", directory, name, expect, group_kind)
-    expected_skeleton = {name for _d, name, _e, _g in skeleton_expected}
-    stale = sorted(path.name for path in skeleton.glob("model-*.safetensors")
-                   if path.name not in expected_skeleton)
-    if stale:
-        raise CartridgeError(
-            f"{skeleton} holds {len(stale)} shards this recipe does not "
-            f"describe, e.g. {stale[:3]}; they would be published into every "
-            f"base checkpoint.")
-    if missing:
-        raise CartridgeError(
-            f"{len(missing)} outputs are missing, e.g. {sorted(missing)[:5]}. "
-            f"Run encode/skeleton to completion before finalize.")
-    if broken:
-        raise CartridgeError(
-            f"{len(broken)} fragments failed verification, e.g. "
-            f"{sorted(broken)[:3]}. Every published fragment must hash to its "
-            f"recorded digest and carry a signed line naming those bytes.")
-    if len(signers) != 1:
-        raise CartridgeError(
-            f"fragments are signed by {len(signers)} different keys "
-            f"({sorted(k[:16] for k in signers)}); a campaign must publish one "
-            f"signer identity")
-    if len(encoders) > 1:
-        raise CartridgeError(
-            f"fragments were produced by {len(encoders)} different encoder "
-            f"builds ({sorted(e[:16] for e in encoders)}). A residual is only "
-            f"valid against the reconstruction its own encoder produced: "
-            f"re-encode the affected blocks with one build before publishing.")
-    # Every stage shard must name the parent shard bytes it corrects, and that
-    # digest must be the one this campaign actually published for the parent.
-    node_parents = {stage["label"]: stage["parent"] for stage in recipe["stages"]}
-    for (bucket, name), claim in parents.items():
-        expected_parent = node_parents.get(bucket)
-        if expected_parent is None:
-            if claim is not None:
-                broken.append(f"{bucket}/{name}: a base tier claims a parent")
-            continue
-        published = digests.get(expected_parent, {}).get(name)
-        if (not isinstance(claim, dict) or claim.get("label") != expected_parent
-                or claim.get("file") != name
-                or claim.get("sha256") != published):
-            broken.append(
-                f"{bucket}/{name}: attests parent {claim!r}, but this campaign "
-                f"published {expected_parent}/{name} as {published}")
-    if broken:
-        raise CartridgeError(
-            f"{len(broken)} fragments are not bound to the reconstruction they "
-            f"correct, e.g. {sorted(broken)[:3]}")
-
-    base_manifests: dict[str, str] = {}
-    for base in recipe["bases"]:
-        label = base["label"]
-        directory = node_dir(out, recipe, label)
-        directory.mkdir(parents=True, exist_ok=True)
-        known = dict(digests[label])
-        for entry in sorted(skeleton.iterdir()):
-            if entry.name.startswith("."):
+                f"{skeleton} holds {len(stale)} shards this recipe does not "
+                f"describe, e.g. {stale[:3]}; they would be published into every "
+                f"base checkpoint.")
+        if missing:
+            raise CartridgeError(
+                f"{len(missing)} outputs are missing, e.g. {sorted(missing)[:5]}. "
+                f"Run encode/skeleton to completion before finalize.")
+        if broken:
+            raise CartridgeError(
+                f"{len(broken)} fragments failed verification, e.g. "
+                f"{sorted(broken)[:3]}. Every published fragment must hash to its "
+                f"recorded digest and carry a signed line naming those bytes.")
+        if len(signers) != 1:
+            raise CartridgeError(
+                f"fragments are signed by {len(signers)} different keys "
+                f"({sorted(k[:16] for k in signers)}); a campaign must publish one "
+                f"signer identity")
+        if len(encoders) > 1:
+            raise CartridgeError(
+                f"fragments were produced by {len(encoders)} different encoder "
+                f"builds ({sorted(e[:16] for e in encoders)}). A residual is only "
+                f"valid against the reconstruction its own encoder produced: "
+                f"re-encode the affected blocks with one build before publishing.")
+        # Every stage shard must name the parent shard bytes it corrects, and that
+        # digest must be the one this campaign actually published for the parent.
+        node_parents = {stage["label"]: stage["parent"] for stage in recipe["stages"]}
+        for (bucket, name), claim in parents.items():
+            expected_parent = node_parents.get(bucket)
+            if expected_parent is None:
+                if claim is not None:
+                    broken.append(f"{bucket}/{name}: a base tier claims a parent")
                 continue
-            if entry.is_dir():
-                # Merge, never replace: this base's own digests/ and
-                # attestations/ live here and deleting them would retract the
-                # commit markers for every block already encoded.
-                shutil.copytree(entry, directory / entry.name,
-                                dirs_exist_ok=True)
-                continue
-            if entry.suffix == ".safetensors":
-                # Immutable payload: one inode shared by every base tier.
-                link_or_copy(entry, directory / entry.name)
-            else:
-                # config.json and tier_bitmap.json are rewritten per base, so
-                # they must never share an inode with another base or the
-                # skeleton they came from.
-                shutil.copy2(entry, directory / entry.name)
-            if entry.name in digests.get("skeleton", {}):
-                known[entry.name] = digests["skeleton"][entry.name]
-        write_base_metadata(
-            directory, base["k"], layers, experts_per_layer, known)
-        base_manifests[label] = sha256_file(directory / "MANIFEST.sha256")
-        print(f"base {label}: K{base['k']} checkpoint finalized in {directory}",
-              flush=True)
+            published = digests.get(expected_parent, {}).get(name)
+            if (not isinstance(claim, dict) or claim.get("label") != expected_parent
+                    or claim.get("file") != name
+                    or claim.get("sha256") != published):
+                broken.append(
+                    f"{bucket}/{name}: attests parent {claim!r}, but this campaign "
+                    f"published {expected_parent}/{name} as {published}")
+        if broken:
+            raise CartridgeError(
+                f"{len(broken)} fragments are not bound to the reconstruction they "
+                f"correct, e.g. {sorted(broken)[:3]}")
 
-    products = []
-    signer = load_signer(args.sign_key, create=False,
-                         outside=(out, Path(args.source)))
-    if signer.pub_hex != next(iter(signers)):
-        raise CartridgeError(
-            f"--sign-key is {signer.pub_hex[:16]} but every fragment was "
-            f"signed by {next(iter(signers))[:16]}. A consumer pins one key "
-            f"for the plan and the fragments, so two identities would make "
-            f"this campaign unusable.")
-    for assembly in recipe["assemblies"]:
-        shards, tensors = [], 0
-        for label in assembly["chain"]:
+        base_manifests: dict[str, str] = {}
+        for base in recipe["bases"]:
+            label = base["label"]
             directory = node_dir(out, recipe, label)
-            for name in sorted(digests[label]):
-                relative = (directory / name).relative_to(out).as_posix()
-                header, _ = read_header(directory / name)
-                meta = header.pop("__metadata__", None) or {}
-                shards.append({
-                    "label": label,
-                    "path": relative,
-                    "sha256": digests[label][name],
-                    # Coverage is published *in the signed plan* so a consumer
-                    # who wants 96 experts can decide what to download before
-                    # touching a single payload byte.
-                    "layer": int(meta["layer"]),
-                    "block": int(meta["block"]),
-                    "experts": [int(value) for value
-                                in meta["covered_experts"].split(",") if value],
-                    "parent_label": node_parents[label],
-                    "parent_sha256": digests[node_parents[label]][name],
-                    # Provenance travels with the shard list so a consumer that
-                    # fetches only this product still gets its signed evidence.
-                    "attestation": attestation_path(
-                        directory, name).relative_to(out).as_posix(),
+            directory.mkdir(parents=True, exist_ok=True)
+            known = dict(digests[label])
+            for entry in sorted(skeleton.iterdir()):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    # Merge, never replace: this base's own digests/ and
+                    # attestations/ live here and deleting them would retract the
+                    # commit markers for every block already encoded.
+                    shutil.copytree(entry, directory / entry.name,
+                                    dirs_exist_ok=True)
+                    continue
+                if entry.suffix == ".safetensors":
+                    # Immutable payload: one inode shared by every base tier.
+                    link_or_copy(entry, directory / entry.name)
+                else:
+                    # config.json and tier_bitmap.json are rewritten per base, so
+                    # they must never share an inode with another base or the
+                    # skeleton they came from.
+                    shutil.copy2(entry, directory / entry.name)
+                if entry.name in digests.get("skeleton", {}):
+                    known[entry.name] = digests["skeleton"][entry.name]
+            write_base_metadata(
+                directory, base["k"], layers, experts_per_layer, known)
+            base_manifests[label] = sha256_file(directory / "MANIFEST.sha256")
+            print(f"base {label}: K{base['k']} checkpoint finalized in {directory}",
+                  flush=True)
+
+        products = []
+        signer = load_signer(args.sign_key, create=False,
+                             outside=(out, Path(args.source)))
+        if signer.pub_hex != next(iter(signers)):
+            raise CartridgeError(
+                f"--sign-key is {signer.pub_hex[:16]} but every fragment was "
+                f"signed by {next(iter(signers))[:16]}. A consumer pins one key "
+                f"for the plan and the fragments, so two identities would make "
+                f"this campaign unusable.")
+        for assembly in recipe["assemblies"]:
+            shards, tensors = [], 0
+            for label in assembly["chain"]:
+                directory = node_dir(out, recipe, label)
+                for name in sorted(digests[label]):
+                    relative = (directory / name).relative_to(out).as_posix()
+                    header, _ = read_header(directory / name)
+                    meta = header.pop("__metadata__", None) or {}
+                    shards.append({
+                        "label": label,
+                        "path": relative,
+                        "sha256": digests[label][name],
+                        # Coverage is published *in the signed plan* so a consumer
+                        # who wants 96 experts can decide what to download before
+                        # touching a single payload byte.
+                        "layer": int(meta["layer"]),
+                        "block": int(meta["block"]),
+                        "experts": [int(value) for value
+                                    in meta["covered_experts"].split(",") if value],
+                        "parent_label": node_parents[label],
+                        "parent_sha256": digests[node_parents[label]][name],
+                        # Provenance travels with the shard list so a consumer that
+                        # fetches only this product still gets its signed evidence.
+                        "attestation": attestation_path(
+                            directory, name).relative_to(out).as_posix(),
+                    })
+                    tensors += len(header)
+            expert_counts = set(experts_per_layer.values())
+            config = write_adapter_config(
+                out / "assemblies" / assembly["label"], recipe, assembly,
+                base_manifests[assembly["base"]],
+                [entry["path"] for entry in shards], tensors,
+                schema=ASSEMBLY_SCHEMA, filename="assembly.json",
+                extra={
+                    "paths_relative_to": "campaign root",
+                    "campaign": {
+                        "recipe_sha256": recipe_sha,
+                        "base_model": base_model,
+                        "base_revision": base_revision,
+                        "encoder_sha256": (next(iter(encoders)) if encoders
+                                           else None),
+                        "signer_pubkey": next(iter(signers)),
+                        "block_size": args.block_size,
+                        "moe_layers": layers,
+                    },
+                    "stage_shards": shards,
+                    "bits_per_weight": (
+                        assembly_bpw(recipe, assembly, max(expert_counts))),
                 })
-                tensors += len(header)
-        expert_counts = set(experts_per_layer.values())
-        config = write_adapter_config(
-            out / "assemblies" / assembly["label"], recipe, assembly,
-            base_manifests[assembly["base"]],
-            [entry["path"] for entry in shards], tensors,
-            schema=ASSEMBLY_SCHEMA, filename="assembly.json",
-            extra={
-                "paths_relative_to": "campaign root",
-                "campaign": {
-                    "recipe_sha256": recipe_sha,
-                    "base_model": base_model,
-                    "base_revision": base_revision,
-                    "encoder_sha256": (next(iter(encoders)) if encoders
-                                       else None),
-                    "signer_pubkey": next(iter(signers)),
-                    "block_size": args.block_size,
-                    "moe_layers": layers,
-                },
-                "stage_shards": shards,
-                "bits_per_weight": (
-                    assembly_bpw(recipe, assembly, max(expert_counts))),
-            })
-        plan_dir = out / "assemblies" / assembly["label"]
-        (plan_dir / "assembly.jsonl").write_text(
-            signer.sign_line(config) + "\n")
-        products.append({"label": assembly["label"],
-                         "bits_per_weight": config["bits_per_weight"],
-                         "shards": len(shards),
-                         "signed_plan": "assembly.jsonl"})
-        print(f"assembly {assembly['label']}: "
-              f"{config['bits_per_weight']:.3f} bpw, {len(shards)} stage shards",
-              flush=True)
+            plan_dir = out / "assemblies" / assembly["label"]
+            (plan_dir / "assembly.jsonl").write_text(
+                signer.sign_line(config) + "\n")
+            products.append({"label": assembly["label"],
+                             "bits_per_weight": config["bits_per_weight"],
+                             "shards": len(shards),
+                             "signed_plan": "assembly.jsonl"})
+            print(f"assembly {assembly['label']}: "
+                  f"{config['bits_per_weight']:.3f} bpw, {len(shards)} stage shards",
+                  flush=True)
 
-    summary = {
-        "schema": "fq-msrt-campaign/1",
-        "tool": TOOL_VERSION,
-        "recipe_sha256": recipe_sha,
-        "block_size": args.block_size,
-        "moe_layers": layers,
-        "experts_per_layer": {str(k): v for k, v in experts_per_layer.items()},
-        "bases": {base["label"]: {"k": base["k"],
-                                  "manifest_sha256": base_manifests[base["label"]]}
-                  for base in recipe["bases"]},
-        "stages": {stage["label"]: {"k": stage["k"], "parent": stage["parent"],
-                                    "shards": len(digests[stage["label"]])}
-                   for stage in recipe["stages"]},
-        "assemblies": products,
-        "provenance": {
-            "attested_fragments": attested,
-            "signer_pubkey": next(iter(signers)),
-            "attestation_schema": ATTESTATION_SCHEMA,
-            "predicates": {"expert_shards": "encode-of",
-                           "skeleton_shards": "repack-of"},
-            "note": ("Every fragment carries one signed fq-attestation/1 line "
-                     "under attestations/, naming its own sha256 and the "
-                     "sha256 of each expert's contiguous byte span. Authority "
-                     "over the signing key comes from keys/FINGERPRINTS, not "
-                     "from these files."),
-        },
-        "encoded_bits_per_weight": encoded_bits_per_weight(
-            recipe, max(set(experts_per_layer.values()))),
-        "created_utc": now_utc(),
-    }
-    (out / "campaign_summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n")
-    print(f"\nFinalized {out}", flush=True)
-    return 0
+        summary = {
+            "schema": "fq-msrt-campaign/1",
+            "tool": TOOL_VERSION,
+            "recipe_sha256": recipe_sha,
+            "block_size": args.block_size,
+            "moe_layers": layers,
+            "experts_per_layer": {str(k): v for k, v in experts_per_layer.items()},
+            "bases": {base["label"]: {"k": base["k"],
+                                      "manifest_sha256": base_manifests[base["label"]]}
+                      for base in recipe["bases"]},
+            "stages": {stage["label"]: {"k": stage["k"], "parent": stage["parent"],
+                                        "shards": len(digests[stage["label"]])}
+                       for stage in recipe["stages"]},
+            "assemblies": products,
+            "provenance": {
+                "attested_fragments": attested,
+                "signer_pubkey": next(iter(signers)),
+                "attestation_schema": ATTESTATION_SCHEMA,
+                "predicates": {"expert_shards": "encode-of",
+                               "skeleton_shards": "repack-of"},
+                "note": ("Every fragment carries one signed fq-attestation/1 line "
+                         "under attestations/, naming its own sha256 and the "
+                         "sha256 of each expert's contiguous byte span. Authority "
+                         "over the signing key comes from keys/FINGERPRINTS, not "
+                         "from these files."),
+            },
+            "encoded_bits_per_weight": encoded_bits_per_weight(
+                recipe, max(set(experts_per_layer.values()))),
+            "created_utc": now_utc(),
+        }
+        (out / "campaign_summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n")
+        print(f"\nFinalized {out}", flush=True)
+        return 0
 
 
-# ── Plan ──────────────────────────────────────────────────────────────────
+    # ── Plan ──────────────────────────────────────────────────────────────────
 
 def cmd_plan(args) -> int:
     """Report the work list, staged shard reads, and product bitrates."""
@@ -2695,6 +2803,7 @@ def cmd_plan(args) -> int:
         }
     print(json.dumps(plan, indent=2))
     if args.out_plan:
+        args.out_plan.parent.mkdir(parents=True, exist_ok=True)
         args.out_plan.write_text(json.dumps(plan, indent=2) + "\n")
     return 0
 
