@@ -297,13 +297,13 @@ the second base re-ships the same skeleton content, which Hugging Face's Xet
 content-addressed storage should deduplicate, so physical WAN is likely ~2.838 TB
 (`dag`) or ~2.653 TB (`lean`). The larger numbers are the conservative ones.
 
-**Storage: 1.6 TB runs `lean`; rent 2 TB for `dag`.** `finalize` re-reads and
-re-hashes every fragment, so the whole campaign must be local at that moment.
-`lean` needs 1.146 TB plus one 150 GB source window = 1.296 TB, leaving ~304 GB
-on a 1.6 TB volume for partial files, HF/Xet caches, logs and retries. `dag`
-needs 1.482 TB, leaving only ~118 GB, which is too tight — the extra 0.4 TB costs
-~$2.67 for two days. Rolling publication deletes *source* shards, never campaign
-output. A 1 TB volume cannot run either plan.
+**Storage: 1.6 TB is a capacity fit for both; 2 TB is the prudent choice for
+`dag`.** The peaks above are the whole story — `finalize` re-reads the campaign in
+place and needs no second copy — so `lean` peaks at 1.266 TB (334 GB spare) and
+`dag` at 1.439 TB (161 GB spare). 161 GB is enough arithmetically but thin for
+partial files, logs and retries, and the extra 0.4 TB costs ~$2.67 for two days.
+Rolling publication deletes *source* shards, never campaign output. A 1 TB volume
+cannot run either plan.
 
 Throughput sufficient to hide transfer under compute is **258 Mbps** (`dag`) or
 **348 Mbps** (`lean`, whose compute window is 29% shorter for 94% of the bytes);
@@ -394,12 +394,21 @@ export HF_HUB_DISABLE_XET=1                # source staging: see below
 
 # the reviewed tree and the client, on the volume the CPU VM will inherit
 git clone https://github.com/malaiwah/progressive-tensors "$REPO"
-git -C "$REPO" checkout <the reviewed commit>
+git -C "$REPO" checkout f25536e          # or the reviewed commit you audited
 python3 -m venv /data/venv && /data/venv/bin/pip install -q \
   "$REPO"[quant] 'huggingface_hub[cli,hf_xet]'
 export PATH=/data/venv/bin:$PATH
 hf auth login                              # or export HF_TOKEN=...
-export PROXY=/data/parity-proxy            # small MoE checkpoint for gate 2
+
+# the encoder bundle: the trellis kernels every attestation pins by digest
+git clone https://github.com/turboderp-org/exllamav3 /data/exllamav3
+git -C /data/exllamav3 checkout <the build you intend to publish under>
+/data/venv/bin/pip install -q -e /data/exllamav3
+export ENC=/data/exllamav3/exllamav3
+
+# a small MoE checkpoint for the parity gate: same expert layout, 9.5 GB
+export PROXY=/data/parity-proxy
+hf download malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16 --local-dir "$PROXY"
 
 mkdir -p "$CAMPAIGN/plans" "$SRC" /data/keys
 
@@ -459,10 +468,24 @@ PHASE=finalize "$REPO/tools/msrt_campaign.sh"   # CPU phase: verify and publish
 
 It refuses to start unless `DEVICES` is set — a default would run one GPU while
 eight are billed — and unless `WINDOWS` covers every recipe layer exactly once,
-which is the one value no tool can check for itself. `PHASE=encode` (the default)
-stops after the last window with a volume-prerequisite check, so the fleet can be
-released before the CPU-only publication pass; `PHASE=finalize` needs neither a
-GPU nor the encoder bundle. Each finished window leaves a marker bound to the
+which is the one value no tool can check for itself.
+
+`PHASE=encode` (the default) stops after the last window and **refuses to let you
+release the fleet** unless the campaign, the key, the recipe, the source metadata
+and `$CAMPAIGN/campaign.env` all resolve onto the *same* filesystem, and that
+filesystem is not the instance's root disk. It writes `campaign.env` for exactly
+this reason: shell exports do not follow a volume to another machine. After the
+reattach:
+
+```bash
+source /data/glm52-msrt/campaign.env
+export PATH=/data/venv/bin:$PATH
+PHASE=finalize "$REPO/tools/msrt_campaign.sh"   # needs no GPU, no encoder bundle
+```
+
+Set `ALLOW_ROOT_CAMPAIGN=1` only for a rehearsal on a machine that has no
+separate volume; on a rental it is the check that stops you from releasing the
+instance holding your only copy. Each finished window leaves a marker bound to the
 recipe digest, revision, block size and window partition, so a rerun after a
 preemption skips completed windows instead of re-staging a terabyte, and a
 drifted rerun is refused rather than silently skipping work it never did.
@@ -664,8 +687,8 @@ world sees:
 ```bash
 export DEST=malaiwah/GLM-5.2-MSRT           # the destination repo
 export STAGING=staging                      # never publish onto main directly
-hf repos create "$DEST" --private || true   # once
-hf repos branch create "$DEST" "$STAGING" || true
+hf repos create "$DEST" --private          # once; do not mask failures
+hf repos branch create "$DEST" "$STAGING"  # a branch this campaign alone uses
 
 # per window, while the GPUs work on the next one: stages only. A base is not
 # loadable until finalize links the skeleton into it, so bases wait.
@@ -687,10 +710,9 @@ hf upload "$DEST" "$CAMPAIGN/campaign_summary.json" campaign_summary.json \
 
 # promote once, when every fragment is up. Server-side copies in a single
 # commit: no payload moves, and no consumer can observe a partial family.
-"$REPO/tools/promote_campaign.py" --repo "$DEST" --from staging \
-  --summary "$CAMPAIGN/campaign_summary.json" --check
-"$REPO/tools/promote_campaign.py" --repo "$DEST" --from staging \
-  --summary "$CAMPAIGN/campaign_summary.json"
+fq-promote-campaign --repo "$DEST" --from "$STAGING" \
+  --campaign "$CAMPAIGN" --check     # every file, name and size, or it refuses
+fq-promote-campaign --repo "$DEST" --from "$STAGING" --campaign "$CAMPAIGN"
 ```
 
 Publishing onto a staging ref and promoting once is what keeps a consumer from
@@ -729,7 +751,8 @@ Needs only `config.json` and the source index — deleted source payloads do not
 have to be restaged — but it **re-reads and re-hashes the whole campaign**
 (1.146 TB for `lean`, 1.332 TB for `dag`): a digest computed by the process that
 wrote a file proves nothing about the file that survived. **Measured 908 MB/s**
-(8.72 GB in 10.26 s, warm cache), so budget `min(908 MB/s, volume read rate)`:
+(9.32 GB — 8.68 GiB — in 10.263 s, warm cache, one core), so budget
+`min(908 MB/s, volume read rate)`:
 21 min on a 1 GB/s volume, 38 min at 500 MB/s. **Pause the GPU fleet first**;
 this pass needs no GPU.
 
