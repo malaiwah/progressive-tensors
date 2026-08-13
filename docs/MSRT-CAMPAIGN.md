@@ -41,6 +41,54 @@ bits per weight**. Nominal means trellis payload only; §3 has the actual bytes,
 which come to 14.09 bpw for the routed artifacts (the `suh`/`svh` vectors and
 scales) and 14.51 bpw with the skeleton amortised in.
 
+### 1.1 Which recipe to rent for
+
+Two of the nine products exist only to sell a **+1-bit upgrade** to a consumer
+who already installed a 3 bpw or 4 bpw product: `k2-k4like-stepped` upgrades
+`k2-k3like` for one more bit, and `k3-k5like-stepped` upgrades `k3-k4like`. They
+are the two nodes with a K1 parent that is itself K1-corrected, and they cost
+**two K1 passes**, the most expensive kind (§2).
+
+**Measured**: at the same nominal bitrate the narrow-step path is always worse
+than fetching the wider residual, on all 88 blocks of the Fruit rehearsal
+(§3.5) and on real GLM-5.2 experts:
+
+| Comparison | Fruit, 88 blocks / 2,816 experts | GLM-5.2 L40, 3 experts |
+|---|---:|---:|
+| `k2+k2r1+k2r1r1` vs `k2+k2r2` (4 bpw) | **1.0901x** worse, sigma 0.0002, 88/88 | **1.0903x** worse |
+| `k3+k3r1+k3r1r1` vs `k3+k3r2` (5 bpw) | **1.0679x** worse, sigma 0.0005, 88/88 | not measured |
+
+The proxy and the real weights agree to three decimal places, so this is a
+property of greedy residual trellis coding, not of a model. The upgrade path is
+the only thing the extra passes buy, and it buys it at 9.0%/6.8% higher error.
+
+`recipes/glm52-k2k3-lean.json` is the same menu without those two products:
+**7 passes, 12 nominal bpw, 7 products, every one of them the best available at
+its bitrate.**
+
+Both graphs were then encoded on the same clean RTX 5090, one real 32-expert
+block each, back to back (§2):
+
+| | `glm52-k2k3-dag` | `glm52-k2k3-lean` |
+|---|---:|---:|
+| Passes per matrix | 9 | **7** |
+| Products | 9 | 7 |
+| Nominal trellis bpw | 14 | **12** |
+| **Committed rate, measured** | 11.5276 s/matrix | **8.1775 s/matrix** |
+| Campaign, one RTX 5090 | 186.9 GPU-h | **132.6 GPU-h** |
+| Compute at $0.99, roofline centre | $197 | **$139** |
+| 8-GPU compute wall, roofline centre | 24.8 h | **17.6 h** |
+| Campaign on disk | 1.332 TB | **1.146 TB** |
+| Logical WAN | 2.876 TB | **2.691 TB** |
+| Throughput needed to hide I/O | 273 Mbps | 360 Mbps |
+
+**Recommendation: rent for the lean recipe.** Measured, it saves **54.3 GPU-hours
+and $58 of compute**, 7.2 h of fleet wall time and 186 GB of storage, and every
+product it ships is better than the one it drops. Choose the full graph only if a
++1-bit upgrade for an already installed 3 bpw or 4 bpw base is worth $58 and 9%
+more error on the two upgraded tiers. The rest of this runbook prices **both**:
+`$RECIPE` selects which.
+
 Every emitted fragment carries a signed `fq-attestation/1` line beside it:
 `encode-of` for expert shards, with the sha256 of each expert's contiguous byte
 range and the exact parent shard digest the residual corrects; `repack-of` for
@@ -60,100 +108,125 @@ the parent fragment this campaign actually published.
 | K2 | 0.806 | 16384 |
 | K3 | 0.674 | 8192 |
 
-Lower K is **more** expensive: the DP table is `65536 >> K` wide. The graph uses
-five K1 stages, so **K1 is 72% of campaign GPU time**.
+Lower K is **more** expensive: the DP table is `65536 >> K` wide. `dag` runs
+five K1 stages and `lean` three, so K1 is **72%** of `dag` kernel time and
+**61%** of `lean`. Any change to the graph should be priced with this table
+first; §2 shows the prediction landing within 0.2% of the measurement.
 
-**Measured** end-to-end, current code, `tile_batch=128`, clean GPU at start:
-one real 32-expert block (layer 40, experts 128–159, all 9 nodes) committed in
-**1188.4 s = 12.379 s/matrix**, of which 12.333 s/matrix is the matrix loop.
-Everything the block needs to be *done* — the nine grouped safetensors writes,
-per-expert span hashing, nine ed25519 signatures and the digest sidecars — costs
-**0.046 s/matrix, 0.37%**. Two earlier blocks of the same work measured 12.06 s
-(older unbounded tiling) and 12.30 s/matrix, both with a foreign job resident
-for part of the run, so the three runs cluster at 12.06–12.38 s/matrix.
+**Measured** end to end, one real 32-expert block (layer 40, experts 128–159,
+96 matrices), `tile_batch=128`, clean GPU, both recipes run back to back on the
+same card with the same build — the only difference is the graph:
 
-| Quantity | Value |
-|---|---:|
-| Expert-projection matrices | 58,368 (76 layers x 256 experts x 3) |
-| Routed weights | 734.44 G |
-| Passes per matrix | 9 |
-| Committed rate, measured | **12.379 s/matrix** |
-| **Whole campaign, one RTX 5090** | **200.7 GPU-hours** |
-| Same nine products, kernel time only | 19 passes, 20.47 s/matrix |
-| **DAG saving, trellis kernels** | **1.83x** (measured per-K mix) |
-| DAG saving, end to end | ~1.80x (inferred: independent encoding's own write and metadata cost is unmeasured) |
-| Bytes saved | 2.5x (14 vs 35 nominal trellis bpw) |
+| Recipe | Passes | Block | Committed | Matrix loop | Commit overhead |
+|---|---:|---:|---:|---:|---:|
+| `glm52-k2k3-dag` | 9 | 1106.6 s | **11.5276 s/matrix** | 11.4828 | 0.39% |
+| `glm52-k2k3-lean` | 7 | 785.0 s | **8.1775 s/matrix** | 8.1408 | 0.45% |
 
-The isolated kernel sum for one expert is 34.08 s (11.36 s/matrix), so the real
-loop costs ~8% more than the kernels alone: regularization, nine inverse
-transforms, eighteen MSE reductions and the device-to-host copies serialize with
-the trellis search. That gap is why the campaign figure comes from a block, not
-from the sweep.
+The measured lean/full ratio is **0.7093**; the per-K kernel mix predicts
+`7.946 / 11.182 = 0.7108`. Two independent measurements agreeing to 0.2% is why
+the per-K table can be trusted to price a graph change before running it.
+
+Everything a block needs to be *done* — the grouped safetensors writes,
+per-expert span hashing, one ed25519 signature per node and the digest sidecars
+— costs **0.04 s/matrix, under half a percent**. Three earlier blocks of the
+nine-node graph measured 12.06, 12.30 and 12.38 s/matrix with a foreign job
+resident for part of each run; the 11.53 s above is the clean-card number and
+supersedes them.
+
+Subtracting the two graphs isolates the in-loop cost of one K1 pass:
+`(11.4828 - 8.1408) / 2 = 1.671 s/matrix`, 3.3% above the 1.618 s measured in
+isolation. The remaining nodes then account for 3.13 s/matrix against an
+isolated 2.96 s. The loop therefore runs within ~5% of the sum of its kernels.
+
+| Quantity | `dag` | `lean` |
+|---|---:|---:|
+| Expert-projection matrices | 58,368 | 58,368 |
+| Routed weights | 734.44 G | 734.44 G |
+| Passes per matrix | 9 | **7** |
+| Committed rate, measured | 11.5276 s | **8.1775 s** |
+| **Campaign, one RTX 5090** | **186.9 GPU-h** | **132.6 GPU-h** |
+| Same products encoded separately, kernel only | 20.47 s/matrix | 15.44 s/matrix |
+| **Graph saving, trellis kernels** | **1.83x** | **1.94x** |
+| Nominal trellis bytes saved | 2.5x (14 vs 35 bpw) | 2.9x (12 vs 35 bpw) |
 
 Fleet projection at the live JarvisLabs spot price of $0.99/GPU-hour. A roofline
-weighting of the measured per-K mix (K1 is 72.4% of kernel time and
-memory-bound at 1.79 -> 1.60 TB/s; K2/K3 lean on SM count, 170 -> 188) puts the
-parity-card centre at `0.724 x 1.122 + 0.276 x 0.904 = 1.062`:
+weighting of the measured per-K mix (K1 is memory-bound, 1.79 -> 1.60 TB/s;
+K2/K3 lean on SM count, 170 -> 188 SMs) puts the parity-card centre at
+`0.724 x 1.122 + 0.276 x 0.904 = 1.062`:
 
-| Assumption | GPU-h | 8-GPU compute wall | Compute |
-|---|---:|---:|---:|
-| RTX PRO 6000 10% faster | 181 | 22.6 h | $179 |
-| **roofline centre (+6.2%)** | **213** | **26.6 h** | **$211** |
-| RTX PRO 6000 25% slower | 251 | 31.4 h | $248 |
+| Assumption | `dag` GPU-h | `dag` compute | `lean` GPU-h | `lean` compute |
+|---|---:|---:|---:|---:|
+| RTX PRO 6000 10% faster | 168 | $166 | 119 | $118 |
+| **roofline centre (+6.2%)** | **198** | **$197** | **141** | **$139** |
+| RTX PRO 6000 25% slower | 234 | $231 | 166 | $164 |
+
+8-GPU compute wall at the roofline centre: **24.8 h** (`dag`), **17.6 h**
+(`lean`).
 
 **Compute wall is not elapsed wall.** Nothing overlaps the first source window
-or the final output drain, and finalize (§4.6) needs 0.4–1.9 h with GPUs paused.
-Realistic elapsed time at the roofline centre and 350 Mbps is **28–31 h**.
+or the final output drain, and finalize pauses the GPUs (§4.6): **measured 908
+MB/s** of verify throughput (8.72 GB campaign re-read and re-hashed in 10.26 s,
+warm cache), so finalize is `min(908 MB/s, volume read rate)` — 21 min for the
+lean campaign on a 1 GB/s volume, 38 min at 500 MB/s. Realistic elapsed time at
+the roofline centre and 350 Mbps is **27–30 h** (`dag`) or **20–22 h** (`lean`).
 
-Budget: **$240 planning centre, $300 authorization cap** — engineering
-contingencies, not statistical bounds. Compute $179–$248; 2 TB for two days
-~$13; gates, CPU-side finalize/upload tails and one all-GPU in-flight-block redo
-$3–$10; the cap additionally covers one full 8-layer-window redo (~$21).
-A routine spot preemption with persistent storage loses at most the in-flight
-block per GPU: 2.64 GPU-h / $2.61 for all eight, not a window.
+Because the lean campaign shrinks compute by 29% but bytes by only 6%, it is the
+more I/O-bound of the two: hiding transfer under compute needs **360 Mbps**
+(`lean`) versus **273 Mbps** (`dag`).
+
+Budget for the recommended `lean` graph: **$155 planning centre, $200
+authorization cap** — engineering contingencies, not statistical bounds. Compute
+$118–$164; 1.6 TB for two days ~$10.67; gates ~$2 (one block $0.22, one 8-GPU
+layer 1.74 GPU-h/$1.73); CPU-side finalize and upload tails $3–$10. The cap
+additionally covers one full 8-layer-window redo (13.96 GPU-h, $13.82). A
+routine spot preemption with persistent storage loses at most the in-flight block
+per GPU: 1.74 GPU-h / $1.73 for all eight, not a window. For the `dag` graph add
+$54 of compute: **$210 centre, $270 cap**.
 
 Resolve the card range with the §4.0 probe. One block gives the committed rate;
-one complete layer across all eight GPUs (2.64 GPU-h, ~$2.61) gives the fleet
-rate under real storage and multi-GPU contention. The campaign figure is
-**extrapolated linearly from that gate**, not proven by it: one block samples
-kernel work on identical geometry, not shard locality, eight-process I/O, or
-sustained clocks over a day.
+one complete layer across all eight GPUs gives the fleet rate under real storage
+and multi-GPU contention. The campaign figure is **extrapolated linearly from
+that gate**, not proven by it: one block samples kernel work on identical
+geometry, not shard locality, eight-process I/O, or sustained clocks over a day.
 
 ## 3. Storage
 
-| Artifact | Size |
-|---|---:|
-| k2 base trellis | 184.6 GB |
-| k3 base trellis | 276.4 GB |
-| K1 stages (k2r1, k2r1r1, k2r2r1, k3r1, k3r1r1) | 92.8 GB each |
-| K2 stages (k2r2, k3r2) | 184.6 GB each |
-| suh/svh metadata, all 9 nodes | 8.6 GB |
-| skeleton (everything that is not a routed expert) | 37.8 GB |
-| **campaign on disk** | **1.332 TB** |
-| upload (the second base re-ships the skeleton) | 1.370 TB |
-| source download | 1.507 TB |
-| **total WAN** | **2.876 TB** |
+| Artifact | `dag` | `lean` |
+|---|---:|---:|
+| k2 base trellis | 184.6 GB | 184.6 GB |
+| k3 base trellis | 276.4 GB | 276.4 GB |
+| K1 stages, 92.8 GB each | 5 = 464.0 GB | 3 = 278.4 GB |
+| K2 stages, 184.6 GB each | 2 = 369.2 GB | 2 = 369.2 GB |
+| suh/svh metadata | 8.6 GB (9 nodes) | 6.7 GB (7 nodes) |
+| skeleton (everything not a routed expert) | 37.8 GB | 37.8 GB |
+| **campaign on disk** | **1.332 TB** | **1.146 TB** |
+| upload (the second base re-ships the skeleton) | 1.370 TB | 1.184 TB |
+| source download | 1.507 TB | 1.507 TB |
+| **total WAN** | **2.876 TB** | **2.691 TB** |
 
-Per layer, all nine nodes emit 17.0 GB in 72 block files (9 nodes x 8 blocks of
-32 experts). The campaign is 5,472 block files plus 282 skeleton shards, each
-with a digest sidecar and a signed attestation beside it.
+Per layer, `dag` emits 17.0 GB in 72 block files (9 nodes x 8 blocks of 32
+experts) and `lean` 14.6 GB in 56; the campaigns are 5,472 and 4,256 block files
+plus 282 skeleton shards, each with a digest sidecar and a signed attestation
+beside it.
 
-Actual routed bitrate is **14.09 bpw** (nominal 14 plus 8.6 GB of `suh`/`svh`
-and scales), or **14.51 bpw** with the skeleton amortised over routed weights.
-The upload figure is *logical repository bytes*: the second base re-ships the
-same skeleton content, which Hugging Face's Xet content-addressed storage should
-deduplicate, so physical WAN is likely ~2.838 TB. 2.876 TB is the conservative
-number.
+Actual routed bitrate is **14.09 bpw** for `dag` (nominal 14 plus `suh`/`svh` and
+scales) and **12.07 bpw** for `lean`, or 14.51 and 12.48 bpw with the skeleton
+amortised over routed weights. The upload figure is *logical repository bytes*:
+the second base re-ships the same skeleton content, which Hugging Face's Xet
+content-addressed storage should deduplicate, so physical WAN is likely ~2.838 TB
+(`dag`) or ~2.653 TB (`lean`). The larger numbers are the conservative ones.
 
-**Rent 2 TB of persistent storage.** Campaign payload 1.332 TB plus one 150 GB
-source window is already 1.482 TB, and `finalize` re-reads and re-hashes every
-fragment before publishing a manifest, so the whole campaign has to be local at
-that moment. 1.6 TB leaves ~118 GB for partial files, HF/Xet caches, logs and
-retries; the extra 0.4 TB costs ~$2.67 for two days. Rolling publication deletes
-*source* shards, never campaign output. A 1 TB volume cannot run this plan.
+**Storage: 1.6 TB runs `lean`; rent 2 TB for `dag`.** `finalize` re-reads and
+re-hashes every fragment, so the whole campaign must be local at that moment.
+`lean` needs 1.146 TB plus one 150 GB source window = 1.296 TB, leaving ~304 GB
+on a 1.6 TB volume for partial files, HF/Xet caches, logs and retries. `dag`
+needs 1.482 TB, leaving only ~118 GB, which is too tight — the extra 0.4 TB costs
+~$2.67 for two days. Rolling publication deletes *source* shards, never campaign
+output. A 1 TB volume cannot run either plan.
 
-Aggregate throughput of **280 Mbps** is sufficient to hide transfer under
-overlap; require **≥350 Mbps measured** before committing the fleet. Below that,
+Throughput sufficient to hide transfer under compute is **273 Mbps** (`dag`) or
+**360 Mbps** (`lean`, whose compute window is 29% shorter for 94% of the bytes);
+require **≥400 Mbps measured** before committing the fleet to `lean`. Below that,
 stage bytes on a regional filesystem with a CPU VM instead of paying GPUs to
 wait.
 
@@ -208,9 +281,9 @@ Set once:
 REPO_ID=zai-org/GLM-5.2
 REV=<40-hex-commit>                # the revision every attestation pins
 SRC=~/.cache/huggingface/hub/models--zai-org--GLM-5.2/snapshots/$REV
-CAMPAIGN=/data/glm52-msrt          # on the 2 TB volume
+CAMPAIGN=/data/glm52-msrt          # 1.6 TB volume for lean, 2 TB for dag
 KEY=~/.fq_keys/glm52-campaign.key  # NEVER inside $CAMPAIGN or $SRC
-RECIPE=recipes/glm52-k2k3-dag.json
+RECIPE=recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
 ENC=/opt/exllamav3-python/exllamav3
 ```
 
@@ -241,10 +314,14 @@ attestation pins.
    prints both `s/matrix` committed and the quantizing part of it — with §2.
    Record the SKU, power limit and sustained clocks while it runs.
 5. One complete layer across all eight GPUs, timed with external wall clock:
-   2.44 GPU-h, ~$2.41. This is the only sample that includes eight-process I/O
-   on one volume and multi-GPU contention, and it is what the campaign figure is
-   extrapolated from.
-6. Measure throughput to the hub (`hf download` one 5 GB shard): need ≥350 Mbps.
+   1.74 GPU-h / ~$1.73 for `lean` (2.46 GPU-h / $2.43 for `dag`). This is the
+   only sample that includes eight-process I/O on one volume and multi-GPU
+   contention, and it is what the campaign figure is extrapolated from.
+6. Measure throughput to the hub (`hf download` one 5 GB shard): need
+   ≥400 Mbps for `lean`, ≥350 Mbps for `dag` (§3).
+7. Run finalize on the rehearsal campaign twice. It must succeed both times:
+   finalize re-reads the whole campaign, so on the real one it is a
+   minutes-to-hours pass that has to be resumable after a preemption.
 
 ```bash
 fq-assemble-lora encode --source $SRC --recipe $RECIPE --out $CAMPAIGN \
@@ -371,10 +448,17 @@ fq-assemble-lora finalize --source $SRC --recipe $RECIPE --out $CAMPAIGN \
 ```
 
 Needs only `config.json` and the source index — deleted source payloads do not
-have to be restaged — but it **re-reads and re-hashes all 1.332 TB of campaign
-output**: a digest computed by the process that wrote a file proves nothing
-about the file that survived. Budget 0.4–1.9 h depending on volume throughput
-and **pause the GPU fleet first**; this pass needs no GPU.
+have to be restaged — but it **re-reads and re-hashes the whole campaign**
+(1.146 TB for `lean`, 1.332 TB for `dag`): a digest computed by the process that
+wrote a file proves nothing about the file that survived. **Measured 908 MB/s**
+(8.72 GB in 10.26 s, warm cache), so budget `min(908 MB/s, volume read rate)`:
+21 min on a 1 GB/s volume, 38 min at 500 MB/s. **Pause the GPU fleet first**;
+this pass needs no GPU.
+
+Finalize is **resumable**: it may be re-run any number of times on the same
+campaign, so a preemption in the middle of that pass costs only the re-read.
+(Publishing a base hardlinks the skeleton into it, and finalize accepts those
+names on re-entry while still refusing shards from any other block layout.)
 
 It fails, naming what is wrong, unless every expected block and skeleton shard
 is present, hashes to its recorded digest, carries a signed line naming those

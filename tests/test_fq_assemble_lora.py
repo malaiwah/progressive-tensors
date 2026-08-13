@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -508,6 +509,70 @@ def campaign(tmp_path: Path, monkeypatch):
     assert lora.cmd_encode(encode_args(source, recipe, out)) == 0
     assert lora.cmd_finalize(encode_args(source, recipe, out)) == 0
     return SimpleNamespace(root=out, source=source, recipe=recipe)
+
+
+def test_two_encodes_of_one_block_produce_identical_bytes(
+    tmp_path: Path, monkeypatch
+):
+    """The signed reproducibility claim, tested as bytes.
+
+    Every attestation declares a `determinism_scope` and asserts that
+    re-encoding inside it reproduces the fragment. That is only true if nothing
+    volatile reaches the hashed shard: a `created_utc` in the safetensors header
+    would make two encodes differ whenever they cross a second boundary. The
+    wall clock belongs in the attestation, which is not part of the fragment.
+    """
+    pytest.importorskip("torch")
+    source = build_source(tmp_path / "src", layers=(3, 4), experts=2)
+    recipe = write_recipe(tmp_path / "recipe.json", **DAG_RECIPE)
+    monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
+
+    shards = []
+    for run in ("a", "b"):
+        out = tmp_path / run
+        assert lora.cmd_encode(encode_args(source, recipe, out)) == 0
+        shards.append({
+            path.relative_to(out): path.read_bytes()
+            for path in sorted(out.rglob("model-*.safetensors"))
+        })
+        time.sleep(1.1)  # cross a wall-clock second between the two encodes
+
+    first, second = shards
+    assert first and set(first) == set(second)
+    differing = sorted(str(name) for name in first if first[name] != second[name])
+    assert not differing, f"encode is not byte-reproducible: {differing}"
+    # The digest sidecars must agree too, since they are what resume trusts.
+    for name in first:
+        directory = (tmp_path / "a" / name).parent
+        assert (lora.read_digest(directory, name.name)
+                == lora.read_digest((tmp_path / "b" / name).parent, name.name))
+
+
+def test_finalize_is_resumable_after_it_linked_the_skeleton(
+    campaign, monkeypatch
+):
+    """Finalize re-reads and re-hashes the whole campaign, so it can be cut off.
+
+    On a real campaign that pass is terabytes long and minutes wide. Publishing
+    a base means hardlinking every skeleton shard into it, so the second run
+    sees files in `base/<label>/` that the recipe's block list does not name.
+    Rejecting those would turn an interrupted finalize into a lost campaign.
+    """
+    monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
+    base = campaign.root / "base" / "k2"
+    skeleton = {path.name for path
+                in (campaign.root / "skeleton").glob("model-*.safetensors")}
+    linked = skeleton & {path.name for path in base.glob("model-*.safetensors")}
+    assert linked == skeleton, "finalize must publish the skeleton into the base"
+
+    args = encode_args(campaign.source, campaign.recipe, campaign.root)
+    assert lora.cmd_finalize(args) == 0
+    assert lora.cmd_finalize(args) == 0
+    # A shard from a different block layout is still refused.
+    (base / lora.block_name(3, 9)).write_bytes(
+        (base / lora.block_name(3, 0)).read_bytes())
+    with pytest.raises(lora.CartridgeError, match="does not describe"):
+        lora.cmd_finalize(args)
 
 
 def test_campaign_encodes_finalizes_and_resumes(tmp_path: Path, monkeypatch):

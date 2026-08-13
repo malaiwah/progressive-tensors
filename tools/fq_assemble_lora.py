@@ -2322,13 +2322,21 @@ def cmd_finalize(args) -> int:
         signers.add(payload["_keyid"])
         attested += 1
 
+    # A finalized base holds its own expert blocks *and* one hardlink per
+    # skeleton shard, because that is what makes it loadable. Finalize must
+    # therefore accept those names when it re-runs: a crash or preemption in the
+    # middle of a multi-terabyte finalize is a resume, not a lost campaign.
+    base_labels = {base["label"] for base in recipe["bases"]}
+    published_skeleton = {name for _d, name, _e, _g in skeleton_expected}
     for label, entries in expected.items():
         for directory, name, expect, group_kind in entries:
             check(label, directory, name, expect, group_kind)
         directory = node_dir(out, recipe, label)
-        stale = sorted(
-            path.name for path in directory.glob("model-*.safetensors")
-            if path.name not in {name for _d, name, _e, _g in entries})
+        allowed = {name for _d, name, _e, _g in entries}
+        if label in base_labels:
+            allowed |= published_skeleton
+        stale = sorted(path.name for path in directory.glob("model-*.safetensors")
+                       if path.name not in allowed)
         if stale:
             raise CartridgeError(
                 f"{directory} holds {len(stale)} shards this recipe does not "
