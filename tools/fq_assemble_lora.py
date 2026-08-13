@@ -1804,27 +1804,30 @@ def block_outputs(
 def block_claim(out: Path, layer: int, block: int):
     """Advisory single-writer claim for one (layer, block).
 
-    Two launchers pointed at one campaign would otherwise spend rented GPU
-    hours encoding the same block twice and interleave its commit markers. The
-    claim is created with ``O_EXCL``, so exactly one worker wins; the loser
-    skips the block. A crashed worker leaves its claim behind on purpose --
-    ``--devices`` clears them once, before it forks, when no worker can be
-    running.
+    Two workers on one campaign would otherwise spend rented GPU hours encoding
+    the same block twice and interleave its commit markers. Ownership is an
+    ``flock``, not the existence of a file, for one reason: the kernel releases
+    it when the owner dies, however it dies. A crashed worker therefore leaves
+    nothing to clean up, and no launcher ever has to decide whether a claim it
+    did not create is stale -- the question that let a second launcher delete a
+    live claim. The lock files are never unlinked, because unlinking a path
+    another process has already opened would hand the same block to two owners.
     """
     locks = out / "locks"
     locks.mkdir(parents=True, exist_ok=True)
     path = locks / f"layer-{layer:03d}-b{block:03d}.lock"
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        yield False
-        return
-    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False           # a live worker owns this block
+            return
+        os.truncate(handle, 0)
         os.write(handle, f"{os.getpid()}\n".encode())
-        os.close(handle)
         yield True
     finally:
-        path.unlink(missing_ok=True)
+        os.close(handle)          # the kernel drops the lock, even on SIGKILL
 
 
 CAMPAIGN_LOCK = ".fq-campaign.lock"
@@ -2157,13 +2160,9 @@ def _spawn_device_workers(args) -> int:
         base += ["--force"]
     children = []
     with campaign_lock(out, what="encode launcher"):
-        # Holding the campaign lock is what makes this safe: no other launcher
-        # can own this directory, so every claim still here is from a crash.
-        stale = sorted((out / "locks").glob("*.lock"))
-        for path in stale:
-            path.unlink()
-        if stale:
-            print(f"cleared {len(stale)} stale block claims", flush=True)
+        # Nothing to clean: a block claim is an flock, so a crashed worker's
+        # claim is already free and a live worker's claim -- even one orphaned by
+        # a killed launcher -- still holds.
         environment = {**os.environ, CAMPAIGN_LOCK_ENV: "1"}
         for index, device in enumerate(devices):
             log = logs / f"encode-{stamp}-w{index}.log"

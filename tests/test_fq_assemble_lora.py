@@ -547,18 +547,27 @@ def test_one_campaign_directory_takes_one_launcher(tmp_path: Path):
         assert after is True
 
 
-def test_a_live_block_claim_is_never_cleared_by_another_launcher(tmp_path: Path):
-    """Finalize and encode must not run against each other either."""
+def test_a_block_claim_is_ownership_not_a_leftover_file(tmp_path: Path):
+    """A crashed worker must not park a block forever, or hand it out twice.
+
+    Ownership is an flock, so the kernel frees it however the owner dies. That
+    is what removes the need for a launcher to decide whether someone else's
+    claim is stale -- the decision that let a second launcher delete a live one.
+    """
     out = tmp_path / "campaign"
     with lora.block_claim(out, 3, 0) as owned:
         assert owned is True
         with lora.block_claim(out, 3, 0) as again:
-            assert again is False
+            assert again is False          # a live owner keeps the block
         with lora.campaign_lock(out, what="encode"):
             with pytest.raises(lora.CartridgeError, match="takes one finalize"):
                 with lora.campaign_lock(out, what="finalize"):
                     pass
-    assert not sorted((out / "locks").glob("*.lock"))
+    # The file survives on purpose: unlinking a path another process already
+    # opened would give the same block to two owners.
+    assert (out / "locks" / "layer-003-b000.lock").is_file()
+    with lora.block_claim(out, 3, 0) as reclaimed:
+        assert reclaimed is True           # released, so claimable again
 
 # ── End to end, on CPU, with a stand-in quantizer ─────────────────────────
 

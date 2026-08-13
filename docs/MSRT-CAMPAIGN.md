@@ -584,19 +584,25 @@ fq-assemble-lora encode "${COMMON[@]}" "${IDENTITY[@]}" \
 `--devices` runs one single-device worker per GPU over disjoint
 `(layer, block)` work, logging to `$CAMPAIGN/logs/`. Workers have disjoint work
 and output paths — no NCCL, no shared writes — but they do share the source
-shards, the page cache and the output volume's I/O bandwidth. Each block is
-claimed with an `O_EXCL` lock, so two launchers pointed at one campaign cannot
-burn GPU hours on the same block; the launcher clears stale claims once, before
-it forks.
+shards, the page cache and the output volume's I/O bandwidth.
 
-**Run one launcher at a time, with one key.** The work split is disjoint within
-a launcher, not across launchers, and claims prevent duplicate *work* — not
-mixed *identity*. Observed in rehearsal: two launchers, each with its own
-`--sign-key`, split the 88 blocks between them and finished the whole encode;
-`finalize` then refused the campaign — `fragments are signed by 3 different
-keys` — and 82 GPU-minutes had to be re-run. Keep the key file for the life of
-the campaign, outside whatever the cleanup script deletes; a resumed run must
-publish under the signer its earlier fragments already named.
+Ownership of a block is an `flock`, not a file that exists: the kernel releases it
+however the owner dies, so a crashed worker leaves nothing to clean up and no
+launcher ever has to guess whether someone else's claim is stale. A launcher also
+takes an exclusive `flock` on the campaign directory for its whole lifetime, which
+`encode`, `skeleton` and `finalize` all respect, so two launchers cannot burn GPU
+hours on the same blocks even if the first one's parent is killed and its workers
+survive.
+
+**One campaign directory takes one launcher, and one key.** Both are now
+enforced rather than advised: the campaign `flock` refuses the second launcher,
+and the sentinel binds `signer_pubkey` so a different `--sign-key` is refused
+before any quantization. Observed in rehearsal, before either existed: two
+launchers, each with its own key, split the 88 blocks between them and finished
+the whole encode; `finalize` then refused the campaign — `fragments are signed by
+3 different keys` — and 82 GPU-minutes had to be re-run. Keep the key file for the
+life of the campaign, outside whatever the cleanup script deletes; a resumed run
+must publish under the signer its earlier fragments already named.
 
 ### 4.4 Resume after preemption
 
