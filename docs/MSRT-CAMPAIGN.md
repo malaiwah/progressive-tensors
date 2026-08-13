@@ -53,14 +53,19 @@ are the two nodes with a K1 parent that is itself K1-corrected, and they cost
 than fetching the wider residual, on all 88 blocks of the Fruit rehearsal
 (§3.5) and on real GLM-5.2 experts:
 
-| Comparison | Fruit, 88 blocks / 2,816 experts | GLM-5.2 L40, 3 experts |
+| Comparison | Fruit, 88 blocks / 2,816 experts per stage | GLM-5.2, 84 matrices |
 |---|---:|---:|
-| `k2+k2r1+k2r1r1` vs `k2+k2r2` (4 bpw) | **1.0901x** worse, sigma 0.0002, 88/88 | **1.0903x** worse |
-| `k3+k3r1+k3r1r1` vs `k3+k3r2` (5 bpw) | **1.0679x** worse, sigma 0.0005, 88/88 | not measured |
+| `k2+k2r1+k2r1r1` vs `k2+k2r2` (4 bpw) | **1.0901x** worse, sigma 0.00017, 88/88 | **1.0902x** worse, sigma 0.00022, 84/84 |
+| `k3+k3r1+k3r1r1` vs `k3+k3r2` (5 bpw) | **1.0679x** worse, sigma 0.00053, 88/88 | **1.0684x** worse, sigma 0.00044, 84/84 |
 
-The proxy and the real weights agree to three decimal places, so this is a
-property of greedy residual trellis coding, not of a model. The upgrade path is
-the only thing the extra passes buy, and it buys it at 9.0%/6.8% higher error.
+The GLM-5.2 column sweeps layers 3, 10, 19, 30, 40, 50, 60 and 70, six experts
+each, all three projections: **168 of 168 comparisons favour the wider residual**,
+and the three projections agree to four decimal places (1.07927 / 1.07937 /
+1.07935 mean over both families). The proxy and the real weights agree to three
+decimals. This is a property of greedy residual trellis coding, not of a model or
+a layer. The upgrade path is the only thing the extra passes buy, and it buys it
+at 9.0%/6.8% higher error. For reference, the wider residual alone improves on
+its base by a mean of **14.2x**.
 
 `recipes/glm52-k2k3-lean.json` is the same menu without those two products:
 **7 passes, 12 nominal bpw, 7 products, every one of them the best available at
@@ -283,7 +288,8 @@ REV=<40-hex-commit>                # the revision every attestation pins
 SRC=~/.cache/huggingface/hub/models--zai-org--GLM-5.2/snapshots/$REV
 CAMPAIGN=/data/glm52-msrt          # 1.6 TB volume for lean, 2 TB for dag
 KEY=~/.fq_keys/glm52-campaign.key  # NEVER inside $CAMPAIGN or $SRC
-RECIPE=recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
+REPO=~/progressive-tensors        # this checkout
+RECIPE=$REPO/recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
 ENC=/opt/exllamav3-python/exllamav3
 ```
 
@@ -344,10 +350,30 @@ print(" ".join(f"--include {s}" for s in shards))
 PY
 ```
 
-Feed those to
-`hf download "$REPO_ID" --revision "$REV" --include ...`. A GLM MoE layer spans
-~4 shards (~21.4 GB); an 8-layer window is ~150 GB. Stage the first window
-*before* starting the GPUs.
+Stage exactly those, and nothing else:
+
+```bash
+# from $REPO at the pinned revision, into the same snapshot tree $SRC points at
+hf download "$REPO_ID" --revision "$REV" \
+  --include config.json --include model.safetensors.index.json \
+  $(python - <<'PY'
+import json
+plan = json.load(open("window.json"))
+for shard in sorted({s for L in plan["layers"] for s in L["shards"]}):
+    print(f"--include {shard}", end=" ")
+PY
+)
+```
+
+A GLM MoE layer spans ~4 shards (~21.4 GB); an 8-layer window is ~150 GB. Stage
+the first window *before* starting the GPUs.
+
+`$SRC` must keep `config.json` and `model.safetensors.index.json` for the whole
+campaign: every later command resolves layers and experts through the index, and
+`finalize` needs nothing else from the source (verified: finalize completes with
+every payload shard deleted). This holds for an **indexed** checkpoint, which
+`zai-org/GLM-5.2` is; a source without an index would have to open shards, so
+keep the payload until finalize if you ever run one.
 
 Optional but recommended: fetch the hub's own LFS digests once and pass them as
 `--source-digests`, so the skeleton pass never re-hashes source payloads to
@@ -422,10 +448,19 @@ the skeleton into it**, so per-window uploads are staging only (use a private
 branch or a staging prefix), and the authoritative upload happens after §4.6.
 
 ```bash
-# per window: stage what is final, then delete that window's SOURCE shards
+# per window: stage what is final, then delete that window's SOURCE payload
 for path in "$CAMPAIGN"/stages/*; do
   hf upload <repo> "$path" "stages/$(basename "$path")"   # + digests, attestations
 done
+
+# reclaim the window's source bytes; NEVER touch config.json or the index
+python - <<'PY' | xargs -r rm -f --
+import json, os
+plan = json.load(open("window.json"))
+src = os.environ["SRC"]
+for shard in sorted({s for L in plan["layers"] for s in L["shards"]}):
+    print(os.path.join(src, shard))
+PY
 
 # after finalize: publish the complete base trees, including the skeleton
 # hardlinks, metadata, digests and attestations that make them loadable
