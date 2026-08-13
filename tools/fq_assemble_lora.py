@@ -12,8 +12,9 @@ directed acyclic graph of quantization tiers in one pass over the weights:
 Cartridges are full-rank additive trellis weights, not PEFT/LoRA matrices.
 Their execution pattern is LoRA-like (base GEMM plus correction GEMMs), but
 standard vLLM/SGLang ``add_lora`` APIs cannot load them without an EXL3 MSRT
-runtime implementation. The emitted ``fq-cartridge-adapter/2`` config records
-that custom contract instead of claiming standard LoRA compatibility.
+runtime implementation. The emitted ``fq-cartridge-adapter/3`` manifest binds
+the stages to exact base routed-expert bytes, declares their TP layout, and
+digest-pins every packed shard instead of claiming standard LoRA compatibility.
 
 MSRT (Multi-Stage Rescaled Trellis) is described in:
   research/fungible-quant/poc/V50-LOW-BITRATE-MSRT.md
@@ -43,6 +44,7 @@ Usage:
       --encoder-source /opt/exllamav3-python/exllamav3 --devices cuda:0,cuda:1
   python tools/fq_assemble_lora.py finalize --source S --recipe R --out O
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,9 +58,11 @@ import os
 import platform
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
@@ -83,7 +87,6 @@ from fq_repack import (
     ATTESTATION_SCHEMA,
     PROJ_ORDER,
     Signer,
-    load_source_shas,
     read_header,
 )
 
@@ -91,8 +94,10 @@ from fq_repack import (
 
 TOOL_VERSION = "fq_assemble_lora/3"
 CARTRIDGE_SCHEMA = "fq-cartridge/2"
-ADAPTER_CONFIG_SCHEMA = "fq-cartridge-adapter/2"
-ASSEMBLY_SCHEMA = "fq-cartridge-assembly/1"
+ADAPTER_CONFIG_SCHEMA = "fq-cartridge-adapter/3"
+ASSEMBLY_SCHEMA = "fq-cartridge-assembly/2"
+BASE_COMPATIBILITY_SCHEMA = "fq-msrt-base-compatibility/2"
+BASE_LAYER_COMPATIBILITY_SCHEMA = "fq-msrt-base-layer-compatibility/1"
 PLAN_SCHEMA = "fq-msrt-plan/1"
 BLOCK_SCHEMA = "fq-msrt-block/1"
 SENTINEL = ".fq-msrt-encode.json"
@@ -101,6 +106,13 @@ HADAMARD_BLOCK = 128
 MCG_MULTIPLIER = 0xCBAC1FED
 MCG_SENTINEL_SIGNED = MCG_MULTIPLIER - (1 << 32)
 RUNTIME_OPERATION = "base_exl3_gemm + sum(stage_exl3_gemm / stage_scale)"
+RUNTIME_PROFILE = "exl3-msrt-additive/1"
+BASE_RUNTIME_PROFILE = "exl3-msrt-base/1"
+TP_AXIS_BY_PROJECTION = {
+    "gate_proj": "output",
+    "up_proj": "output",
+    "down_proj": "input",
+}
 DEFAULT_BLOCK_SIZE = 32
 MAX_LAYER = 999
 # One quantize_tiles launch runs one block per tile, and its work buffers are
@@ -110,17 +122,31 @@ MAX_LAYER = 999
 # 2048-wide GLM-5.2 experts, where 256 costs 10.7% because the K1 dynamic
 # programming tables no longer fit the cache.
 TILE_BATCH = 128
-LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_SOURCE_HEADER_BYTES = 16 * 1024 * 1024
+SOURCE_STAGING_DIR = ".source-staging"
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 BF16_EXPERT_RE = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"^model\.layers\.([0-9]+)\.mlp\.experts\.([0-9]+)\."
     r"(gate_proj|up_proj|down_proj)\.weight$"
 )
-LAYER_KEY_RE = re.compile(r"^model\.layers\.(\d+)\.")
-EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+LAYER_KEY_RE = re.compile(r"^model\.layers\.([0-9]+)\.")
+EXPERT_ID_RE = re.compile(r"\.experts\.([0-9]+)\.")
+BASE_TENSOR_RE = re.compile(
+    r"^(?P<prefix>model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\."
+    r"(?P<expert>[0-9]+)\.(?P<projection>gate_proj|up_proj|down_proj))\."
+    r"rank(?P<rank>[0-9]+)\.(?P<component>trellis|suh|svh|mcg)$"
+)
 SAFETENSORS_DTYPE = {
-    "float16": "F16", "bfloat16": "BF16", "float32": "F32", "float64": "F64",
-    "int8": "I8", "int16": "I16", "int32": "I32", "int64": "I64",
-    "uint8": "U8", "bool": "BOOL",
+    "float16": "F16",
+    "bfloat16": "BF16",
+    "float32": "F32",
+    "float64": "F64",
+    "int8": "I8",
+    "int16": "I16",
+    "int32": "I32",
+    "int64": "I64",
+    "uint8": "U8",
+    "bool": "BOOL",
 }
 # Residual scale is stored per (expert, projection, stage); zero-RMS residuals
 # are floored instead of special-cased so no stage ever ships a fabricated
@@ -153,20 +179,35 @@ def require_quant_dependencies() -> None:
     if torch is None:
         raise CartridgeError(
             "MSRT encoding requires the 'quant' extra: "
-            "pip install 'progressive-tensors[quant]'")
+            "pip install 'progressive-tensors[quant]'"
+        )
     try:
         import safetensors  # noqa: F401
     except ModuleNotFoundError as exc:
         raise CartridgeError(
             "MSRT encoding requires the 'quant' extra: "
-            "pip install 'progressive-tensors[quant]'") from exc
+            "pip install 'progressive-tensors[quant]'"
+        ) from exc
 
 
 def now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def base_tensor_parallel_contract() -> dict[str, Any]:
+    """Closed metadata for a logical full-rank base sliced by the runtime."""
+    return {
+        "storage_layout": "full-rank",
+        "storage_world_size": 1,
+        "storage_ranks": [0],
+        "runtime_partitioning": "slice-full-rank",
+        "slice_alignment": HADAMARD_BLOCK,
+        "axis_by_projection": dict(TP_AXIS_BY_PROJECTION),
+    }
+
+
 # ── EXL3 Encoder Bootstrap ────────────────────────────────────────────────
+
 
 @contextmanager
 def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
@@ -184,7 +225,8 @@ def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
     if missing:
         raise CartridgeError(
             f"--encoder-source {pkg_root} is not an exllamav3 package "
-            f"(missing {missing})")
+            f"(missing {missing})"
+        )
 
     names = [
         "exllamav3",
@@ -213,11 +255,20 @@ def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
         progress = types.ModuleType("exllamav3.util.progress")
 
         class _DisabledProgress:
-            def __init__(self, *args, **kwargs): pass
-            def __enter__(self): return self
-            def __exit__(self, *args): return False
-            def update(self, *args): pass
-            def new_task(self, *args, **kwargs): pass
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def update(self, *args):
+                pass
+
+            def new_task(self, *args, **kwargs):
+                pass
 
         progress.ProgressBar = _DisabledProgress
         sys.modules["exllamav3.util.progress"] = progress
@@ -229,8 +280,7 @@ def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
 
         util = types.ModuleType("exllamav3.util")
         util.__path__ = [str(pkg_root / "util")]
-        util.cuda_sync_active = (
-            lambda *args, **kwargs:
+        util.cuda_sync_active = lambda *args, **kwargs: (
             torch.cuda.synchronize() if torch.cuda.is_available() else None
         )
         sys.modules["exllamav3.util"] = util
@@ -250,12 +300,10 @@ def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
 
         ext_mod = load("exllamav3.ext", required[0])
         had_mod = load("exllamav3.util.hadamard", required[1])
-        quant_mod = load(
-            "exllamav3.modules.quant.exl3_lib.quantize", required[2])
+        quant_mod = load("exllamav3.modules.quant.exl3_lib.quantize", required[2])
         ext = getattr(ext_mod, "exllamav3_ext", None)
         if not callable(getattr(ext, "pack_trellis", None)):
-            raise CartridgeError(
-                f"{pkg_root}: exllamav3 extension lacks pack_trellis")
+            raise CartridgeError(f"{pkg_root}: exllamav3 extension lacks pack_trellis")
         yield Encoder(
             ext=ext,
             ghd=had_mod.get_hadamard_dt,
@@ -276,6 +324,7 @@ def bootstrap_encoder(encoder_source: str, tile_batch: int = TILE_BATCH):
 
 # ── Quantization Primitives ────────────────────────────────────────────────
 
+
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     """RMS along a dimension."""
     return x.square().mean(dim=dim, keepdim=keepdim).sqrt()
@@ -285,12 +334,14 @@ def validate_quant_shape(w: torch.Tensor, *, who: str = "weight") -> tuple[int, 
     """Return a valid EXL3 matrix shape or raise a useful error."""
     if w.ndim != 2:
         raise ValueError(
-            f"{who}: expected a 2-D BF16 weight, got shape {tuple(w.shape)}")
+            f"{who}: expected a 2-D BF16 weight, got shape {tuple(w.shape)}"
+        )
     k, n = w.shape
     if k % HADAMARD_BLOCK or n % HADAMARD_BLOCK:
         raise ValueError(
             f"{who}: shape {(k, n)} must be divisible by Hadamard block "
-            f"{HADAMARD_BLOCK} on both axes")
+            f"{HADAMARD_BLOCK} on both axes"
+        )
     return k, n
 
 
@@ -331,8 +382,8 @@ def regularize_with_vectors(
 
     had_n_mat = ghd(had_n, device, torch.float, 1.0 / math.sqrt(had_n))
     transformed = (
-        transformed.view(k, n // had_n, had_n) @ had_n_mat
-    ).view(k, n).contiguous()
+        (transformed.view(k, n // had_n, had_n) @ had_n_mat).view(k, n).contiguous()
+    )
 
     in_scales = block_rms(transformed, dim=1)
     suh_sign = su_sign * (-1.0 if cbs > 0 else 1.0)
@@ -341,8 +392,8 @@ def regularize_with_vectors(
 
     had_k_mat = ghd(had_k, device, torch.float, 1.0 / math.sqrt(had_k))
     transformed = (
-        had_k_mat @ transformed.view(k // had_k, had_k, n)
-    ).view(k, n).contiguous()
+        (had_k_mat @ transformed.view(k // had_k, had_k, n)).view(k, n).contiguous()
+    )
     if not torch.isfinite(transformed).all():
         raise ValueError("regularized weight contains non-finite values")
     return transformed, suh.contiguous(), svh.contiguous()
@@ -360,16 +411,12 @@ def inverse_regularize(
     """Invert regularization using the exact serialized FP16 scale vectors."""
     k, n = validate_quant_shape(w_reg, who="reconstruction")
     had_k_mat = ghd(had_k, device, torch.float, 1.0 / math.sqrt(had_k))
-    restored = (
-        had_k_mat.transpose(0, 1)
-        @ w_reg.view(k // had_k, had_k, n)
-    ).view(k, n)
+    restored = (had_k_mat.transpose(0, 1) @ w_reg.view(k // had_k, had_k, n)).view(k, n)
     restored = restored * suh.float().unsqueeze(1)
     had_n_mat = ghd(had_n, device, torch.float, 1.0 / math.sqrt(had_n))
-    restored = (
-        restored.view(k, n // had_n, had_n)
-        @ had_n_mat.transpose(0, 1)
-    ).view(k, n)
+    restored = (restored.view(k, n // had_n, had_n) @ had_n_mat.transpose(0, 1)).view(
+        k, n
+    )
     restored = restored * svh.float().unsqueeze(0)
     return restored.contiguous()
 
@@ -378,7 +425,23 @@ def _validate_k(K: int, *, who: str = "K") -> int:
     if isinstance(K, bool) or not isinstance(K, int) or not 1 <= K <= 6:
         raise ValueError(
             f"{who} must be an integer in 1..6 (the runtime-supported trellis "
-            f"bitrates), got {K!r}")
+            f"bitrates), got {K!r}"
+        )
+    return K
+
+
+def _validate_base_k(K: int, *, who: str = "base K") -> int:
+    """Validate the uniform base bitrates implemented by the EXL3 runtime.
+
+    Residual stages support K1, but the base GEMM has no K1 profile. Keeping
+    those domains separate prevents a recipe that encodes successfully from
+    publishing a checkpoint no downstream runtime can construct.
+    """
+    if isinstance(K, bool) or not isinstance(K, int) or not 2 <= K <= 6:
+        raise ValueError(
+            f"{who} must be an integer in 2..6 (the runtime-supported base "
+            f"bitrates), got {K!r}"
+        )
     return K
 
 
@@ -398,7 +461,8 @@ def quantize_trellis_packed(
     if enc.ext is None or not callable(getattr(enc.ext, "pack_trellis", None)):
         raise RuntimeError(
             "the selected exllamav3 build lacks pack_trellis; refusing to "
-            "write raw Viterbi indices as an EXL3 checkpoint")
+            "write raw Viterbi indices as an EXL3 checkpoint"
+        )
     k, n = validate_quant_shape(data)
     tk, tn = k // 16, n // 16
     device = data.device
@@ -413,14 +477,19 @@ def quantize_trellis_packed(
         stop = min(start + blocks, tk)
         span = stop - start
         tiles = (
-            data[start * 16:stop * 16].view(span, 16, tn, 16)
-            .permute(0, 2, 1, 3).reshape(span * tn, 256)[:, perm].contiguous()
+            data[start * 16 : stop * 16]
+            .view(span, 16, tn, 16)
+            .permute(0, 2, 1, 3)
+            .reshape(span * tn, 256)[:, perm]
+            .contiguous()
         )
         quant_w, quant_idx = enc.qtf(tiles, options)
         raw[start:stop] = quant_idx.view(span, tn, 256)
-        recon[start * 16:stop * 16] = (
-            quant_w[:, perm_i].view(span, tn, 16, 16)
-            .permute(0, 2, 1, 3).reshape(span * 16, n)
+        recon[start * 16 : stop * 16] = (
+            quant_w[:, perm_i]
+            .view(span, tn, 16, 16)
+            .permute(0, 2, 1, 3)
+            .reshape(span * 16, n)
         )
     packed = torch.zeros((tk, tn, K * 16), dtype=torch.int16, device=device)
     enc.ext.pack_trellis(packed, raw, K)
@@ -448,10 +517,12 @@ def rescaled_trellis_quantize(
 
 # ── Recipe ────────────────────────────────────────────────────────────────
 
+
 def _validate_label(value: Any, *, who: str, seen: set[str]) -> str:
     if not isinstance(value, str) or not LABEL_RE.fullmatch(value):
         raise CartridgeError(
-            f"{who}: label must match {LABEL_RE.pattern}, got {value!r}")
+            f"{who}: label must match {LABEL_RE.pattern}, got {value!r}"
+        )
     if value in seen:
         raise CartridgeError(f"{who}: duplicate label {value!r}")
     seen.add(value)
@@ -461,12 +532,13 @@ def _validate_label(value: Any, *, who: str, seen: set[str]) -> str:
 def _validate_experts(value: Any, *, who: str) -> str | list[int]:
     if value == "all":
         return "all"
-    if (not isinstance(value, list) or not value
-            or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
-                   for v in value)
-            or len(set(value)) != len(value)):
-        raise CartridgeError(
-            f"{who}: experts must be 'all' or unique non-negative IDs")
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in value)
+        or len(set(value)) != len(value)
+    ):
+        raise CartridgeError(f"{who}: experts must be 'all' or unique non-negative IDs")
     return sorted(value)
 
 
@@ -487,16 +559,20 @@ def load_recipe(path: Path) -> dict[str, Any]:
         raise CartridgeError(f"{path}: recipe must be a JSON object")
     if recipe.get("schema") != CARTRIDGE_SCHEMA:
         raise CartridgeError(
-            f"{path}: schema must be {CARTRIDGE_SCHEMA!r}, "
-            f"got {recipe.get('schema')!r}")
+            f"{path}: schema must be {CARTRIDGE_SCHEMA!r}, got {recipe.get('schema')!r}"
+        )
 
     layers = recipe.get("moe_layers")
-    if (not isinstance(layers, list) or not layers
-            or any(isinstance(v, bool) or not isinstance(v, int)
-                   or not 0 <= v <= MAX_LAYER for v in layers)
-            or len(set(layers)) != len(layers)):
-        raise CartridgeError(
-            f"moe_layers must be unique integers in 0..{MAX_LAYER}")
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or any(
+            isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= MAX_LAYER
+            for v in layers
+        )
+        or len(set(layers)) != len(layers)
+    ):
+        raise CartridgeError(f"moe_layers must be unique integers in 0..{MAX_LAYER}")
     recipe["moe_layers"] = sorted(layers)
 
     bases = recipe.get("bases")
@@ -508,12 +584,13 @@ def load_recipe(path: Path) -> dict[str, Any]:
         if not isinstance(base, dict):
             raise CartridgeError(f"base {index}: must be an object")
         label = _validate_label(base.get("label"), who=f"base {index}", seen=labels)
-        _validate_k(base.get("k"), who=f"base {label!r} k")
+        _validate_base_k(base.get("k"), who=f"base {label!r} k")
         # A base tier is a complete checkpoint: it must cover every expert.
         if base.get("experts", "all") != "all":
             raise CartridgeError(
                 f"base {label!r}: bases cover all experts; move a partial "
-                f"tier into stages")
+                f"tier into stages"
+            )
         base["experts"] = "all"
         experts_by_label[label] = "all"
 
@@ -529,12 +606,14 @@ def load_recipe(path: Path) -> dict[str, Any]:
         if parent not in experts_by_label:
             raise CartridgeError(
                 f"stage {label!r}: parent {parent!r} is not a base or an "
-                f"earlier stage; stages must be listed parent-first")
+                f"earlier stage; stages must be listed parent-first"
+            )
         experts = _validate_experts(stage.get("experts"), who=f"stage {label!r}")
         if not _covers(experts_by_label[parent], experts):
             raise CartridgeError(
                 f"stage {label!r}: experts must be a subset of parent "
-                f"{parent!r}; a residual cannot correct a tier that is absent")
+                f"{parent!r}; a residual cannot correct a tier that is absent"
+            )
         stage["experts"] = experts
         experts_by_label[label] = experts
 
@@ -548,23 +627,28 @@ def load_recipe(path: Path) -> dict[str, Any]:
         if not isinstance(assembly, dict):
             raise CartridgeError(f"assembly {index}: must be an object")
         label = _validate_label(
-            assembly.get("label"), who=f"assembly {index}", seen=assembly_labels)
+            assembly.get("label"), who=f"assembly {index}", seen=assembly_labels
+        )
         base = assembly.get("base")
         if base not in base_labels:
             raise CartridgeError(f"assembly {label!r}: base {base!r} is not declared")
         chain = assembly.get("chain", [])
-        if (not isinstance(chain, list)
-                or len(set(chain)) != len(chain)
-                or any(name not in stage_by_label for name in chain)):
+        if (
+            not isinstance(chain, list)
+            or len(set(chain)) != len(chain)
+            or any(name not in stage_by_label for name in chain)
+        ):
             raise CartridgeError(
-                f"assembly {label!r}: chain must be unique declared stage labels")
+                f"assembly {label!r}: chain must be unique declared stage labels"
+            )
         expected = base
         for name in chain:
             if stage_by_label[name]["parent"] != expected:
                 raise CartridgeError(
                     f"assembly {label!r}: stage {name!r} corrects "
                     f"{stage_by_label[name]['parent']!r}, not {expected!r}; a "
-                    f"chain must be one path through the recipe graph")
+                    f"chain must be one path through the recipe graph"
+                )
             expected = name
         assembly["chain"] = list(chain)
     recipe["assemblies"] = assemblies
@@ -573,16 +657,18 @@ def load_recipe(path: Path) -> dict[str, Any]:
 
 def node_index(recipe: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """label -> node, for bases and stages alike."""
-    return {node["label"]: node
-            for node in [*recipe["bases"], *recipe["stages"]]}
+    return {node["label"]: node for node in [*recipe["bases"], *recipe["stages"]]}
 
 
 def stages_for_expert(
     stages: list[dict[str, Any]], expert_id: int
 ) -> list[dict[str, Any]]:
     """Resolve stage applicability before residual chaining begins."""
-    return [stage for stage in stages
-            if stage["experts"] == "all" or expert_id in stage["experts"]]
+    return [
+        stage
+        for stage in stages
+        if stage["experts"] == "all" or expert_id in stage["experts"]
+    ]
 
 
 def selected_count(node: dict[str, Any], expert_count: int) -> int:
@@ -606,11 +692,14 @@ def assembly_bpw(
 def encoded_bits_per_weight(recipe: dict[str, Any], expert_count: int) -> float:
     """Bits emitted per source weight for the whole recipe graph."""
     nodes = node_index(recipe)
-    return sum(node["k"] * selected_count(node, expert_count)
-               for node in nodes.values()) / expert_count
+    return (
+        sum(node["k"] * selected_count(node, expert_count) for node in nodes.values())
+        / expert_count
+    )
 
 
 # ── Encoding Pipeline ─────────────────────────────────────────────────────
+
 
 def encode_matrix_dag(
     w_bf16: torch.Tensor,
@@ -634,8 +723,9 @@ def encode_matrix_dag(
     recon: dict[str, torch.Tensor] = {}
     nodes: dict[str, dict[str, Any]] = {}
 
-    def record(label: str, packed: torch.Tensor, current: torch.Tensor,
-               scale: float | None) -> None:
+    def record(
+        label: str, packed: torch.Tensor, current: torch.Tensor, scale: float | None
+    ) -> None:
         restored = inverse_regularize(current, suh, svh, device, enc.ghd)
         nodes[label] = {
             "trellis": packed.cpu(),
@@ -660,10 +750,12 @@ def encode_matrix_dag(
         parent = stage["parent"]
         if parent not in recon:
             raise CartridgeError(
-                f"stage {stage['label']!r}: parent {parent!r} was not encoded")
+                f"stage {stage['label']!r}: parent {parent!r} was not encoded"
+            )
         parent_recon = recon[parent]
         current, packed, scale = rescaled_trellis_quantize(
-            parent_recon, w_reg - parent_recon, stage["k"], enc)
+            parent_recon, w_reg - parent_recon, stage["k"], enc
+        )
         record(stage["label"], packed, current, scale)
         del packed
         remaining[parent] -= 1
@@ -677,6 +769,7 @@ def encode_matrix_dag(
 
 
 # ── Source Checkpoint ─────────────────────────────────────────────────────
+
 
 class SourceCheckpoint:
     """Random-access reader for a BF16 checkpoint in either supported layout.
@@ -701,6 +794,8 @@ class SourceCheckpoint:
             raise CartridgeError(f"--source {self.root} has no config.json")
         self.max_open = max_open
         self._open: OrderedDict[str, Any] = OrderedDict()
+        self._staged_paths: dict[str, Path] = {}
+        self._header_keys: dict[str, tuple[str, ...]] = {}
         self._layer_keys: dict[int, dict[str, str]] = {}
         index = self.root / "model.safetensors.index.json"
         if index.is_file():
@@ -717,14 +812,17 @@ class SourceCheckpoint:
                 if not isinstance(key, str) or not isinstance(shard, str):
                     raise CartridgeError(f"{index}: non-string weight map entry")
                 relative = PurePosixPath(shard)
-                if (relative.is_absolute() or ".." in relative.parts
-                        or not shard.endswith(".safetensors")):
-                    raise CartridgeError(
-                        f"{index}: unsafe shard path {shard!r}")
-            missing = sorted({
-                shard for shard in set(weight_map.values())
-                if not (self.root / shard).is_file()
-            })
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or not shard.endswith(".safetensors")
+                ):
+                    raise CartridgeError(f"{index}: unsafe shard path {shard!r}")
+            missing = sorted(
+                shard
+                for shard in set(weight_map.values())
+                if not self._source_entry_exists(shard)
+            )
             self.layout = self.INDEXED
             self.weight_map: dict[str, str] = weight_map
             self.absent_shards = missing
@@ -733,7 +831,8 @@ class SourceCheckpoint:
             if not shards:
                 raise CartridgeError(
                     f"--source {self.root} has neither "
-                    f"model.safetensors.index.json nor per-layer shards")
+                    f"model.safetensors.index.json nor per-layer shards"
+                )
             self.layout = self.PER_LAYER
             self.weight_map = {}
             self.absent_shards = []
@@ -752,25 +851,235 @@ class SourceCheckpoint:
         cached = getattr(self, "_topology_id", None)
         if cached is None:
             if self.layout == self.INDEXED:
-                rows = [f"{key}\t{shard}"
-                        for key, shard in sorted(self.weight_map.items())]
+                rows = [
+                    f"{key}\t{shard}" for key, shard in sorted(self.weight_map.items())
+                ]
             else:
                 rows = sorted(
-                    path.name for path in
-                    self.root.glob("model-layer-*.safetensors"))
+                    path.name for path in self.root.glob("model-layer-*.safetensors")
+                )
             digest = hashlib.sha256("\n".join(rows).encode()).hexdigest()
             cached = self._topology_id = digest
         return cached
 
     # -- handles ---------------------------------------------------------
+    def _source_path(self, shard: str) -> Path:
+        if not isinstance(shard, str):
+            raise CartridgeError(f"source shard name must be a string, got {shard!r}")
+        relative = PurePosixPath(shard)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not shard.endswith(".safetensors")
+        ):
+            raise CartridgeError(f"unsafe source shard path {shard!r}")
+        return self.root.joinpath(*relative.parts)
+
+    def _source_entry_exists(self, shard: str) -> bool:
+        """Only ENOENT means absent; unsafe existing objects fail when opened."""
+        try:
+            os.lstat(self._source_path(shard))
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CartridgeError(f"cannot inspect source shard {shard}: {exc}") from exc
+        return True
+
+    @staticmethod
+    def _identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    def _open_source_regular(self, shard: str) -> tuple[int, os.stat_result]:
+        path = self._source_path(shard)
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise CartridgeError(f"source shard {shard} is missing") from exc
+        except OSError as exc:
+            raise CartridgeError(f"cannot resolve source shard {shard}: {exc}") from exc
+        if path.absolute() != resolved or (
+            resolved != self.root and self.root not in resolved.parents
+        ):
+            # Equality with the lexical absolute path closes both final-
+            # component and parent-directory symlinks while retaining safe
+            # nested relative paths from a standard checkpoint index.
+            raise CartridgeError(
+                f"source shard {shard} must be a direct, non-symlink regular file"
+            )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise CartridgeError(
+                f"cannot safely open source shard {shard}: {exc}"
+            ) from exc
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 8:
+            os.close(descriptor)
+            raise CartridgeError(
+                f"source shard {shard} must be a non-empty regular file"
+            )
+        return descriptor, info
+
+    def _read_source_header_keys(self, shard: str) -> tuple[str, ...]:
+        cached = self._header_keys.get(shard)
+        if cached is not None:
+            return cached
+        descriptor, before = self._open_source_regular(shard)
+        try:
+            prefix = os.read(descriptor, 8)
+            if len(prefix) != 8:
+                raise CartridgeError(f"source shard {shard} has a truncated prefix")
+            header_size = struct.unpack("<Q", prefix)[0]
+            if (
+                not 0 < header_size <= MAX_SOURCE_HEADER_BYTES
+                or 8 + header_size > before.st_size
+            ):
+                raise CartridgeError(
+                    f"source shard {shard} header exceeds the "
+                    f"{MAX_SOURCE_HEADER_BYTES}-byte topology limit"
+                )
+            raw = bytearray()
+            while len(raw) < header_size:
+                chunk = os.read(descriptor, header_size - len(raw))
+                if not chunk:
+                    raise CartridgeError(
+                        f"source shard {shard} has a truncated safetensors header"
+                    )
+                raw.extend(chunk)
+            after = os.fstat(descriptor)
+            if self._identity(before) != self._identity(after):
+                raise CartridgeError(
+                    f"source shard {shard} changed while its topology was read"
+                )
+        finally:
+            os.close(descriptor)
+        try:
+            header = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CartridgeError(
+                f"source shard {shard} has an invalid safetensors header"
+            ) from exc
+        if not isinstance(header, dict):
+            raise CartridgeError(f"source shard {shard} header must be an object")
+        header.pop("__metadata__", None)
+        if not header or any(not isinstance(key, str) for key in header):
+            raise CartridgeError(f"source shard {shard} has no usable tensor keys")
+        cached = tuple(header)
+        self._header_keys[shard] = cached
+        return cached
+
+    def _copy_source_regular(self, shard: str, destination: Path) -> tuple[str, int]:
+        descriptor, before = self._open_source_regular(shard)
+        output = None
+        try:
+            output = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            os.fchmod(output, 0o600)
+            digest = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(8 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise CartridgeError(
+                        f"source shard {shard} was truncated while staging"
+                    )
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(output, view)
+                    if written <= 0:
+                        raise OSError("short write while staging a source shard")
+                    view = view[written:]
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise CartridgeError(f"source shard {shard} grew while staging")
+            after = os.fstat(descriptor)
+            if self._identity(before) != self._identity(after):
+                raise CartridgeError(f"source shard {shard} changed while staging")
+            os.fsync(output)
+            return digest.hexdigest(), before.st_size
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            if output is not None:
+                os.close(output)
+            os.close(descriptor)
+
+    @contextmanager
+    def stage_shards(self, shards: set[str] | list[str], out: Path, registry: Any):
+        """Yield observed digests while all tensor reads use private copies."""
+        names = sorted(set(shards))
+        if not names:
+            raise CartridgeError("cannot stage an empty source shard set")
+        overlap = set(names) & set(self._staged_paths)
+        if overlap:
+            raise CartridgeError(f"source shards are already staged: {sorted(overlap)}")
+        parent = Path(out) / SOURCE_STAGING_DIR
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            raise CartridgeError(f"{parent}: source staging root must be a directory")
+        os.chmod(parent, 0o700)
+        observed: dict[str, str] = {}
+        with tempfile.TemporaryDirectory(prefix="txn-", dir=parent) as temporary:
+            transaction = Path(temporary)
+            os.chmod(transaction, 0o700)
+            try:
+                for index, shard in enumerate(names):
+                    staged = transaction / f"{index:06d}.safetensors"
+                    digest, _size = self._copy_source_regular(shard, staged)
+                    expected = registry.expected(shard)
+                    if expected is not None and expected != digest:
+                        raise CartridgeError(
+                            f"source shard {shard} hashes {digest}, not expected "
+                            f"{expected}; refusing to attest other bytes"
+                        )
+                    observed[shard] = digest
+                    self._staged_paths[shard] = staged
+
+                # Deserialize only private bytes, and reconcile any topology
+                # header inspected while planning with the exact staged file.
+                for shard in names:
+                    staged_keys = tuple(self._handle(shard).keys())
+                    planned = self._header_keys.get(shard)
+                    if planned is not None and set(staged_keys) != set(planned):
+                        raise CartridgeError(
+                            f"source shard {shard} topology changed before staging"
+                        )
+                registry.record_many(observed)
+                yield dict(observed)
+            finally:
+                for shard in names:
+                    handle = self._open.pop(shard, None)
+                    if handle is not None:
+                        handle.__exit__(None, None, None)
+                    self._staged_paths.pop(shard, None)
+
     def _handle(self, shard: str):
         handle = self._open.get(shard)
         if handle is None:
             from safetensors import safe_open
 
-            path = self.root / shard
-            if not path.is_file():
-                raise CartridgeError(f"source shard {shard} is missing")
+            path = self._staged_paths.get(shard)
+            if path is None:
+                raise CartridgeError(
+                    f"source shard {shard} tensor access requires private staging"
+                )
             handle = safe_open(str(path), framework="pt")
             handle.__enter__()
             self._open[shard] = handle
@@ -782,7 +1091,9 @@ class SourceCheckpoint:
         return handle
 
     def keys_in_shard(self, shard: str) -> list[str]:
-        return list(self._handle(shard).keys())
+        if shard in self._staged_paths:
+            return list(self._handle(shard).keys())
+        return list(self._read_source_header_keys(shard))
 
     def tensor(self, shard: str, key: str):
         return self._handle(shard).get_tensor(key)
@@ -801,7 +1112,19 @@ class SourceCheckpoint:
 
     # -- topology --------------------------------------------------------
     def layer_shard(self, layer: int) -> str:
-        return resolve_layer_shards(self.root, [layer])[layer].name
+        candidates = [
+            name
+            for width in (3, 4)
+            if self._source_entry_exists(
+                name := f"model-layer-{layer:0{width}d}.safetensors"
+            )
+        ]
+        if len(candidates) != 1:
+            raise CartridgeError(
+                f"layer {layer}: expected exactly one per-layer shard in "
+                f"{self.root}, found {candidates}"
+            )
+        return candidates[0]
 
     def layer_keys(self, layer: int) -> dict[str, str]:
         """key -> shard for every tensor of one layer."""
@@ -810,19 +1133,24 @@ class SourceCheckpoint:
             return cached
         if self.layout == self.INDEXED:
             prefix = f"model.layers.{layer}."
-            keys = {key: shard for key, shard in self.weight_map.items()
-                    if key.startswith(prefix)}
+            keys = {
+                key: shard
+                for key, shard in self.weight_map.items()
+                if key.startswith(prefix)
+            }
         else:
             shard = self.layer_shard(layer)
             keys = {key: shard for key in self.keys_in_shard(shard)}
             foreign = sorted(
-                key for key in keys
-                if (match := LAYER_KEY_RE.match(key))
-                and int(match.group(1)) != layer)
+                key
+                for key in keys
+                if (match := LAYER_KEY_RE.match(key)) and int(match.group(1)) != layer
+            )
             if foreign:
                 raise CartridgeError(
                     f"layer {layer} shard {shard} also contains tensors for "
-                    f"other layers, e.g. {foreign[:3]}")
+                    f"other layers, e.g. {foreign[:3]}"
+                )
         if not keys:
             raise CartridgeError(f"layer {layer}: no tensors found in {self.root}")
         self._layer_keys[layer] = keys
@@ -845,8 +1173,8 @@ class SourceCheckpoint:
     def experts(self, layer: int) -> dict[int, dict[str, str]]:
         """expert -> projection -> key, validated for exact coverage."""
         return inspect_source_layer(
-            list(self.layer_keys(layer)), layer,
-            declared=self.declared_experts)
+            list(self.layer_keys(layer)), layer, declared=self.declared_experts
+        )
 
     def shard_bytes(self, shards: set[str]) -> dict[str, int]:
         out = {}
@@ -864,17 +1192,22 @@ def resolve_layer_shards(source: Path, layers: list[int]) -> dict[int, Path]:
     resolved: dict[int, Path] = {}
     for layer in layers:
         found = [
-            path for path in
-            (root / f"model-layer-{layer:0{width}d}.safetensors"
-             for width in (3, 4))
+            path
+            for path in (
+                root / f"model-layer-{layer:0{width}d}.safetensors" for width in (3, 4)
+            )
             if path.is_file()
         ]
         if len(found) != 1:
-            detail = (f"ambiguous candidates {[p.name for p in found]}" if found
-                      else "standard Hugging Face indexed shards are supported "
-                           "by the encoder, but this caller needs per-layer shards")
+            detail = (
+                f"ambiguous candidates {[p.name for p in found]}"
+                if found
+                else "standard Hugging Face indexed shards are supported "
+                "by the encoder, but this caller needs per-layer shards"
+            )
             raise CartridgeError(
-                f"layer {layer}: shard not resolved in {root}; {detail}")
+                f"layer {layer}: shard not resolved in {root}; {detail}"
+            )
         resolved[layer] = found[0]
     return resolved
 
@@ -889,24 +1222,31 @@ def inspect_source_layer(
         if not match:
             continue
         key_layer, expert, projection = (
-            int(match.group(1)), int(match.group(2)), match.group(3))
+            int(match.group(1)),
+            int(match.group(2)),
+            match.group(3),
+        )
         if key_layer != layer:
             raise CartridgeError(
-                f"layer {layer} shard also contains BF16 expert tensor {key}")
+                f"layer {layer} shard also contains BF16 expert tensor {key}"
+            )
         if projection in experts.setdefault(expert, {}):
             raise CartridgeError(
-                f"layer {layer} expert {expert}: duplicate {projection}")
+                f"layer {layer} expert {expert}: duplicate {projection}"
+            )
         experts[expert][projection] = key
     if not experts:
         raise CartridgeError(
-            f"layer {layer}: no BF16 routed expert .weight tensors found")
+            f"layer {layer}: no BF16 routed expert .weight tensors found"
+        )
     expected = set(PROJECTIONS)
     for expert, projections in experts.items():
         have = set(projections)
         if have != expected:
             raise CartridgeError(
                 f"layer {layer} expert {expert}: projections "
-                f"{sorted(have)} != {sorted(expected)}")
+                f"{sorted(have)} != {sorted(expected)}"
+            )
     # tier_bitmap.json and hybrid_tr3_tail.experts_per_layer describe a layer
     # by expert *count*, and the loader indexes rows positionally, so a sparse
     # or shifted id set would misstate what the checkpoint contains.
@@ -915,11 +1255,13 @@ def inspect_source_layer(
         raise CartridgeError(
             f"layer {layer}: routed expert ids are not dense 0..{len(ids) - 1} "
             f"(got {ids[:4]}...{ids[-1]}); positional loader metadata cannot "
-            f"describe that")
+            f"describe that"
+        )
     if declared is not None and len(ids) != declared:
         raise CartridgeError(
             f"layer {layer}: found {len(ids)} routed experts but config.json "
-            f"declares n_routed_experts={declared}")
+            f"declares n_routed_experts={declared}"
+        )
     return experts
 
 
@@ -928,11 +1270,11 @@ def expert_blocks(expert_ids: list[int], block_size: int) -> list[list[int]]:
     if block_size < 1:
         raise CartridgeError("--block-size must be positive")
     ordered = sorted(expert_ids)
-    return [ordered[i:i + block_size]
-            for i in range(0, len(ordered), block_size)]
+    return [ordered[i : i + block_size] for i in range(0, len(ordered), block_size)]
 
 
 # ── Output Layout ─────────────────────────────────────────────────────────
+
 
 def block_name(layer: int, block: int) -> str:
     """Flat, loader-friendly shard name for one (layer, expert block)."""
@@ -952,7 +1294,9 @@ def digest_path(directory: Path, name: str) -> Path:
 
 
 def save_shard_tensors(
-    tensors: dict[str, torch.Tensor], directory: Path, name: str,
+    tensors: dict[str, torch.Tensor],
+    directory: Path,
+    name: str,
     metadata: dict[str, str] | None = None,
 ) -> Path:
     """Validate and write one safetensors shard through a temporary name.
@@ -977,6 +1321,7 @@ def save_shard_tensors(
 
 # ── Provenance ────────────────────────────────────────────────────────────
 
+
 def attestation_path(directory: Path, name: str) -> Path:
     """Provenance lives *inside* the node directory it describes.
 
@@ -1000,14 +1345,12 @@ def infer_source_identity(root: Path) -> tuple[str | None, str | None]:
     repo = None
     for parent in root.parents:
         if parent.name.startswith("models--"):
-            repo = parent.name[len("models--"):].replace("--", "/")
+            repo = parent.name[len("models--") :].replace("--", "/")
             break
     return repo, revision
 
 
-def encoder_identity(
-    root: Path, modules: list[Path], ext: Any
-) -> dict[str, Any]:
+def encoder_identity(root: Path, modules: list[Path], ext: Any) -> dict[str, Any]:
     """Digest the exact encoder bundle that produced a shard's bytes.
 
     Both the Python modules this tool executes and the compiled extension that
@@ -1015,15 +1358,13 @@ def encoder_identity(
     emits, so an attestation that pinned only the Python side would claim
     reproducibility it cannot deliver.
     """
-    files = {
-        path.relative_to(root).as_posix(): sha256_file(path)
-        for path in modules
-    }
+    files = {path.relative_to(root).as_posix(): sha256_file(path) for path in modules}
     binary = getattr(ext, "__file__", None)
     if not binary or not Path(binary).is_file():
         raise CartridgeError(
             "cannot locate the compiled exllamav3 extension; an encode-of "
-            "attestation must pin the binary that produced the bytes")
+            "attestation must pin the binary that produced the bytes"
+        )
     files[Path(binary).name] = sha256_file(Path(binary))
     return {
         "encoder": "exllamav3",
@@ -1043,9 +1384,11 @@ def determinism_scope(device: torch.device, tile_batch: int) -> dict[str, Any]:
         "cuda": torch.version.cuda,
         "python": platform.python_version(),
         "tile_batch": tile_batch,
-        "note": ("Trellis search is deterministic for a fixed encoder build, "
-                 "GPU architecture and library stack. Across stacks the "
-                 "honest claim is measured equivalence, not byte identity."),
+        "note": (
+            "Trellis search is deterministic for a fixed encoder build, "
+            "GPU architecture and library stack. Across stacks the "
+            "honest claim is measured equivalence, not byte identity."
+        ),
     }
     if device.type == "cuda":
         scope["gpu"] = torch.cuda.get_device_name(device)
@@ -1075,13 +1418,91 @@ def capture_evidence(
         "hadamard_block": HADAMARD_BLOCK,
         "codebook": "mcg",
         "codebook_scale": float(cbs),
-        "note": ("No calibration corpus or Hessian is used; these are the "
-                 "deterministic encode inputs instead."),
+        "note": (
+            "No calibration corpus or Hessian is used; these are the "
+            "deterministic encode inputs instead."
+        ),
     }
     fingerprint = hashlib.sha256(
         json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return fingerprint, descriptor
+
+
+def validate_source_digest_map(raw: Any, *, where: Any) -> dict[str, str]:
+    """Validate every declared source digest; never silently drop a claim."""
+    if not isinstance(raw, dict):
+        raise CartridgeError(f"{where}: source digests must be an object")
+    result: dict[str, str] = {}
+    for name, digest in raw.items():
+        relative = PurePosixPath(name) if isinstance(name, str) else None
+        if (
+            not isinstance(name, str)
+            or not name
+            or relative is None
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise CartridgeError(f"{where}: invalid source digest entry {name!r}")
+        result[name] = digest
+    if not result:
+        raise CartridgeError(f"{where}: no sha256 digests found")
+    return result
+
+
+def load_source_manifest_digests(snapshot: Path) -> dict[str, str]:
+    """Read a source MANIFEST strictly; malformed claims are not advisory."""
+    path = Path(snapshot) / "MANIFEST.sha256"
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise CartridgeError(f"cannot safely open {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE_HEADER_BYTES:
+            raise CartridgeError(f"{path}: must be a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1 << 20, remaining))
+            if not chunk:
+                raise CartridgeError(f"{path}: changed while read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1) or SourceCheckpoint._identity(
+            before
+        ) != SourceCheckpoint._identity(os.fstat(descriptor)):
+            raise CartridgeError(f"{path}: changed while read")
+    finally:
+        os.close(descriptor)
+    try:
+        lines = b"".join(chunks).decode().splitlines()
+    except UnicodeDecodeError as exc:
+        raise CartridgeError(f"{path}: is not UTF-8") from exc
+    claims: dict[str, str] = {}
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})[ \t]+\*?(.+)", line)
+        if match is None:
+            raise CartridgeError(f"{path}:{line_number}: malformed sha256 claim")
+        digest, name = match.groups()
+        if name in claims:
+            raise CartridgeError(f"{path}:{line_number}: duplicate claim for {name!r}")
+        claims[name] = digest
+    if not claims:
+        raise CartridgeError(f"{path}: no sha256 digests found")
+    return validate_source_digest_map(claims, where=path)
 
 
 def load_digest_map(path: Path | None) -> dict[str, str]:
@@ -1098,57 +1519,201 @@ def load_digest_map(path: Path | None) -> dict[str, str]:
         raw = json.loads(Path(path).expanduser().read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise CartridgeError(f"{path}: unreadable digest map ({exc})") from exc
-    if isinstance(raw, list):  # an HF tree listing, passed through untouched
-        raw = {entry["path"]: (entry.get("lfs") or {}).get("oid")
-               for entry in raw if isinstance(entry, dict) and entry.get("path")}
+    if isinstance(raw, list):  # an HF API tree listing
+        digests: dict[str, Any] = {}
+        for index, entry in enumerate(raw):
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                raise CartridgeError(f"{path}: invalid HF tree entry {index}")
+            name = entry["path"]
+            if not name.endswith(".safetensors"):
+                continue
+            lfs = entry.get("lfs")
+            digest = lfs.get("oid") if isinstance(lfs, dict) else None
+            if name in digests:
+                raise CartridgeError(f"{path}: duplicate source digest for {name!r}")
+            digests[name] = digest
+        raw = digests
     if not isinstance(raw, dict):
         raise CartridgeError(f"{path}: expected an object of file -> sha256")
-    digests = {name: value for name, value in raw.items()
-               if isinstance(value, str) and len(value) == 64}
-    if not digests:
-        raise CartridgeError(f"{path}: no sha256 digests found")
-    return digests
+    return validate_source_digest_map(raw, where=path)
+
+
+class SourceDigestRegistry:
+    """External expectations plus locally observed, concurrency-safe digests.
+
+    A manifest, operator map, or prior cache entry is only an expectation. The
+    value published in an attestation always comes from the same source-file fd
+    copied into private staging for tensor deserialization.
+    """
+
+    def __init__(
+        self,
+        source: SourceCheckpoint,
+        out: Path,
+        supplied: dict[str, str] | None = None,
+    ) -> None:
+        self.source = source
+        self.out = Path(out)
+        self.cache_path = self.out / "source-digests.json"
+        self.lock_path = self.out / ".source-digests.lock"
+        manifest = load_source_manifest_digests(source.root)
+        supplied = self._validate_map(
+            dict(supplied or {}), where=Path("--source-digests")
+        )
+        conflicts = {
+            name: (manifest[name], supplied[name])
+            for name in manifest.keys() & supplied.keys()
+            if manifest[name] != supplied[name]
+        }
+        if conflicts:
+            name, values = min(conflicts.items())
+            raise CartridgeError(
+                f"source digest claims conflict for {name}: manifest "
+                f"{values[0]} != supplied {values[1]}"
+            )
+        self.external = {**manifest, **supplied}
+        self.cache = self._read_cache()
+        for name in self.external.keys() & self.cache.keys():
+            if self.external[name] != self.cache[name]:
+                raise CartridgeError(
+                    f"source digest cache for {name} is {self.cache[name]}, not "
+                    f"the expected {self.external[name]}"
+                )
+
+    @staticmethod
+    def _validate_map(raw: Any, *, where: Path) -> dict[str, str]:
+        if raw == {}:
+            return {}
+        return validate_source_digest_map(raw, where=where)
+
+    def _read_cache(self) -> dict[str, str]:
+        try:
+            descriptor = os.open(
+                self.cache_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise CartridgeError(f"cannot open {self.cache_path}: {exc}") from exc
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size > MAX_SOURCE_HEADER_BYTES
+            ):
+                raise CartridgeError(
+                    f"{self.cache_path}: must be a bounded regular file"
+                )
+            chunks: list[bytes] = []
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(1 << 20, remaining))
+                if not chunk:
+                    raise CartridgeError(f"{self.cache_path}: changed while read")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1) or SourceCheckpoint._identity(
+                before
+            ) != SourceCheckpoint._identity(os.fstat(descriptor)):
+                raise CartridgeError(f"{self.cache_path}: changed while read")
+            return self._validate_map(
+                json.loads(b"".join(chunks)), where=self.cache_path
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CartridgeError(f"{self.cache_path}: invalid digest cache") from exc
+        finally:
+            os.close(descriptor)
+
+    def expected(self, name: str) -> str | None:
+        return self.external.get(name, self.cache.get(name))
+
+    def _write_cache(self, cache: dict[str, str]) -> None:
+        payload = (json.dumps(cache, indent=1, sort_keys=True) + "\n").encode()
+        temporary = self.cache_path.with_name(
+            f".source-digests.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write to source digest cache")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, self.cache_path)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+
+    def record_many(self, observed: dict[str, str]) -> None:
+        observed = self._validate_map(observed, where=self.cache_path)
+        self.out.mkdir(parents=True, exist_ok=True)
+        lock = os.open(
+            self.lock_path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(lock).st_mode):
+                raise CartridgeError(f"{self.lock_path}: lock must be a regular file")
+            os.fchmod(lock, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current = self._read_cache()
+            for name, digest in observed.items():
+                expected = self.external.get(name)
+                cached = current.get(name)
+                if expected is not None and expected != digest:
+                    raise CartridgeError(
+                        f"source shard {name} hashes {digest}, not expected {expected}"
+                    )
+                if cached is not None and cached != digest:
+                    raise CartridgeError(
+                        f"source shard {name} changed from cached {cached} to {digest}"
+                    )
+                current[name] = digest
+            self._write_cache(current)
+            self.cache = current
+        finally:
+            os.close(lock)
 
 
 def source_digest_resolver(
     source: SourceCheckpoint, out: Path, supplied: dict[str, str] | None = None
-):
-    """Digest one source shard, preferring evidence that already exists.
-
-    ``repack-of`` pins the file its bytes were copied out of, so the digest is
-    required. Hashing hundreds of gigabytes of source shards to attest 38 GB of
-    skeleton is avoidable work: an operator-supplied map (Hugging Face LFS oids)
-    is used first, then a ``MANIFEST.sha256`` the source publishes about itself,
-    and anything computed locally is cached in the campaign so a resumed or
-    re-windowed run never hashes the same shard twice.
-    """
-    published = {**load_source_shas(source.root), **(supplied or {})}
-    cache_path = out / "source-digests.json"
-    try:
-        cache = json.loads(cache_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        cache = {}
-
-    def resolve(name: str) -> str | None:
-        if name in published:
-            return published[name]
-        if name in cache:
-            return cache[name]
-        path = source.root / name
-        if not path.is_file():
-            return None
-        cache[name] = sha256_file(path)
-        tmp = cache_path.with_name(f".source-digests.{os.getpid()}.json")
-        tmp.write_text(json.dumps(cache, indent=1, sort_keys=True) + "\n")
-        os.replace(tmp, cache_path)
-        return cache[name]
-
-    return resolve
+) -> SourceDigestRegistry:
+    """Build the expectation/observation registry for source staging."""
+    return SourceDigestRegistry(source, out, supplied)
 
 
 def build_provenance(
-    *, predicate: str, recipe_sha: str, source: SourceCheckpoint,
-    base_model: str, base_revision: str, signer: Any,
+    *,
+    predicate: str,
+    recipe_sha: str,
+    source: SourceCheckpoint,
+    base_model: str,
+    base_revision: str,
+    signer: Any,
     source_digest: Any = None,
     encoder: dict[str, Any] | None = None,
     scope: dict[str, Any] | None = None,
@@ -1160,7 +1725,8 @@ def build_provenance(
     if not Source.is_immutable_commit(base_revision):
         raise CartridgeError(
             f"--base-revision {base_revision!r} is not an immutable commit; "
-            f"an attestation that pins a moving reference proves nothing")
+            f"an attestation that pins a moving reference proves nothing"
+        )
     if not base_model:
         raise CartridgeError("--base-model is required to attest an artifact")
     return {
@@ -1178,17 +1744,28 @@ def build_provenance(
 
 
 def write_attestation(
-    directory: Path, name: str, *, sha: str, size: int, body_offset: int,
-    spans: dict[str, tuple[int, int]], digests: dict[str, str],
-    group_kind: str, provenance: dict[str, Any],
+    directory: Path,
+    name: str,
+    *,
+    sha: str,
+    size: int,
+    body_offset: int,
+    spans: dict[str, tuple[int, int]],
+    digests: dict[str, str],
+    group_kind: str,
+    provenance: dict[str, Any],
 ) -> Path:
     """Sign and write one ``fq-attestation/1`` line for one shard."""
     predicate = provenance["predicate"]
     payload: dict[str, Any] = {
         "schema": ATTESTATION_SCHEMA,
         "predicate": predicate,
-        "fragment": {"file": name, "sha256": sha, "size": size,
-                     "body_offset": body_offset},
+        "fragment": {
+            "file": name,
+            "sha256": sha,
+            "size": size,
+            "body_offset": body_offset,
+        },
         "created_utc": now_utc(),
         "layout": "rank-sliced",
         "base_model": provenance["base_model"],
@@ -1211,20 +1788,43 @@ def write_attestation(
     payload.update(provenance.get("extra") or {})
     if predicate == "encode-of":
         fingerprint, descriptor = provenance["capture"]
+        source_shards = provenance.get("source_shards")
+        if (
+            not isinstance(source_shards, dict)
+            or not source_shards
+            or any(
+                not isinstance(name, str)
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                for name, digest in source_shards.items()
+            )
+        ):
+            raise CartridgeError("encode-of attestation lacks observed source shards")
         payload["materials"] = {
             "base_model": provenance["base_model"],
             "base_revision": provenance["base_revision"],
             "capture_fingerprint": fingerprint,
+            "source_shards": dict(sorted(source_shards.items())),
             **provenance["encoder"],
         }
         payload["capture_descriptor"] = descriptor
         payload["determinism_scope"] = provenance["scope"]
     else:
+        source_shards = provenance.get("source_shards")
+        observed = source_shards.get(name) if isinstance(source_shards, dict) else None
+        if (
+            not isinstance(observed, str)
+            or re.fullmatch(r"[0-9a-f]{64}", observed) is None
+        ):
+            raise CartridgeError(
+                f"repack-of attestation for {name} lacks its observed source digest"
+            )
         payload["materials"] = {
             "repo": provenance["base_model"],
             "revision": provenance["base_revision"],
             "file": name,
-            "file_sha256": provenance["source_digest"](name),
+            "file_sha256": observed,
+            "source_shards": {name: observed},
         }
     line = provenance["signer"].sign_line(payload)
     path = attestation_path(directory, name)
@@ -1257,8 +1857,14 @@ def read_signed_line(path: Path) -> dict[str, Any]:
         signature = base64.b64decode(envelope["signature"], validate=True)
         VerifyKey(bytes.fromhex(envelope["keyid"])).verify(raw, signature)
         payload = json.loads(raw)
-    except (KeyError, TypeError, ValueError, BadSignatureError,
-            json.JSONDecodeError, binascii.Error) as exc:
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        BadSignatureError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
         raise CartridgeError(f"{path}: unusable attestation ({exc})") from exc
     payload["_keyid"] = envelope["keyid"]
     return payload
@@ -1279,7 +1885,9 @@ def tensor_bytes(tensor: torch.Tensor) -> bytes:
 
 def write_grouped_shard(
     groups: list[tuple[str, list[tuple[str, torch.Tensor]]]],
-    directory: Path, name: str, metadata: dict[str, str],
+    directory: Path,
+    name: str,
+    metadata: dict[str, str],
 ) -> tuple[Path, str, int, dict[str, tuple[int, int]], dict[str, str]]:
     """Serialize one safetensors shard with a layout we choose, hashing as we go.
 
@@ -1309,14 +1917,14 @@ def write_grouped_shard(
                 raise CartridgeError(f"{name}: duplicate tensor {key!r}")
             seen.add(key)
             if str(tensor.dtype).removeprefix("torch.") not in SAFETENSORS_DTYPE:
-                raise CartridgeError(f"{name}: {key} has unsupported dtype "
-                                     f"{tensor.dtype}")
+                raise CartridgeError(
+                    f"{name}: {key} has unsupported dtype {tensor.dtype}"
+                )
             if tensor.is_floating_point() and not torch.isfinite(tensor).all():
                 raise CartridgeError(f"{name}: tensor {key} is not finite")
             raw = tensor_bytes(tensor)
             entries[key] = {
-                "dtype": SAFETENSORS_DTYPE[
-                    str(tensor.dtype).removeprefix("torch.")],
+                "dtype": SAFETENSORS_DTYPE[str(tensor.dtype).removeprefix("torch.")],
                 "shape": list(tensor.shape),
                 "data_offsets": [offset, offset + len(raw)],
             }
@@ -1327,8 +1935,9 @@ def write_grouped_shard(
     if not entries:
         raise CartridgeError(f"refusing to write empty safetensors {name}")
 
-    header = json.dumps({"__metadata__": dict(metadata), **entries},
-                        separators=(",", ":")).encode()
+    header = json.dumps(
+        {"__metadata__": dict(metadata), **entries}, separators=(",", ":")
+    ).encode()
     header += b" " * ((8 - len(header) % 8) % 8)
     prefix = struct.pack("<Q", len(header)) + header
     body_offset = len(prefix)
@@ -1354,21 +1963,27 @@ def write_grouped_shard(
     return target, whole.hexdigest(), body_offset, spans, digests
 
 
-def verify_shard(
-    path: Path, *, group_kind: str
-) -> tuple[str, int, dict[str, str]]:
-    """Re-derive one shard's digests from the bytes on disk.
+class VerifiedShard(NamedTuple):
+    sha256: str
+    body_offset: int
+    group_sha256: dict[str, str]
+    tensors: list[dict[str, Any]]
 
-    ``write_grouped_shard`` hashes while writing, which is what makes the
-    encode path cheap, but a digest that was only ever computed in the same
-    process that wrote it proves nothing about the file that survived. Finalize
-    re-reads every fragment through this function before publishing a manifest
-    or an assembly plan.
+
+def verify_shard_details(path: Path, *, group_kind: str) -> VerifiedShard:
+    """Re-hash a shard and each logical group and tensor in one disk pass.
+
+    Tensor-level hashes are what make the base compatibility identity
+    independent of safetensors file boundaries and future physical TP
+    partitioning. They are derived in the same mandatory finalize read that
+    verifies the whole shard and its attested expert spans, so exact-byte
+    compatibility does not add another terabyte-scale pass.
     """
     header, body = read_header(path)
     header.pop("__metadata__", None)
     ordered = sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0])
-    runs: list[tuple[str, int, int]] = []
+    groups: list[tuple[str, int, int]] = []
+    tensor_groups: list[str] = []
     for name, meta in ordered:
         lo, hi = meta["data_offsets"]
         if group_kind == "expert":
@@ -1378,49 +1993,97 @@ def verify_shard(
             key = match.group(1)
         else:
             key = name
-        if runs and runs[-1][0] == key:
-            if runs[-1][2] != lo:
+        tensor_groups.append(key)
+        if groups and groups[-1][0] == key:
+            if groups[-1][2] != lo:
                 raise CartridgeError(
                     f"{path}: {group_kind} {key} is not one byte range; a "
-                    f"ranged read of it could not be verified")
-            runs[-1] = (key, runs[-1][1], hi)
+                    f"ranged read of it could not be verified"
+                )
+            groups[-1] = (key, groups[-1][1], hi)
         else:
-            if any(existing == key for existing, _, _ in runs):
+            if any(existing == key for existing, _, _ in groups):
                 raise CartridgeError(
-                    f"{path}: {group_kind} {key} appears in two byte ranges")
-            runs.append((key, lo, hi))
+                    f"{path}: {group_kind} {key} appears in two byte ranges"
+                )
+            groups.append((key, lo, hi))
 
     whole = hashlib.sha256()
-    digests: dict[str, str] = {}
+    group_digests: dict[str, str] = {}
+    tensor_records: list[dict[str, Any]] = []
     with open(path, "rb") as handle:
-        whole.update(handle.read(body))
+        prefix = handle.read(body)
+        if len(prefix) != body:
+            raise CartridgeError(f"{path}: truncated safetensors header")
+        whole.update(prefix)
         position = 0
-        for key, lo, hi in runs:
+        current_group: str | None = None
+        group_digest: Any = None
+        previous_hi = 0
+        for (name, meta), key in zip(ordered, tensor_groups, strict=True):
+            lo, hi = meta["data_offsets"]
+            if lo < position:
+                raise CartridgeError(f"{path}: overlapping tensor payloads")
             if lo != position:
-                whole.update(handle.read(lo - position))
-            span = hashlib.sha256()
+                gap = handle.read(lo - position)
+                if len(gap) != lo - position:
+                    raise CartridgeError(f"{path}: truncated tensor payload")
+                whole.update(gap)
+                position = lo
+            if key != current_group:
+                if current_group is not None:
+                    group_digests[current_group] = group_digest.hexdigest()
+                current_group = key
+                group_digest = hashlib.sha256()
+                previous_hi = lo
+            if previous_hi != lo:
+                raise CartridgeError(
+                    f"{path}: {group_kind} {key} is not one byte range"
+                )
+            tensor_digest = hashlib.sha256()
             remaining = hi - lo
             while remaining:
                 chunk = handle.read(min(remaining, 1 << 22))
                 if not chunk:
                     raise CartridgeError(f"{path}: truncated payload")
                 whole.update(chunk)
-                span.update(chunk)
+                group_digest.update(chunk)
+                tensor_digest.update(chunk)
                 remaining -= len(chunk)
+            tensor_records.append(
+                {
+                    "name": name,
+                    "dtype": meta["dtype"],
+                    "shape": list(meta["shape"]),
+                    "sha256": tensor_digest.hexdigest(),
+                }
+            )
             position = hi
-            digests[key] = span.hexdigest()
+            previous_hi = hi
+        if current_group is not None:
+            group_digests[current_group] = group_digest.hexdigest()
         while True:
             chunk = handle.read(1 << 22)
             if not chunk:
                 break
             whole.update(chunk)
-    return whole.hexdigest(), body, digests
+    return VerifiedShard(whole.hexdigest(), body, group_digests, tensor_records)
+
+
+def verify_shard(path: Path, *, group_kind: str) -> tuple[str, int, dict[str, str]]:
+    """Compatibility wrapper returning whole, header and group digests."""
+    verified = verify_shard_details(path, group_kind=group_kind)
+    return verified.sha256, verified.body_offset, verified.group_sha256
 
 
 def write_shard(
     groups: list[tuple[str, list[tuple[str, torch.Tensor]]]],
-    directory: Path, name: str, metadata: dict[str, str], *,
-    provenance: dict[str, Any] | None = None, group_kind: str = "expert",
+    directory: Path,
+    name: str,
+    metadata: dict[str, str],
+    *,
+    provenance: dict[str, Any] | None = None,
+    group_kind: str = "expert",
 ) -> str:
     """Write one campaign shard, its digest and its signed attestation.
 
@@ -1437,12 +2100,20 @@ def write_shard(
     for stale in (digest_path(directory, name), attestation_path(directory, name)):
         stale.unlink(missing_ok=True)
     target, sha, body, spans, digests = write_grouped_shard(
-        groups, directory, name, metadata)
+        groups, directory, name, metadata
+    )
     if provenance is not None:
         write_attestation(
-            directory, name, sha=sha, size=target.stat().st_size,
-            body_offset=body, spans=spans, digests=digests,
-            group_kind=group_kind, provenance=provenance)
+            directory,
+            name,
+            sha=sha,
+            size=target.stat().st_size,
+            body_offset=body,
+            spans=spans,
+            digests=digests,
+            group_kind=group_kind,
+            provenance=provenance,
+        )
     sidecar = digest_path(directory, name)
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     tmp = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.tmp")
@@ -1461,7 +2132,9 @@ def read_digest(directory: Path, name: str) -> str | None:
 
 
 def shard_is_complete(
-    directory: Path, name: str, expect: dict[str, str],
+    directory: Path,
+    name: str,
+    expect: dict[str, str],
 ) -> bool:
     """A shard counts as done when its digest is committed and it matches.
 
@@ -1482,13 +2155,47 @@ def shard_is_complete(
             raise CartridgeError(
                 f"{target}: {key} is {meta.get(key)!r}, expected {value!r}. "
                 f"This output directory was produced by a different recipe or "
-                f"block layout; use a fresh --out.")
-    return True
+                f"block layout; use a fresh --out."
+            )
+    if "base_revision" not in expect:
+        return True
+    try:
+        attestation = read_attestation(directory, name)
+    except CartridgeError:
+        return False
+    materials = attestation.get("materials")
+    source_shards = (
+        materials.get("source_shards") if isinstance(materials, dict) else None
+    )
+    if (
+        not isinstance(source_shards, dict)
+        or not source_shards
+        or any(
+            not isinstance(source_name, str)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for source_name, digest in source_shards.items()
+        )
+    ):
+        # Fragments from the earlier vulnerable producer are re-created on
+        # resume instead of surviving until finalize rejects their provenance.
+        return False
+    return not (
+        attestation.get("predicate") == "repack-of"
+        and source_shards.get(materials.get("file")) != materials.get("file_sha256")
+    )
 
 
 def prepare_out_dir(
-    out: Path, *, recipe_path: Path, recipe_sha: str, source: SourceCheckpoint,
-    base_model: str, base_revision: str, block_size: int, force: bool,
+    out: Path,
+    *,
+    recipe_path: Path,
+    recipe_sha: str,
+    source: SourceCheckpoint,
+    base_model: str,
+    base_revision: str,
+    block_size: int,
+    force: bool,
     signer: str | None = None,
 ) -> Path:
     """Create or re-attach to a campaign output directory.
@@ -1523,8 +2230,11 @@ def prepare_out_dir(
             found = json.loads(marker.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise CartridgeError(f"{marker}: unreadable ({exc})") from exc
-        drift = {key: (found.get(key), value) for key, value in expected.items()
-                 if found.get(key) != value}
+        drift = {
+            key: (found.get(key), value)
+            for key, value in expected.items()
+            if found.get(key) != value
+        }
         if drift:
             # --force re-encodes blocks of *this* campaign; it never converts a
             # directory to a different recipe, source or block layout. Changing
@@ -1534,15 +2244,21 @@ def prepare_out_dir(
                 f"{marker} does not match this run: {drift}. This campaign "
                 f"directory belongs to a different recipe, source revision, "
                 f"block layout or signer: encode into a fresh --out, or pass "
-                f"the key this campaign already published under.")
+                f"the key this campaign already published under."
+            )
         if not drift:
             # Nothing to record: leave the marker alone so parallel workers
             # never race each other rewriting the same path.
             return resolved
     payload = dict(expected)
-    payload.update({"source": str(source.root), "layout": source.layout,
-                    "topology_id": source.topology_id,
-                    "updated_utc": now_utc()})
+    payload.update(
+        {
+            "source": str(source.root),
+            "layout": source.layout,
+            "topology_id": source.topology_id,
+            "updated_utc": now_utc(),
+        }
+    )
     tmp = marker.with_name(f".{SENTINEL}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, marker)
@@ -1584,7 +2300,8 @@ def _bind_encoder_locked(marker: Path, encoder_sha: str) -> None:
             f"{marker} was encoded by {recorded[:16]} but this build is "
             f"{encoder_sha[:16]}. One campaign publishes one encoder build: "
             f"finalize would reject the mixture after the fleet had paid for "
-            f"it. Use the original build, or encode into a fresh --out.")
+            f"it. Use the original build, or encode into a fresh --out."
+        )
     found["encoder_sha256"] = encoder_sha
     found["updated_utc"] = now_utc()
     tmp = marker.with_name(f".{SENTINEL}.{os.getpid()}.enc.tmp")
@@ -1593,6 +2310,7 @@ def _bind_encoder_locked(marker: Path, encoder_sha: str) -> None:
 
 
 # ── Tensor Naming ─────────────────────────────────────────────────────────
+
 
 def base_tensor_names(
     layer: int, expert: int, projection: str, node: dict[str, Any]
@@ -1612,14 +2330,12 @@ def stage_tensor_names(
     prefix = f"model.layers.{layer}.mlp.experts.{expert}.{projection}.rank0"
     return {
         f"{prefix}.trellis_{label}": node["trellis"],
-        f"{prefix}.suh_{label}": node["suh"],
-        f"{prefix}.svh_{label}": node["svh"],
-        f"{prefix}.scale_{label}": torch.tensor(
-            node["scale"], dtype=torch.float32),
+        f"{prefix}.scale_{label}": torch.tensor(node["scale"], dtype=torch.float32),
     }
 
 
 # ── Skeleton (everything that is not a routed expert weight) ──────────────
+
 
 def skeleton_keys(source: SourceCheckpoint, layers: list[int]) -> dict[str, list[str]]:
     """shard -> keys that must be copied verbatim into every base checkpoint."""
@@ -1653,8 +2369,11 @@ def copy_source_aux_files(source: Path, dest: Path) -> list[str]:
     copied = []
     dest.mkdir(parents=True, exist_ok=True)
     for entry in sorted(source.iterdir()):
-        if (entry.name in skip or entry.name.startswith(".")
-                or entry.name.endswith(".safetensors")):
+        if (
+            entry.name in skip
+            or entry.name.startswith(".")
+            or entry.name.endswith(".safetensors")
+        ):
             continue
         target = dest / entry.name
         if entry.is_dir():
@@ -1685,12 +2404,14 @@ def load_signer(path: Path, *, create: bool, outside: tuple[Path, ...] = ()) -> 
             raise CartridgeError(
                 f"--sign-key {resolved} is inside {root}: refusing. That "
                 f"directory is published; a private ed25519 seed must live "
-                f"outside every tree the campaign uploads.")
+                f"outside every tree the campaign uploads."
+            )
     if not resolved.exists() and not create:
         raise CartridgeError(
             f"signing key {resolved} does not exist. Parallel workers must not "
             f"create it: run `skeleton` first, or start encode with --devices, "
-            f"either of which creates it once.")
+            f"either of which creates it once."
+        )
     return Signer(path)
 
 
@@ -1703,7 +2424,8 @@ def resolve_identity(args, source: SourceCheckpoint) -> tuple[str, str]:
         raise CartridgeError(
             f"cannot attest {source.root}: pass --base-model and "
             f"--base-revision (a 40-hex commit). They are inferred "
-            f"automatically only from a Hugging Face snapshot directory.")
+            f"automatically only from a Hugging Face snapshot directory."
+        )
     return base_model, base_revision
 
 
@@ -1712,57 +2434,88 @@ def cmd_skeleton(args) -> int:
     require_quant_dependencies()
     recipe = load_recipe(args.recipe)
     recipe_sha = sha256_file(args.recipe)
-    with SourceCheckpoint(args.source) as source, \
-            campaign_lock(Path(args.out).expanduser().resolve(),
-                          what="skeleton"):
+    with (
+        SourceCheckpoint(args.source) as source,
+        campaign_lock(Path(args.out).expanduser().resolve(), what="skeleton"),
+    ):
         base_model, base_revision = resolve_identity(args, source)
-        signer = load_signer(args.sign_key, create=True,
-                             outside=(Path(args.out).expanduser().resolve(),
-                                      source.root))
+        signer = load_signer(
+            args.sign_key,
+            create=True,
+            outside=(Path(args.out).expanduser().resolve(), source.root),
+        )
         out = prepare_out_dir(
-            args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
-            source=source, base_model=base_model,
-            base_revision=base_revision, signer=signer.pub_hex,
-            block_size=args.block_size, force=args.force)
-        signer = load_signer(args.sign_key, create=True,
-                             outside=(out, source.root))
+            args.out,
+            recipe_path=args.recipe,
+            recipe_sha=recipe_sha,
+            source=source,
+            base_model=base_model,
+            base_revision=base_revision,
+            signer=signer.pub_hex,
+            block_size=args.block_size,
+            force=args.force,
+        )
+        signer = load_signer(args.sign_key, create=True, outside=(out, source.root))
         # The skeleton is copied verbatim out of the source shards, so its
         # honest predicate is repack-of, pinned to the source file's digest.
+        source_registry = source_digest_resolver(
+            source, out, load_digest_map(args.source_digests)
+        )
         provenance = build_provenance(
-            predicate="repack-of", recipe_sha=recipe_sha, source=source,
-            base_model=base_model, base_revision=base_revision, signer=signer,
-            source_digest=source_digest_resolver(
-                source, out, load_digest_map(args.source_digests)))
+            predicate="repack-of",
+            recipe_sha=recipe_sha,
+            source=source,
+            base_model=base_model,
+            base_revision=base_revision,
+            signer=signer,
+            source_digest=source_registry,
+        )
         skeleton = out / "skeleton"
         grouped = skeleton_keys(source, recipe["moe_layers"])
         aux = copy_source_aux_files(source.root, skeleton)
-        print(f"skeleton: {len(grouped)} shards, {len(aux)} auxiliary files, "
-              f"signer {signer.pub_hex[:16]}", flush=True)
+        print(
+            f"skeleton: {len(grouped)} shards, {len(aux)} auxiliary files, "
+            f"signer {signer.pub_hex[:16]}",
+            flush=True,
+        )
         written = skipped = absent = 0
         for shard, keys in grouped.items():
-            expect = {"schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
-                      "base_revision": base_revision,
-                      "kind": "skeleton", "tensor_count": str(len(keys))}
+            expect = {
+                "schema": BLOCK_SCHEMA,
+                "recipe_sha256": recipe_sha,
+                "base_revision": base_revision,
+                "kind": "skeleton",
+                "tensor_count": str(len(keys)),
+            }
             if not args.force and shard_is_complete(skeleton, shard, expect):
                 skipped += 1
                 continue
-            if not (source.root / shard).is_file():
+            if not source._source_entry_exists(shard):
                 absent += 1
                 continue
-            groups = [(key, [(key, source.tensor(shard, key))])
-                      for key in keys]
-            write_shard(groups, skeleton, shard,
-                        {**expect, "tool": TOOL_VERSION},
-                        provenance=provenance, group_kind="tensor")
+            with source.stage_shards({shard}, out, source_registry) as observed:
+                groups = [(key, [(key, source.tensor(shard, key))]) for key in keys]
+                write_shard(
+                    groups,
+                    skeleton,
+                    shard,
+                    {**expect, "tool": TOOL_VERSION},
+                    provenance={**provenance, "source_shards": observed},
+                    group_kind="tensor",
+                )
             written += 1
             del groups
             print(f"  {shard}: {len(keys)} tensors", flush=True)
-    print(f"skeleton done: {written} written, {skipped} already complete, "
-          f"{absent} shards not present locally", flush=True)
+    print(
+        f"skeleton done: {written} written, {skipped} already complete, "
+        f"{absent} shards not present locally",
+        flush=True,
+    )
     return 0
 
 
 # ── Encode ────────────────────────────────────────────────────────────────
+
 
 def selected_layers(recipe: dict[str, Any], spec: str | None) -> list[int]:
     if not spec:
@@ -1787,7 +2540,9 @@ def selected_layers(recipe: dict[str, Any], spec: str | None) -> list[int]:
 
 
 def build_work_list(
-    source: SourceCheckpoint, recipe: dict[str, Any], layers: list[int],
+    source: SourceCheckpoint,
+    recipe: dict[str, Any],
+    layers: list[int],
     block_size: int,
 ) -> list[dict[str, Any]]:
     work = []
@@ -1798,14 +2553,15 @@ def build_work_list(
     return work
 
 
-def block_outputs(
-    recipe: dict[str, Any], experts: list[int]
-) -> dict[str, list[int]]:
+def block_outputs(recipe: dict[str, Any], experts: list[int]) -> dict[str, list[int]]:
     """label -> experts of this block that the node covers (non-empty only)."""
     out: dict[str, list[int]] = {}
     for node in [*recipe["bases"], *recipe["stages"]]:
-        covered = (experts if node["experts"] == "all"
-                   else [e for e in experts if e in set(node["experts"])])
+        covered = (
+            experts
+            if node["experts"] == "all"
+            else [e for e in experts if e in set(node["experts"])]
+        )
         if covered:
             out[node["label"]] = covered
     return out
@@ -1832,13 +2588,13 @@ def block_claim(out: Path, layer: int, block: int):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            yield False           # a live worker owns this block
+            yield False  # a live worker owns this block
             return
         os.truncate(handle, 0)
         os.write(handle, f"{os.getpid()}\n".encode())
         yield True
     finally:
-        os.close(handle)          # the kernel drops the lock, even on SIGKILL
+        os.close(handle)  # the kernel drops the lock, even on SIGKILL
 
 
 CAMPAIGN_LOCK = ".fq-campaign.lock"
@@ -1883,7 +2639,8 @@ def no_workers_running(out: Path):
             raise CartridgeError(
                 f"encode workers are still running against {out}: their claims "
                 f"are held in {WORKERS_LOCK}. A published campaign must be a "
-                f"quiet one -- stop them, or wait, before finalize.") from None
+                f"quiet one -- stop them, or wait, before finalize."
+            ) from None
         yield
     finally:
         os.close(handle)
@@ -1917,7 +2674,8 @@ def campaign_lock(out: Path, *, what: str):
                 f"{path} is held by {held or 'another process'}: one campaign "
                 f"directory takes one {what} at a time. Two would spend rented "
                 f"GPU hours on the same blocks and publish fragments under "
-                f"different identities.") from None
+                f"different identities."
+            ) from None
         os.truncate(handle, 0)
         os.write(handle, f"{what}, pid {os.getpid()}\n".encode())
         yield True
@@ -1926,40 +2684,58 @@ def campaign_lock(out: Path, *, what: str):
 
 
 def block_is_complete(
-    out: Path, recipe: dict[str, Any], recipe_sha: str,
-    source: SourceCheckpoint, base_revision: str, item: dict[str, Any],
+    out: Path,
+    recipe: dict[str, Any],
+    recipe_sha: str,
+    source: SourceCheckpoint,
+    base_revision: str,
+    item: dict[str, Any],
     block_size: int,
 ) -> bool:
     """Is every node of one (layer, block) committed on disk?"""
     layer, block, experts = item["layer"], item["block"], item["experts"]
     common = {
-        "schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
+        "schema": BLOCK_SCHEMA,
+        "recipe_sha256": recipe_sha,
         "base_revision": base_revision,
-        "layer": str(layer), "block": str(block),
+        "layer": str(layer),
+        "block": str(block),
         "experts": ",".join(str(e) for e in experts),
     }
     for label, covered in block_outputs(recipe, experts).items():
-        expect = {**common, "label": label,
-                  "covered_experts": ",".join(str(e) for e in covered)}
-        if not shard_is_complete(node_dir(out, recipe, label),
-                                 block_name(layer, block), expect):
+        expect = {
+            **common,
+            "label": label,
+            "covered_experts": ",".join(str(e) for e in covered),
+        }
+        if not shard_is_complete(
+            node_dir(out, recipe, label), block_name(layer, block), expect
+        ):
             return False
     return True
 
 
 def encode_block(
-    source: SourceCheckpoint, recipe: dict[str, Any], out: Path,
-    item: dict[str, Any], device: torch.device, enc: Encoder,
-    recipe_sha: str, force: bool, provenance: dict[str, Any],
+    source: SourceCheckpoint,
+    recipe: dict[str, Any],
+    out: Path,
+    item: dict[str, Any],
+    device: torch.device,
+    enc: Encoder,
+    recipe_sha: str,
+    force: bool,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Encode one (layer, expert block) into one shard per graph node."""
     layer, block, experts = item["layer"], item["block"], item["experts"]
     name = block_name(layer, block)
     wanted = block_outputs(recipe, experts)
     expect_common = {
-        "schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
+        "schema": BLOCK_SCHEMA,
+        "recipe_sha256": recipe_sha,
         "base_revision": provenance["base_revision"],
-        "layer": str(layer), "block": str(block),
+        "layer": str(layer),
+        "block": str(block),
         "experts": ",".join(str(e) for e in experts),
     }
     # Not part of the resume identity: a rebuilt encoder must be free to
@@ -1976,11 +2752,16 @@ def encode_block(
     plan = {}
     for label, covered in wanted.items():
         directory = node_dir(out, recipe, label)
-        expect = {**expect_common, "label": label,
-                  "covered_experts": ",".join(str(e) for e in covered)}
+        expect = {
+            **expect_common,
+            "label": label,
+            "covered_experts": ",".join(str(e) for e in covered),
+        }
         plan[label] = (directory, expect, covered)
-    complete = all(shard_is_complete(directory, name, expect)
-                   for directory, expect, _covered in plan.values())
+    complete = all(
+        shard_is_complete(directory, name, expect)
+        for directory, expect, _covered in plan.values()
+    )
     if complete and not force:
         return {"layer": layer, "block": block, "skipped": True}
     pending = plan
@@ -1992,8 +2773,7 @@ def encode_block(
     # after the fleet has been paid. Retracted first, a half-written block is
     # visibly incomplete and gets re-encoded as a whole.
     for directory, _expect, _covered in pending.values():
-        for marker in (digest_path(directory, name),
-                       attestation_path(directory, name)):
+        for marker in (digest_path(directory, name), attestation_path(directory, name)):
             marker.unlink(missing_ok=True)
 
     base_labels = {base["label"] for base in recipe["bases"]}
@@ -2001,36 +2781,48 @@ def encode_block(
     # label -> expert id -> [(tensor name, tensor)], written expert by expert so
     # every expert occupies one byte range that a signed digest can cover.
     tensors: dict[str, dict[int, list[tuple[str, torch.Tensor]]]] = {
-        label: {} for label in pending}
+        label: {} for label in pending
+    }
     mses: dict[str, list[float]] = {label: [] for label in pending}
     started = time.perf_counter()
-    for expert in experts:
-        stages = stages_for_expert(recipe["stages"], expert)
-        for projection in PROJECTIONS:
-            key = source_experts[expert][projection]
-            shard = source.layer_keys(layer)[key]
-            raw = source.tensor(shard, key)
-            if raw.ndim != 2 or raw.dtype is not torch.bfloat16:
-                raise CartridgeError(
-                    f"{key}: expected a 2-D BF16 weight, got "
-                    f"{tuple(raw.shape)} {raw.dtype}")
-            # Transpose on the device: half the bytes cross PCIe as BF16 and
-            # the 12.6M-element permutation runs as a GPU kernel instead of a
-            # CPU copy on the critical path of every matrix.
-            weight = raw.to(device, non_blocking=True).float().T.contiguous()
-            del raw
-            nodes = encode_matrix_dag(
-                weight, recipe["bases"], stages, device, enc)
-            for label, node in nodes.items():
-                if label not in pending:
-                    continue
-                named = (base_tensor_names(layer, expert, projection, node)
-                         if label in base_labels
-                         else stage_tensor_names(
-                             layer, expert, projection, label, node))
-                tensors[label].setdefault(expert, []).extend(named.items())
-                mses[label].append(node["mse"])
-            del weight, nodes
+    layer_keys = source.layer_keys(layer)
+    required_shards = {
+        layer_keys[source_experts[expert][projection]]
+        for expert in experts
+        for projection in PROJECTIONS
+    }
+    registry = provenance.get("source_digest")
+    if not isinstance(registry, SourceDigestRegistry):
+        raise CartridgeError("encode provenance lacks a source digest registry")
+    with source.stage_shards(required_shards, out, registry) as observed_sources:
+        for expert in experts:
+            stages = stages_for_expert(recipe["stages"], expert)
+            for projection in PROJECTIONS:
+                key = source_experts[expert][projection]
+                shard = layer_keys[key]
+                raw = source.tensor(shard, key)
+                if raw.ndim != 2 or raw.dtype is not torch.bfloat16:
+                    raise CartridgeError(
+                        f"{key}: expected a 2-D BF16 weight, got "
+                        f"{tuple(raw.shape)} {raw.dtype}"
+                    )
+                # Transpose on the device: half the bytes cross PCIe as BF16 and
+                # the 12.6M-element permutation runs as a GPU kernel instead of a
+                # CPU copy on the critical path of every matrix.
+                weight = raw.to(device, non_blocking=True).float().T.contiguous()
+                del raw
+                nodes = encode_matrix_dag(weight, recipe["bases"], stages, device, enc)
+                for label, node in nodes.items():
+                    if label not in pending:
+                        continue
+                    named = (
+                        base_tensor_names(layer, expert, projection, node)
+                        if label in base_labels
+                        else stage_tensor_names(layer, expert, projection, label, node)
+                    )
+                    tensors[label].setdefault(expert, []).extend(named.items())
+                    mses[label].append(node["mse"])
+                del weight, nodes
     quantize_s = time.perf_counter() - started
 
     nodes_by_label = node_index(recipe)
@@ -2049,17 +2841,21 @@ def encode_block(
             if parent not in written:
                 raise CartridgeError(
                     f"layer {layer} block {block}: stage {label!r} has no "
-                    f"parent shard for {parent!r} in this block")
+                    f"parent shard for {parent!r} in this block"
+                )
             parent_fragment = {
                 "label": parent,
                 "file": name,
                 "path": node_dir(out, recipe, parent).name + "/" + name,
                 "sha256": written[parent],
             }
-        groups = [(str(expert), tensors[label][expert])
-                  for expert in sorted(tensors[label])]
+        groups = [
+            (str(expert), tensors[label][expert]) for expert in sorted(tensors[label])
+        ]
         written[label] = write_shard(
-            groups, directory, name,
+            groups,
+            directory,
+            name,
             # Deliberately no timestamp: the shard's bytes are a function of
             # the recipe, the source and the encoder build, so re-encoding
             # inside the declared determinism scope reproduces this file
@@ -2067,6 +2863,7 @@ def encode_block(
             {**expect, "tool": TOOL_VERSION, "encoder_sha256": encoder_sha},
             provenance={
                 **provenance,
+                "source_shards": observed_sources,
                 "extra": {
                     "k": node["k"],
                     "quant_args": {
@@ -2079,21 +2876,27 @@ def encode_block(
                         "role": "base" if label in base_labels else "stage",
                         "regularize_seed": 0,
                         "hadamard_block": HADAMARD_BLOCK,
-                        "rescale": (None if label in base_labels
-                                    else "codebook_scale / residual_rms"),
+                        "rescale": (
+                            None
+                            if label in base_labels
+                            else "codebook_scale / residual_rms"
+                        ),
                         "tile_batch": enc.tile_batch,
                     },
                     "cartridge": {
-                        "label": label, "parent": parent,
-                        "layer": layer, "block": block,
+                        "label": label,
+                        "parent": parent,
+                        "layer": layer,
+                        "block": block,
                         "covered_experts": _covered,
                         "mean_mse_original_space": (
-                            sum(mses[label]) / len(mses[label])),
+                            sum(mses[label]) / len(mses[label])
+                        ),
                     },
-                    **({"parents": [parent_fragment]} if parent_fragment
-                       else {}),
+                    **({"parents": [parent_fragment]} if parent_fragment else {}),
                 },
-            })
+            },
+        )
     if device.type == "cuda":
         torch.cuda.empty_cache()
     # Two rates, because only one of them is comparable to a campaign estimate:
@@ -2101,12 +2904,20 @@ def encode_block(
     # hashing, signatures and digest sidecars that a block is not done without.
     commit_s = time.perf_counter() - started
     return {
-        "layer": layer, "block": block, "skipped": False,
-        "experts": len(experts), "encode_s": commit_s,
-        "quantize_s": quantize_s, "commit_s": commit_s,
-        "labels": {label: {"sha256": written[label],
-                           "mse": sum(mses[label]) / len(mses[label])}
-                   for label in sorted(written)},
+        "layer": layer,
+        "block": block,
+        "skipped": False,
+        "experts": len(experts),
+        "encode_s": commit_s,
+        "quantize_s": quantize_s,
+        "commit_s": commit_s,
+        "labels": {
+            label: {
+                "sha256": written[label],
+                "mse": sum(mses[label]) / len(mses[label]),
+            }
+            for label in sorted(written)
+        },
     }
 
 
@@ -2134,46 +2945,74 @@ def cmd_encode(args) -> int:
         name = device.type
 
     target = Path(args.out).expanduser().resolve()
-    with SourceCheckpoint(args.source) as source, \
-            campaign_lock(target, what="encode"), worker_presence(target):
+    with (
+        SourceCheckpoint(args.source) as source,
+        campaign_lock(target, what="encode"),
+        worker_presence(target),
+    ):
         base_model, base_revision = resolve_identity(args, source)
-        signer = load_signer(args.sign_key,
-                             create=args.shard_count == 1,
-                             outside=(target, source.root))
+        signer = load_signer(
+            args.sign_key, create=args.shard_count == 1, outside=(target, source.root)
+        )
         out = prepare_out_dir(
-            args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
-            source=source, base_model=base_model,
-            base_revision=base_revision, signer=signer.pub_hex,
-            block_size=args.block_size, force=args.force)
+            args.out,
+            recipe_path=args.recipe,
+            recipe_sha=recipe_sha,
+            source=source,
+            base_model=base_model,
+            base_revision=base_revision,
+            signer=signer.pub_hex,
+            block_size=args.block_size,
+            force=args.force,
+        )
+        source_registry = source_digest_resolver(
+            source, out, load_digest_map(args.source_digests)
+        )
         work = build_work_list(source, recipe, layers, args.block_size)
-        mine = work[args.shard_index::args.shard_count]
-        print(f"worker {args.shard_index}/{args.shard_count} on {device} "
-              f"({name}): {len(mine)} of {len(work)} blocks, "
-              f"{len(recipe['bases'])} bases + {len(recipe['stages'])} stages, "
-              f"signer {signer.pub_hex[:16]}", flush=True)
+        mine = work[args.shard_index :: args.shard_count]
+        print(
+            f"worker {args.shard_index}/{args.shard_count} on {device} "
+            f"({name}): {len(mine)} of {len(work)} blocks, "
+            f"{len(recipe['bases'])} bases + {len(recipe['stages'])} stages, "
+            f"signer {signer.pub_hex[:16]}",
+            flush=True,
+        )
         done = skipped = contended = 0
         elapsed = quantized = 0.0
         matrices = 0
         with bootstrap_encoder(args.encoder_source, args.tile_batch) as enc:
-            print(f"codebook_scale = {enc.cbs}, tile_batch = {enc.tile_batch}",
-                  flush=True)
+            print(
+                f"codebook_scale = {enc.cbs}, tile_batch = {enc.tile_batch}", flush=True
+            )
             bind_encoder_identity(out, enc.identity["encoder_sha256"])
             provenance = build_provenance(
-                predicate="encode-of", recipe_sha=recipe_sha, source=source,
-                base_model=base_model, base_revision=base_revision,
+                predicate="encode-of",
+                recipe_sha=recipe_sha,
+                source=source,
+                base_model=base_model,
+                base_revision=base_revision,
                 signer=signer,
+                source_digest=source_registry,
                 encoder=enc.identity,
                 scope=determinism_scope(device, enc.tile_batch),
-                capture=capture_evidence(
-                    recipe_sha, base_revision, enc.cbs))
+                capture=capture_evidence(recipe_sha, base_revision, enc.cbs),
+            )
             for item in mine:
                 with block_claim(out, item["layer"], item["block"]) as owned:
                     if not owned:
                         contended += 1
                         continue
                     result = encode_block(
-                        source, recipe, out, item, device, enc, recipe_sha,
-                        args.force, provenance)
+                        source,
+                        recipe,
+                        out,
+                        item,
+                        device,
+                        enc,
+                        recipe_sha,
+                        args.force,
+                        provenance,
+                    )
                 if result["skipped"]:
                     skipped += 1
                     continue
@@ -2182,24 +3021,35 @@ def cmd_encode(args) -> int:
                 quantized += result["quantize_s"]
                 count = result["experts"] * len(PROJECTIONS)
                 matrices += count
-                print(f"  layer {result['layer']} block {result['block']}: "
-                      f"{result['experts']} experts, "
-                      f"{result['commit_s']:.1f}s committed "
-                      f"({result['commit_s'] / count:.3f}s/matrix, of which "
-                      f"{result['quantize_s'] / count:.3f}s quantizing)",
-                      flush=True)
+                print(
+                    f"  layer {result['layer']} block {result['block']}: "
+                    f"{result['experts']} experts, "
+                    f"{result['commit_s']:.1f}s committed "
+                    f"({result['commit_s'] / count:.3f}s/matrix, of which "
+                    f"{result['quantize_s'] / count:.3f}s quantizing)",
+                    flush=True,
+                )
     if matrices:
-        print(f"worker {args.shard_index}: {done} blocks encoded, {skipped} "
-              f"already complete, {elapsed / matrices:.4f}s per matrix "
-              f"committed ({quantized / matrices:.4f}s quantizing), "
-              f"{elapsed / 3600:.2f} GPU-h. Extrapolate a campaign from the "
-              f"committed rate.", flush=True)
+        print(
+            f"worker {args.shard_index}: {done} blocks encoded, {skipped} "
+            f"already complete, {elapsed / matrices:.4f}s per matrix "
+            f"committed ({quantized / matrices:.4f}s quantizing), "
+            f"{elapsed / 3600:.2f} GPU-h. Extrapolate a campaign from the "
+            f"committed rate.",
+            flush=True,
+        )
     else:
-        print(f"worker {args.shard_index}: nothing to do "
-              f"({skipped} blocks already complete)", flush=True)
+        print(
+            f"worker {args.shard_index}: nothing to do "
+            f"({skipped} blocks already complete)",
+            flush=True,
+        )
     if contended:
-        print(f"worker {args.shard_index}: {contended} blocks were claimed by "
-              f"another worker and left to it", flush=True)
+        print(
+            f"worker {args.shard_index}: {contended} blocks were claimed by "
+            f"another worker and left to it",
+            flush=True,
+        )
     return 0
 
 
@@ -2219,29 +3069,53 @@ def _spawn_device_workers(args) -> int:
     # Create the signing key before the sentinel binds it: eight workers racing
     # to generate one would each write a different seed and sign with a
     # different identity, which finalize would reject after the fleet had paid.
-    signer = load_signer(args.sign_key, create=True,
-                         outside=(target, Path(args.source)))
+    signer = load_signer(
+        args.sign_key, create=True, outside=(target, Path(args.source))
+    )
     with SourceCheckpoint(args.source) as source:
         base_model, base_revision = resolve_identity(args, source)
         out = prepare_out_dir(
-            args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
-            source=source, base_model=base_model,
-            base_revision=base_revision, signer=signer.pub_hex,
-            block_size=args.block_size, force=args.force)
+            args.out,
+            recipe_path=args.recipe,
+            recipe_sha=recipe_sha,
+            source=source,
+            base_model=base_model,
+            base_revision=base_revision,
+            signer=signer.pub_hex,
+            block_size=args.block_size,
+            force=args.force,
+        )
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     print(f"signing key {signer.pub_hex[:16]} at {args.sign_key}", flush=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    base = [sys.executable, str(Path(__file__).resolve()), "encode",
-            "--source", str(args.source), "--recipe", str(args.recipe),
-            "--out", str(args.out), "--encoder-source", str(args.encoder_source),
-            "--sign-key", str(args.sign_key),
-            "--block-size", str(args.block_size),
-            "--tile-batch", str(args.tile_batch),
-            "--shard-count", str(len(devices))]
-    for flag, value in (("--base-model", args.base_model),
-                        ("--base-revision", args.base_revision),
-                        ("--layers", args.layers)):
+    base = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "encode",
+        "--source",
+        str(args.source),
+        "--recipe",
+        str(args.recipe),
+        "--out",
+        str(args.out),
+        "--encoder-source",
+        str(args.encoder_source),
+        "--sign-key",
+        str(args.sign_key),
+        "--block-size",
+        str(args.block_size),
+        "--tile-batch",
+        str(args.tile_batch),
+        "--shard-count",
+        str(len(devices)),
+    ]
+    for flag, value in (
+        ("--base-model", args.base_model),
+        ("--base-revision", args.base_revision),
+        ("--source-digests", args.source_digests),
+        ("--layers", args.layers),
+    ):
         if value:
             base += [flag, value]
     if args.force:
@@ -2256,10 +3130,17 @@ def _spawn_device_workers(args) -> int:
             log = logs / f"encode-{stamp}-w{index}.log"
             handle = log.open("w")
             cmd = base + ["--device", device, "--shard-index", str(index)]
-            children.append((
-                index, device, log, handle,
-                subprocess.Popen(cmd, stdout=handle, env=environment,
-                                 stderr=subprocess.STDOUT)))
+            children.append(
+                (
+                    index,
+                    device,
+                    log,
+                    handle,
+                    subprocess.Popen(
+                        cmd, stdout=handle, env=environment, stderr=subprocess.STDOUT
+                    ),
+                )
+            )
             print(f"worker {index} -> {device}, log {log}", flush=True)
         failures = []
         for index, device, log, handle, process in children:
@@ -2272,7 +3153,8 @@ def _spawn_device_workers(args) -> int:
     if failures:
         raise CartridgeError(
             f"workers {failures} failed; see {logs}. Blocks already written "
-            f"are complete: rerun the same command to resume.")
+            f"are complete: rerun the same command to resume."
+        )
     # Exit 0 from every worker is not the postcondition the caller needs. A
     # worker skips a block another live worker holds -- including one orphaned by
     # a killed launcher -- and still exits 0, so a driver that retires source
@@ -2281,22 +3163,26 @@ def _spawn_device_workers(args) -> int:
     with SourceCheckpoint(args.source) as source:
         recipe_ = load_recipe(args.recipe)
         pending = [
-            item for item in build_work_list(
-                source, recipe_, selected_layers(recipe_, args.layers),
-                args.block_size)
-            if not block_is_complete(out, recipe_, recipe_sha, source,
-                                     base_revision, item, args.block_size)
+            item
+            for item in build_work_list(
+                source, recipe_, selected_layers(recipe_, args.layers), args.block_size
+            )
+            if not block_is_complete(
+                out, recipe_, recipe_sha, source, base_revision, item, args.block_size
+            )
         ]
     if pending:
         raise CartridgeError(
             f"{len(pending)} of this run's blocks are not complete, e.g. "
             f"{[(item['layer'], item['block']) for item in pending[:5]]}. "
             f"Another worker holds them, or a worker exited without writing "
-            f"them: rerun the same command once those workers are done.")
+            f"them: rerun the same command once those workers are done."
+        )
     return 0
 
 
 # ── Finalize ──────────────────────────────────────────────────────────────
+
 
 def write_base_metadata(
     base_dir: Path,
@@ -2304,6 +3190,8 @@ def write_base_metadata(
     layers: list[int],
     experts_per_layer: dict[int, int],
     known: dict[str, str],
+    compatibility_sha256: str,
+    compatibility_by_layer: dict[str, str],
 ) -> None:
     """Synchronize loader-visible EXL3 config, bitmap, index, and manifest."""
     config_path = base_dir / "config.json"
@@ -2315,25 +3203,33 @@ def write_base_metadata(
         raise CartridgeError(f"{config_path}: config must be an object")
 
     counts = set(experts_per_layer.values())
-    tail = config.setdefault("hybrid_tr3_tail", {})
-    if not isinstance(tail, dict):
+    if len(counts) != 1:
+        raise CartridgeError(
+            "cartridge-capable EXL3 bases require one experts_per_layer value; "
+            f"the selected layers contain {sorted(counts)}"
+        )
+    prior_tail = config.get("hybrid_tr3_tail", {})
+    if not isinstance(prior_tail, dict):
         raise CartridgeError("config.json: hybrid_tr3_tail must be an object")
-    tail.update({
+    # exl3-msrt-base/1 is closed. Replace legacy/mixed-profile metadata rather
+    # than updating it so stale `tp`, policy switches, and unknown fields can
+    # never leak into an artifact the runtime correctly rejects.
+    config["hybrid_tr3_tail"] = {
         "format": "exl3-trellis",
+        "runtime_profile": BASE_RUNTIME_PROFILE,
         "bits": float(base_k),
         "codebook": "mcg",
         "moe_layers": [min(layers), max(layers)],
+        "moe_layer_coverage": sorted(layers),
         "tensor_schema": (
-            "model.layers.{L}.mlp.experts.{E}.{proj}.rank{rank}.{component}"),
-        "tp": 1,
+            "model.layers.{L}.mlp.experts.{E}.{proj}.rank{r}.{trellis|suh|svh|mcg}"
+        ),
+        "tensor_parallel": base_tensor_parallel_contract(),
         "mcg_multiplier": MCG_MULTIPLIER,
-    })
-    if len(counts) == 1:
-        tail["experts_per_layer"] = next(iter(counts))
-    else:
-        tail.pop("experts_per_layer", None)
-    tail.pop("k_values", None)
-    tail.pop("bits_per_expert", None)
+        "compatibility_sha256": compatibility_sha256,
+        "compatibility_by_layer": dict(compatibility_by_layer),
+        "experts_per_layer": next(iter(counts)),
+    }
     config["quantization_config"] = {
         "quant_method": "exl3",
         "bits": float(base_k),
@@ -2362,6 +3258,164 @@ def write_base_metadata(
     regenerate_manifest(base_dir, known)
 
 
+def logical_base_tensor_records(
+    tensor_records: list[dict[str, Any]], base_k: int
+) -> list[dict[str, Any]]:
+    """Normalize and validate the full logical routed-expert tensor namespace.
+
+    Physical ``rank0`` is deliberately removed from the identity. A future
+    rank-sharded publisher can reconstruct the same logical tensor records and
+    retain this digest, while a byte, dtype, shape, name, or bitrate change
+    necessarily changes it.
+    """
+    _validate_base_k(base_k)
+    logical: list[dict[str, Any]] = []
+    groups: dict[tuple[int, int, str], dict[str, dict[str, Any]]] = {}
+    names: set[str] = set()
+    for record in tensor_records:
+        match = BASE_TENSOR_RE.fullmatch(str(record.get("name")))
+        if match is None:
+            raise CartridgeError(
+                f"base compatibility: unexpected tensor {record.get('name')!r}"
+            )
+        if int(match.group("rank")) != 0:
+            raise CartridgeError(
+                f"base compatibility: {record['name']} is not full logical rank0"
+            )
+        component = match.group("component")
+        normalized = f"{match.group('prefix')}.{component}"
+        if normalized in names:
+            raise CartridgeError(
+                f"base compatibility: duplicate logical tensor {normalized!r}"
+            )
+        names.add(normalized)
+        item = {
+            "name": normalized,
+            "dtype": record.get("dtype"),
+            "shape": record.get("shape"),
+            "sha256": record.get("sha256"),
+        }
+        logical.append(item)
+        group = (
+            int(match.group("layer")),
+            int(match.group("expert")),
+            match.group("projection"),
+        )
+        groups.setdefault(group, {})[component] = item
+
+    if not groups:
+        raise CartridgeError("base compatibility: no routed-expert tensors")
+    projections_by_expert: dict[tuple[int, int], set[str]] = {}
+    for layer, expert, projection in groups:
+        projections_by_expert.setdefault((layer, expert), set()).add(projection)
+    for target, projections in sorted(projections_by_expert.items()):
+        if projections != set(PROJECTIONS):
+            raise CartridgeError(
+                f"base compatibility: {target} projections "
+                f"{sorted(projections)} != {sorted(PROJECTIONS)}"
+            )
+    marker_sha = hashlib.sha256(struct.pack("<i", MCG_SENTINEL_SIGNED)).hexdigest()
+    for group, components in sorted(groups.items()):
+        if set(components) != {"trellis", "suh", "svh", "mcg"}:
+            raise CartridgeError(
+                f"base compatibility: {group} components "
+                f"{sorted(components)} are incomplete"
+            )
+        trellis = components["trellis"]
+        suh, svh, mcg = components["suh"], components["svh"], components["mcg"]
+        shape = trellis["shape"]
+        if (
+            trellis["dtype"] != "I16"
+            or not isinstance(shape, list)
+            or len(shape) != 3
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in shape
+            )
+            or shape[-1] != base_k * 16
+        ):
+            raise CartridgeError(
+                f"base compatibility: {group} has invalid K{base_k} trellis "
+                f"{trellis['dtype']} {shape}"
+            )
+        if suh["dtype"] != "F16" or suh["shape"] != [shape[0] * 16]:
+            raise CartridgeError(
+                f"base compatibility: {group} suh does not match trellis input"
+            )
+        if svh["dtype"] != "F16" or svh["shape"] != [shape[1] * 16]:
+            raise CartridgeError(
+                f"base compatibility: {group} svh does not match trellis output"
+            )
+        if mcg["dtype"] != "I32" or mcg["shape"] != [] or mcg["sha256"] != marker_sha:
+            raise CartridgeError(
+                f"base compatibility: {group} has an invalid MCG marker"
+            )
+    return sorted(logical, key=lambda item: item["name"])
+
+
+def base_layer_compatibility_payloads(
+    base_k: int,
+    tensor_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build canonical exact-byte identities independently for each MoE layer."""
+    records = logical_base_tensor_records(tensor_records, base_k)
+    by_layer: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        match = re.match(r"^model\.layers\.([0-9]+)\.", record["name"])
+        assert match is not None
+        by_layer.setdefault(int(match.group(1)), []).append(record)
+    return {
+        str(layer): {
+            "schema": BASE_LAYER_COMPATIBILITY_SCHEMA,
+            "k": _validate_base_k(base_k),
+            "layer": layer,
+            "tensors": tensors,
+        }
+        for layer, tensors in sorted(by_layer.items())
+    }
+
+
+def canonical_sha256(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def base_compatibility_identity(
+    base_k: int, tensor_records: list[dict[str, Any]]
+) -> tuple[str, dict[str, str]]:
+    """Return the full-base root and exact per-layer logical byte identities."""
+    payloads = base_layer_compatibility_payloads(base_k, tensor_records)
+    by_layer = {layer: canonical_sha256(payload) for layer, payload in payloads.items()}
+    root = base_compatibility_root_payload(base_k, by_layer)
+    return canonical_sha256(root), by_layer
+
+
+def base_compatibility_root_payload(
+    base_k: int, compatibility_by_layer: dict[str, str]
+) -> dict[str, Any]:
+    """Build the canonical global family root from exact per-layer digests."""
+    return {
+        "schema": BASE_COMPATIBILITY_SCHEMA,
+        "k": _validate_base_k(base_k),
+        "layers": {
+            layer: compatibility_by_layer[layer]
+            for layer in sorted(compatibility_by_layer, key=int)
+        },
+    }
+
+
+def base_compatibility_sha256(
+    base_k: int,
+    tensor_records: list[dict[str, Any]],
+) -> str:
+    """Identify exact logical base tensors independently of TP/file layout."""
+    return base_compatibility_identity(base_k, tensor_records)[0]
+
+
 def link_or_copy(src: Path, dst: Path) -> None:
     """Hardlink when the filesystem allows it; the payload is identical."""
     if dst.exists():
@@ -2378,6 +3432,8 @@ def write_adapter_config(
     recipe: dict[str, Any],
     assembly: dict[str, Any],
     base_manifest_sha256: str,
+    base_compatibility_sha256: str,
+    base_compatibility_by_layer: dict[str, str],
     shards: list[str],
     tensor_count: int,
     *,
@@ -2391,21 +3447,37 @@ def write_adapter_config(
     config = {
         "schema": schema,
         "assembly": assembly["label"],
-        "base": {"label": base["label"], "k": base["k"],
-                 "manifest_sha256": base_manifest_sha256},
+        "base": {
+            "label": base["label"],
+            "k": base["k"],
+            "manifest_sha256": base_manifest_sha256,
+            "compatibility_sha256": base_compatibility_sha256,
+            "compatibility_by_layer": dict(base_compatibility_by_layer),
+        },
         "chain": [
-            {"label": label, "k": nodes[label]["k"],
-             "parent": nodes[label]["parent"],
-             "experts": nodes[label]["experts"]}
+            {
+                "label": label,
+                "k": nodes[label]["k"],
+                "parent": nodes[label]["parent"],
+                "experts": nodes[label]["experts"],
+            }
             for label in assembly["chain"]
         ],
-        "format": "exl3-msrt-full-rank",
+        "format": "exl3-msrt-packed",
+        "runtime_profile": RUNTIME_PROFILE,
+        "rotation_ownership": "base",
         "standard_lora_compatible": False,
         "runtime_operation": RUNTIME_OPERATION,
         "codebook": "mcg",
         "mcg_multiplier": MCG_MULTIPLIER,
         "mcg_ownership": "adapter-config",
         "scale_shape": [],
+        "tensor_parallel": {
+            "layout": "full",
+            "world_size": 1,
+            "ranks": [0],
+            "axis_by_projection": dict(TP_AXIS_BY_PROJECTION),
+        },
         "shards": shards,
         "num_tensors": tensor_count,
         "tool_version": TOOL_VERSION,
@@ -2424,18 +3496,27 @@ def cmd_finalize(args) -> int:
     recipe_sha = sha256_file(args.recipe)
     layers = recipe["moe_layers"]
     target = Path(args.out).expanduser().resolve()
-    with campaign_lock(target, what="finalize"), no_workers_running(target), \
-            SourceCheckpoint(args.source) as source:
+    with (
+        campaign_lock(target, what="finalize"),
+        no_workers_running(target),
+        SourceCheckpoint(args.source) as source,
+    ):
         base_model, base_revision = resolve_identity(args, source)
         out = prepare_out_dir(
-            args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
-            source=source, base_model=base_model,
-            base_revision=base_revision, force=False,
+            args.out,
+            recipe_path=args.recipe,
+            recipe_sha=recipe_sha,
+            source=source,
+            base_model=base_model,
+            base_revision=base_revision,
+            force=False,
             signer=load_signer(
-                args.sign_key, create=False,
-                outside=(Path(args.out).expanduser().resolve(),
-                         source.root)).pub_hex,
-            block_size=args.block_size)
+                args.sign_key,
+                create=False,
+                outside=(Path(args.out).expanduser().resolve(), source.root),
+            ).pub_hex,
+            block_size=args.block_size,
+        )
         experts_per_layer: dict[int, int] = {}
         expected: dict[str, list[tuple[Path, str, dict[str, str], str]]] = {}
         for layer in layers:
@@ -2444,25 +3525,40 @@ def cmd_finalize(args) -> int:
             blocks = expert_blocks(ids, args.block_size)
             for index, experts in enumerate(blocks):
                 common = {
-                    "schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
+                    "schema": BLOCK_SCHEMA,
+                    "recipe_sha256": recipe_sha,
                     "base_revision": base_revision,
-                    "layer": str(layer), "block": str(index),
+                    "layer": str(layer),
+                    "block": str(index),
                     "experts": ",".join(str(e) for e in experts),
                 }
                 for label, covered in block_outputs(recipe, experts).items():
-                    expected.setdefault(label, []).append((
-                        node_dir(out, recipe, label), block_name(layer, index),
-                        {**common, "label": label,
-                         "covered_experts": ",".join(str(e) for e in covered)},
-                        "expert",
-                    ))
+                    expected.setdefault(label, []).append(
+                        (
+                            node_dir(out, recipe, label),
+                            block_name(layer, index),
+                            {
+                                **common,
+                                "label": label,
+                                "covered_experts": ",".join(str(e) for e in covered),
+                            },
+                            "expert",
+                        )
+                    )
         skeleton = out / "skeleton"
         skeleton_expected = [
-            (skeleton, shard,
-             {"schema": BLOCK_SCHEMA, "recipe_sha256": recipe_sha,
-              "base_revision": base_revision, "kind": "skeleton",
-              "tensor_count": str(len(keys))},
-             "tensor")
+            (
+                skeleton,
+                shard,
+                {
+                    "schema": BLOCK_SCHEMA,
+                    "recipe_sha256": recipe_sha,
+                    "base_revision": base_revision,
+                    "kind": "skeleton",
+                    "tensor_count": str(len(keys)),
+                },
+                "tensor",
+            )
             for shard, keys in sorted(skeleton_keys(source, layers).items())
         ]
 
@@ -2471,11 +3567,21 @@ def cmd_finalize(args) -> int:
         digests: dict[str, dict[str, str]] = {}
         signers: set[str] = set()
         encoders: set[str] = set()
+        observed_source_digests: dict[str, str] = {}
         parents: dict[tuple[str, str], dict[str, Any] | None] = {}
         attested = 0
+        base_labels = {base["label"] for base in recipe["bases"]}
+        base_tensor_records: dict[str, list[dict[str, Any]]] = {
+            label: [] for label in base_labels
+        }
 
-        def check(bucket: str, directory: Path, name: str,
-                  expect: dict[str, str], group_kind: str) -> None:
+        def check(
+            bucket: str,
+            directory: Path,
+            name: str,
+            expect: dict[str, str],
+            group_kind: str,
+        ) -> None:
             """Publish nothing that is not on disk, hashed, and signed for.
 
             Every fragment is re-hashed from the bytes that survived, the recorded
@@ -2493,40 +3599,86 @@ def cmd_finalize(args) -> int:
                 if not shard_is_complete(directory, name, expect):
                     missing.append(f"{bucket}/{name}")
                     return
-                sha, body, spans = verify_shard(target, group_kind=group_kind)
+                verified = verify_shard_details(target, group_kind=group_kind)
+                sha, body, spans = (
+                    verified.sha256,
+                    verified.body_offset,
+                    verified.group_sha256,
+                )
                 payload = read_attestation(directory, name)
             except CartridgeError as exc:
                 broken.append(str(exc))
                 return
             if sha != recorded:
                 broken.append(
-                    f"{bucket}/{name}: on-disk sha256 {sha} != recorded {recorded}")
+                    f"{bucket}/{name}: on-disk sha256 {sha} != recorded {recorded}"
+                )
                 return
             fragment = payload.get("fragment") or {}
             claimed = payload.get(
-                "expert_sha256" if group_kind == "expert" else "tensor_sha256")
-            if (fragment.get("sha256") != sha or fragment.get("file") != name
-                    or fragment.get("size") != target.stat().st_size
-                    or fragment.get("body_offset") != body):
+                "expert_sha256" if group_kind == "expert" else "tensor_sha256"
+            )
+            if (
+                fragment.get("sha256") != sha
+                or fragment.get("file") != name
+                or fragment.get("size") != target.stat().st_size
+                or fragment.get("body_offset") != body
+            ):
                 broken.append(f"{bucket}/{name}: attestation names other bytes")
                 return
             if claimed != spans:
                 broken.append(f"{bucket}/{name}: attested span digests do not hold")
                 return
-            if (payload.get("recipe_sha256") != recipe_sha
-                    or payload.get("base_revision") != base_revision):
+            if (
+                payload.get("recipe_sha256") != recipe_sha
+                or payload.get("base_revision") != base_revision
+            ):
                 broken.append(f"{bucket}/{name}: attests a different source or recipe")
                 return
             expected_predicate = "encode-of" if group_kind == "expert" else "repack-of"
             if payload.get("predicate") != expected_predicate:
                 broken.append(
                     f"{bucket}/{name}: predicate {payload.get('predicate')!r} != "
-                    f"{expected_predicate!r}")
+                    f"{expected_predicate!r}"
+                )
                 return
-            if payload.get("materials", {}).get("encoder_sha256") is not None:
-                encoders.add(payload["materials"]["encoder_sha256"])
+            materials = payload.get("materials")
+            raw_source_shards = (
+                materials.get("source_shards") if isinstance(materials, dict) else None
+            )
+            try:
+                source_shards = validate_source_digest_map(
+                    raw_source_shards,
+                    where=f"{bucket}/{name} attestation materials.source_shards",
+                )
+            except CartridgeError:
+                broken.append(f"{bucket}/{name}: lacks observed source shard digests")
+                return
+            if expected_predicate == "repack-of" and (
+                source_shards.get(materials.get("file")) != materials.get("file_sha256")
+            ):
+                broken.append(f"{bucket}/{name}: repack source digest is inconsistent")
+                return
+            conflicts = {
+                source_name: (observed_source_digests[source_name], digest)
+                for source_name, digest in source_shards.items()
+                if source_name in observed_source_digests
+                and observed_source_digests[source_name] != digest
+            }
+            if conflicts:
+                source_name, (prior, current) = min(conflicts.items())
+                broken.append(
+                    f"{bucket}/{name}: source shard {source_name} has conflicting "
+                    f"observed digests {prior} and {current} across signed fragments"
+                )
+                return
+            observed_source_digests.update(source_shards)
+            if materials.get("encoder_sha256") is not None:
+                encoders.add(materials["encoder_sha256"])
             parents[(bucket, name)] = (payload.get("parents") or [None])[0]
             digests.setdefault(bucket, {})[name] = sha
+            if bucket in base_labels:
+                base_tensor_records[bucket].extend(verified.tensors)
             signers.add(payload["_keyid"])
             attested += 1
 
@@ -2534,7 +3686,6 @@ def cmd_finalize(args) -> int:
         # skeleton shard, because that is what makes it loadable. Finalize must
         # therefore accept those names when it re-runs: a crash or preemption in the
         # middle of a multi-terabyte finalize is a resume, not a lost campaign.
-        base_labels = {base["label"] for base in recipe["bases"]}
         published_skeleton = {name for _d, name, _e, _g in skeleton_expected}
         for label, entries in expected.items():
             for directory, name, expect, group_kind in entries:
@@ -2543,44 +3694,56 @@ def cmd_finalize(args) -> int:
             allowed = {name for _d, name, _e, _g in entries}
             if label in base_labels:
                 allowed |= published_skeleton
-            stale = sorted(path.name for path in directory.glob("model-*.safetensors")
-                           if path.name not in allowed)
+            stale = sorted(
+                path.name
+                for path in directory.glob("model-*.safetensors")
+                if path.name not in allowed
+            )
             if stale:
                 raise CartridgeError(
                     f"{directory} holds {len(stale)} shards this recipe does not "
                     f"describe, e.g. {stale[:3]}. They would land in the "
                     f"regenerated index next to the real ones: remove them or "
-                    f"encode into a fresh --out.")
+                    f"encode into a fresh --out."
+                )
         for directory, name, expect, group_kind in skeleton_expected:
             check("skeleton", directory, name, expect, group_kind)
         expected_skeleton = {name for _d, name, _e, _g in skeleton_expected}
-        stale = sorted(path.name for path in skeleton.glob("model-*.safetensors")
-                       if path.name not in expected_skeleton)
+        stale = sorted(
+            path.name
+            for path in skeleton.glob("model-*.safetensors")
+            if path.name not in expected_skeleton
+        )
         if stale:
             raise CartridgeError(
                 f"{skeleton} holds {len(stale)} shards this recipe does not "
                 f"describe, e.g. {stale[:3]}; they would be published into every "
-                f"base checkpoint.")
+                f"base checkpoint."
+            )
         if missing:
             raise CartridgeError(
                 f"{len(missing)} outputs are missing, e.g. {sorted(missing)[:5]}. "
-                f"Run encode/skeleton to completion before finalize.")
+                f"Run encode/skeleton to completion before finalize."
+            )
         if broken:
             raise CartridgeError(
                 f"{len(broken)} fragments failed verification, e.g. "
                 f"{sorted(broken)[:3]}. Every published fragment must hash to its "
-                f"recorded digest and carry a signed line naming those bytes.")
+                f"recorded digest and carry a signed line naming those bytes."
+            )
         if len(signers) != 1:
             raise CartridgeError(
                 f"fragments are signed by {len(signers)} different keys "
                 f"({sorted(k[:16] for k in signers)}); a campaign must publish one "
-                f"signer identity")
+                f"signer identity"
+            )
         if len(encoders) > 1:
             raise CartridgeError(
                 f"fragments were produced by {len(encoders)} different encoder "
                 f"builds ({sorted(e[:16] for e in encoders)}). A residual is only "
                 f"valid against the reconstruction its own encoder produced: "
-                f"re-encode the affected blocks with one build before publishing.")
+                f"re-encode the affected blocks with one build before publishing."
+            )
         # Every stage shard must name the parent shard bytes it corrects, and that
         # digest must be the one this campaign actually published for the parent.
         node_parents = {stage["label"]: stage["parent"] for stage in recipe["stages"]}
@@ -2591,23 +3754,38 @@ def cmd_finalize(args) -> int:
                     broken.append(f"{bucket}/{name}: a base tier claims a parent")
                 continue
             published = digests.get(expected_parent, {}).get(name)
-            if (not isinstance(claim, dict) or claim.get("label") != expected_parent
-                    or claim.get("file") != name
-                    or claim.get("sha256") != published):
+            if (
+                not isinstance(claim, dict)
+                or claim.get("label") != expected_parent
+                or claim.get("file") != name
+                or claim.get("sha256") != published
+            ):
                 broken.append(
                     f"{bucket}/{name}: attests parent {claim!r}, but this campaign "
-                    f"published {expected_parent}/{name} as {published}")
+                    f"published {expected_parent}/{name} as {published}"
+                )
         if broken:
             raise CartridgeError(
                 f"{len(broken)} fragments are not bound to the reconstruction they "
-                f"correct, e.g. {sorted(broken)[:3]}")
+                f"correct, e.g. {sorted(broken)[:3]}"
+            )
 
         base_manifests: dict[str, str] = {}
+        base_compatibilities: dict[str, str] = {}
+        base_compatibilities_by_layer: dict[str, dict[str, str]] = {}
         for base in recipe["bases"]:
             label = base["label"]
             directory = node_dir(out, recipe, label)
             directory.mkdir(parents=True, exist_ok=True)
             known = dict(digests[label])
+            compatibility_sha256, compatibility_by_layer = base_compatibility_identity(
+                base["k"], base_tensor_records[label]
+            )
+            if set(compatibility_by_layer) != {str(layer) for layer in layers}:
+                raise CartridgeError(
+                    f"base {label!r} logical identity layers "
+                    f"{sorted(compatibility_by_layer)} do not match recipe {layers}"
+                )
             for entry in sorted(skeleton.iterdir()):
                 if entry.name.startswith("."):
                     continue
@@ -2615,8 +3793,7 @@ def cmd_finalize(args) -> int:
                     # Merge, never replace: this base's own digests/ and
                     # attestations/ live here and deleting them would retract the
                     # commit markers for every block already encoded.
-                    shutil.copytree(entry, directory / entry.name,
-                                    dirs_exist_ok=True)
+                    shutil.copytree(entry, directory / entry.name, dirs_exist_ok=True)
                     continue
                 if entry.suffix == ".safetensors":
                     # Immutable payload: one inode shared by every base tier.
@@ -2629,20 +3806,33 @@ def cmd_finalize(args) -> int:
                 if entry.name in digests.get("skeleton", {}):
                     known[entry.name] = digests["skeleton"][entry.name]
             write_base_metadata(
-                directory, base["k"], layers, experts_per_layer, known)
+                directory,
+                base["k"],
+                layers,
+                experts_per_layer,
+                known,
+                compatibility_sha256,
+                compatibility_by_layer,
+            )
+            base_compatibilities[label] = compatibility_sha256
+            base_compatibilities_by_layer[label] = compatibility_by_layer
             base_manifests[label] = sha256_file(directory / "MANIFEST.sha256")
-            print(f"base {label}: K{base['k']} checkpoint finalized in {directory}",
-                  flush=True)
+            print(
+                f"base {label}: K{base['k']} checkpoint finalized in {directory}",
+                flush=True,
+            )
 
         products = []
-        signer = load_signer(args.sign_key, create=False,
-                             outside=(out, Path(args.source)))
+        signer = load_signer(
+            args.sign_key, create=False, outside=(out, Path(args.source))
+        )
         if signer.pub_hex != next(iter(signers)):
             raise CartridgeError(
                 f"--sign-key is {signer.pub_hex[:16]} but every fragment was "
                 f"signed by {next(iter(signers))[:16]}. A consumer pins one key "
                 f"for the plan and the fragments, so two identities would make "
-                f"this campaign unusable.")
+                f"this campaign unusable."
+            )
         for assembly in recipe["assemblies"]:
             shards, tensors = [], 0
             for label in assembly["chain"]:
@@ -2651,57 +3841,75 @@ def cmd_finalize(args) -> int:
                     relative = (directory / name).relative_to(out).as_posix()
                     header, _ = read_header(directory / name)
                     meta = header.pop("__metadata__", None) or {}
-                    shards.append({
-                        "label": label,
-                        "path": relative,
-                        "sha256": digests[label][name],
-                        # Coverage is published *in the signed plan* so a consumer
-                        # who wants 96 experts can decide what to download before
-                        # touching a single payload byte.
-                        "layer": int(meta["layer"]),
-                        "block": int(meta["block"]),
-                        "experts": [int(value) for value
-                                    in meta["covered_experts"].split(",") if value],
-                        "parent_label": node_parents[label],
-                        "parent_sha256": digests[node_parents[label]][name],
-                        # Provenance travels with the shard list so a consumer that
-                        # fetches only this product still gets its signed evidence.
-                        "attestation": attestation_path(
-                            directory, name).relative_to(out).as_posix(),
-                    })
+                    shards.append(
+                        {
+                            "label": label,
+                            "path": relative,
+                            "sha256": digests[label][name],
+                            # Coverage is published *in the signed plan* so a consumer
+                            # who wants 96 experts can decide what to download before
+                            # touching a single payload byte.
+                            "layer": int(meta["layer"]),
+                            "block": int(meta["block"]),
+                            "experts": [
+                                int(value)
+                                for value in meta["covered_experts"].split(",")
+                                if value
+                            ],
+                            "parent_label": node_parents[label],
+                            "parent_sha256": digests[node_parents[label]][name],
+                            # Provenance travels with the shard list so a consumer that
+                            # fetches only this product still gets its signed evidence.
+                            "attestation": attestation_path(directory, name)
+                            .relative_to(out)
+                            .as_posix(),
+                        }
+                    )
                     tensors += len(header)
             expert_counts = set(experts_per_layer.values())
             config = write_adapter_config(
-                out / "assemblies" / assembly["label"], recipe, assembly,
+                out / "assemblies" / assembly["label"],
+                recipe,
+                assembly,
                 base_manifests[assembly["base"]],
-                [entry["path"] for entry in shards], tensors,
-                schema=ASSEMBLY_SCHEMA, filename="assembly.json",
+                base_compatibilities[assembly["base"]],
+                base_compatibilities_by_layer[assembly["base"]],
+                [entry["path"] for entry in shards],
+                tensors,
+                schema=ASSEMBLY_SCHEMA,
+                filename="assembly.json",
                 extra={
                     "paths_relative_to": "campaign root",
                     "campaign": {
                         "recipe_sha256": recipe_sha,
                         "base_model": base_model,
                         "base_revision": base_revision,
-                        "encoder_sha256": (next(iter(encoders)) if encoders
-                                           else None),
+                        "encoder_sha256": (next(iter(encoders)) if encoders else None),
                         "signer_pubkey": next(iter(signers)),
                         "block_size": args.block_size,
                         "moe_layers": layers,
                     },
                     "stage_shards": shards,
                     "bits_per_weight": (
-                        assembly_bpw(recipe, assembly, max(expert_counts))),
-                })
+                        assembly_bpw(recipe, assembly, max(expert_counts))
+                    ),
+                },
+            )
             plan_dir = out / "assemblies" / assembly["label"]
-            (plan_dir / "assembly.jsonl").write_text(
-                signer.sign_line(config) + "\n")
-            products.append({"label": assembly["label"],
-                             "bits_per_weight": config["bits_per_weight"],
-                             "shards": len(shards),
-                             "signed_plan": "assembly.jsonl"})
-            print(f"assembly {assembly['label']}: "
-                  f"{config['bits_per_weight']:.3f} bpw, {len(shards)} stage shards",
-                  flush=True)
+            (plan_dir / "assembly.jsonl").write_text(signer.sign_line(config) + "\n")
+            products.append(
+                {
+                    "label": assembly["label"],
+                    "bits_per_weight": config["bits_per_weight"],
+                    "shards": len(shards),
+                    "signed_plan": "assembly.jsonl",
+                }
+            )
+            print(
+                f"assembly {assembly['label']}: "
+                f"{config['bits_per_weight']:.3f} bpw, {len(shards)} stage shards",
+                flush=True,
+            )
 
         summary = {
             "schema": "fq-msrt-campaign/1",
@@ -2710,36 +3918,57 @@ def cmd_finalize(args) -> int:
             "block_size": args.block_size,
             "moe_layers": layers,
             "experts_per_layer": {str(k): v for k, v in experts_per_layer.items()},
-            "bases": {base["label"]: {"k": base["k"],
-                                      "manifest_sha256": base_manifests[base["label"]]}
-                      for base in recipe["bases"]},
-            "stages": {stage["label"]: {"k": stage["k"], "parent": stage["parent"],
-                                        "shards": len(digests[stage["label"]])}
-                       for stage in recipe["stages"]},
+            "bases": {
+                base["label"]: {
+                    "k": base["k"],
+                    "manifest_sha256": base_manifests[base["label"]],
+                    "compatibility_sha256": base_compatibilities[base["label"]],
+                    "compatibility_by_layer": base_compatibilities_by_layer[
+                        base["label"]
+                    ],
+                    "tensor_parallel": {
+                        "storage_layout": "full-rank",
+                        "runtime_partitioning": "slice-full-rank",
+                    },
+                }
+                for base in recipe["bases"]
+            },
+            "stages": {
+                stage["label"]: {
+                    "k": stage["k"],
+                    "parent": stage["parent"],
+                    "shards": len(digests[stage["label"]]),
+                }
+                for stage in recipe["stages"]
+            },
             "assemblies": products,
             "provenance": {
                 "attested_fragments": attested,
                 "signer_pubkey": next(iter(signers)),
                 "attestation_schema": ATTESTATION_SCHEMA,
-                "predicates": {"expert_shards": "encode-of",
-                               "skeleton_shards": "repack-of"},
-                "note": ("Every fragment carries one signed fq-attestation/1 line "
-                         "under attestations/, naming its own sha256 and the "
-                         "sha256 of each expert's contiguous byte span. Authority "
-                         "over the signing key comes from keys/FINGERPRINTS, not "
-                         "from these files."),
+                "predicates": {
+                    "expert_shards": "encode-of",
+                    "skeleton_shards": "repack-of",
+                },
+                "note": (
+                    "Every fragment carries one signed fq-attestation/1 line "
+                    "under attestations/, naming its own sha256 and the "
+                    "sha256 of each expert's contiguous byte span. Authority "
+                    "over the signing key comes from keys/FINGERPRINTS, not "
+                    "from these files."
+                ),
             },
             "encoded_bits_per_weight": encoded_bits_per_weight(
-                recipe, max(set(experts_per_layer.values()))),
+                recipe, max(set(experts_per_layer.values()))
+            ),
             "created_utc": now_utc(),
         }
-        (out / "campaign_summary.json").write_text(
-            json.dumps(summary, indent=2) + "\n")
+        (out / "campaign_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(f"\nFinalized {out}", flush=True)
         return 0
 
-
     # ── Plan ──────────────────────────────────────────────────────────────────
+
 
 def cmd_plan(args) -> int:
     """Report the work list, staged shard reads, and product bitrates."""
@@ -2755,12 +3984,14 @@ def cmd_plan(args) -> int:
             blocks = expert_blocks(ids, args.block_size)
             shards = sorted({shard for shard in source.layer_keys(layer).values()})
             matrices += len(ids) * len(PROJECTIONS)
-            per_layer.append({
-                "layer": layer,
-                "experts": len(ids),
-                "blocks": len(blocks),
-                "shards": source.shard_bytes(set(shards)),
-            })
+            per_layer.append(
+                {
+                    "layer": layer,
+                    "experts": len(ids),
+                    "blocks": len(blocks),
+                    "shards": source.shard_bytes(set(shards)),
+                }
+            )
         expert_count = max(expert_counts)
         nodes = node_index(recipe)
         # The skeleton spans the whole model, so its shards are not a function
@@ -2782,20 +4013,25 @@ def cmd_plan(args) -> int:
             "layout": source.layout,
             "absent_source_shards": source.absent_shards[:20],
             "block_size": args.block_size,
-            "nodes": {label: {"k": node["k"],
-                              "parent": node.get("parent"),
-                              "experts": selected_count(node, expert_count)}
-                      for label, node in nodes.items()},
+            "nodes": {
+                label: {
+                    "k": node["k"],
+                    "parent": node.get("parent"),
+                    "experts": selected_count(node, expert_count),
+                }
+                for label, node in nodes.items()
+            },
             "quantization_passes_per_matrix": len(nodes),
             "matrices": matrices,
             "blocks": sum(entry["blocks"] for entry in per_layer),
-            "encoded_bits_per_weight": encoded_bits_per_weight(
-                recipe, expert_count),
+            "encoded_bits_per_weight": encoded_bits_per_weight(recipe, expert_count),
             "assemblies": [
-                {"label": assembly["label"],
-                 "base": assembly["base"],
-                 "chain": assembly["chain"],
-                 "bits_per_weight": assembly_bpw(recipe, assembly, expert_count)}
+                {
+                    "label": assembly["label"],
+                    "base": assembly["base"],
+                    "chain": assembly["chain"],
+                    "bits_per_weight": assembly_bpw(recipe, assembly, expert_count),
+                }
                 for assembly in recipe["assemblies"]
             ],
             "skeleton_only_shards": source.shard_bytes(skeleton_only),
@@ -2810,31 +4046,47 @@ def cmd_plan(args) -> int:
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
+
 def _add_common(parser: argparse.ArgumentParser, *, out_required: bool = True) -> None:
-    parser.add_argument("--source", required=True, type=Path,
-                        help="Source BF16 checkpoint directory")
-    parser.add_argument("--recipe", required=True, type=Path,
-                        help="Cartridge recipe JSON (fq-cartridge/2)")
-    parser.add_argument("--out", required=out_required, type=Path,
-                        help="Campaign output directory")
-    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE,
-                        help="Experts per resumable work block")
+    parser.add_argument(
+        "--source", required=True, type=Path, help="Source BF16 checkpoint directory"
+    )
+    parser.add_argument(
+        "--recipe",
+        required=True,
+        type=Path,
+        help="Cartridge recipe JSON (fq-cartridge/2)",
+    )
+    parser.add_argument(
+        "--out", required=out_required, type=Path, help="Campaign output directory"
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help="Experts per resumable work block",
+    )
     # Artifact identity: what every attestation pins and what the campaign
     # sentinel is bound to. Inferred from a Hugging Face snapshot path.
-    parser.add_argument("--base-model",
-                        help="Source model id, e.g. zai-org/GLM-5.2")
-    parser.add_argument("--base-revision",
-                        help="Immutable 40-hex source commit")
-    parser.add_argument("--source-digests", type=Path,
-                        help="JSON map of source file -> sha256 (or a Hugging "
-                             "Face tree listing); avoids re-hashing shards")
+    parser.add_argument("--base-model", help="Source model id, e.g. zai-org/GLM-5.2")
+    parser.add_argument("--base-revision", help="Immutable 40-hex source commit")
+    parser.add_argument(
+        "--source-digests",
+        type=Path,
+        help="JSON map of expected source file -> sha256 (or a Hugging "
+        "Face tree listing); observed staged bytes must match",
+    )
 
 
 def _add_signing(parser: argparse.ArgumentParser) -> None:
     """Every emitted fragment is signed; there is no opt-out, because an
     unattested shard can be neither published nor verified."""
-    parser.add_argument("--sign-key", required=True, type=Path,
-                        help="ed25519 seed file; created if absent")
+    parser.add_argument(
+        "--sign-key",
+        required=True,
+        type=Path,
+        help="ed25519 seed file; created if absent",
+    )
 
 
 def main(argv=None) -> int:
@@ -2847,28 +4099,42 @@ def main(argv=None) -> int:
     plan.add_argument("--out-plan", type=Path, help="Also write the plan JSON")
 
     skel = sub.add_parser(
-        "skeleton", help="Copy every non-expert tensor into the campaign")
+        "skeleton", help="Copy every non-expert tensor into the campaign"
+    )
     _add_common(skel)
     _add_signing(skel)
-    skel.add_argument("--force", action="store_true",
-                      help="Rewrite skeleton shards that are already complete")
+    skel.add_argument(
+        "--force",
+        action="store_true",
+        help="Rewrite skeleton shards that are already complete",
+    )
 
     enc = sub.add_parser("encode", help="Encode base tiers and residual stages")
     _add_common(enc)
     _add_signing(enc)
-    enc.add_argument("--encoder-source", required=True, type=Path,
-                     help="Path to exllamav3 Python package")
+    enc.add_argument(
+        "--encoder-source",
+        required=True,
+        type=Path,
+        help="Path to exllamav3 Python package",
+    )
     enc.add_argument("--device", default="cuda:0")
-    enc.add_argument("--devices",
-                     help="Comma-separated devices; runs one worker each")
+    enc.add_argument("--devices", help="Comma-separated devices; runs one worker each")
     enc.add_argument("--layers", help="Layer subset, e.g. 3-10,40")
     enc.add_argument("--shard-index", type=int, default=0)
     enc.add_argument("--shard-count", type=int, default=1)
-    enc.add_argument("--force", action="store_true",
-                     help="Re-encode blocks that are already complete")
-    enc.add_argument("--tile-batch", type=int, default=TILE_BATCH,
-                     help=f"Tiles per trellis launch (default {TILE_BATCH}; "
-                          f"measured optimum on Blackwell)")
+    enc.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-encode blocks that are already complete",
+    )
+    enc.add_argument(
+        "--tile-batch",
+        type=int,
+        default=TILE_BATCH,
+        help=f"Tiles per trellis launch (default {TILE_BATCH}; "
+        f"measured optimum on Blackwell)",
+    )
 
     fin = sub.add_parser("finalize", help="Complete bases and write contracts")
     _add_common(fin)

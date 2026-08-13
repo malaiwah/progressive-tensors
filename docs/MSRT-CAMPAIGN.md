@@ -615,8 +615,11 @@ against a source directory holding only those two files. That holds for an
 would have to open shards, so keep its payload until finalize.
 
 Optional but recommended: fetch the hub's own LFS digests once and pass them as
-`--source-digests`, so the skeleton pass never re-hashes source payloads to
-attest what it copied:
+`--source-digests`. They are expectations, not a substitute for observation.
+Every skeleton shard and encode block copies and hashes one `O_NOFOLLOW`
+regular-file fd into private `0600` staging, checks the inode before and after,
+and deserializes only that copy. The digest from that same read is what the
+attestation records; a supplied, manifest, or cached value must match it:
 
 ```bash
 curl -s "https://huggingface.co/api/models/$REPO_ID/tree/$REV?recursive=1" \
@@ -635,9 +638,12 @@ many were absent; re-run after every window, completed shards are skipped. It
 also creates the signing key, so run it before any parallel encode.
 
 **Measured shape:** 85 of GLM-5.2's 282 shards hold non-expert tensors, 1,217
-tensors totalling 37.8 GB. Without `--source-digests`, those 85 shards
-(~454 GB) are hashed once each to pin `repack-of` materials; digests are cached
-in `$CAMPAIGN/source-digests.json` so windows never repeat the work.
+tensors totalling 37.8 GB. Without `--source-digests`, the first observed hash
+becomes the expectation for later windows in
+`$CAMPAIGN/source-digests.json`. The cache detects drift but never suppresses
+the staging/hash pass. Plan transient disk space for one source shard during a
+skeleton transaction, or the distinct shards needed by one expert block during
+encode. Private copies are removed on success and exceptions.
 
 ### 4.3 Encode
 
@@ -799,33 +805,99 @@ fq-combine-cartridges --root $CAMPAIGN --assembly k2-k4like-direct \
   --out ./k4like-hot96 --experts 0-95 --trust-key $KEYID
 ```
 
-`--base` is optional but worth passing whenever the base checkpoint is local: it
-compares the base's `MANIFEST.sha256` with the digest the plan pins and checks
-that the chain's first stage names the base block bytes this checkpoint
-publishes. A cartridge applied to a different base corrects other weights.
+`--base` is optional but worth passing whenever the base checkpoint is local.
+It hashes every file named by the physical `MANIFEST.sha256`, rejects unlisted
+files, re-derives every expert span and logical tensor digest, validates the
+base fragment's signed file/hash/size/body-offset/span claims, and checks the
+first residual edge against those loaded bytes. The physical manifest pin
+stays in the signed assembly plan and is omitted from runtime adapter/3; it is
+deliberately not presented as a runtime guarantee the loader cannot check.
+
+Each MoE layer has its own runtime identity. The layer digest is SHA-256 over
+canonical JSON with schema `fq-msrt-base-layer-compatibility/1`, base K, layer
+number, and sorted logical routed-expert tensor records
+`{name,dtype,shape,sha256}`. Each tensor digest covers its raw little-endian
+contiguous payload; the logical name removes physical `.rank0`. File names,
+safetensors headers and shard boundaries are excluded. These identities bind
+exact bytes while remaining unchanged when the same logical tensors are
+partitioned for TP.
+
+The base stores the complete map as `compatibility_by_layer`. Its family root
+`compatibility_sha256` hashes canonical
+`{"schema":"fq-msrt-base-compatibility/2","k":K,"layers":<full map>}`.
+An adapter carries that root plus only the map entries for its exact
+`selected_layers`. A target or MTP process verifies each selected layer it
+locally owns against base metadata; the family root binds provenance across
+the complete checkpoint but is not falsely claimed to be recomputed by a
+worker that never loads all layers. The current companion vLLM profile rejects
+pipeline parallelism explicitly; this identity design does not advertise PP
+support.
 
 `--trust-key` is required (or an explicit `--insecure-unsigned`). With it, the
-combiner verifies the signed plan, requires the campaign identity in the plan to
-match every fragment's attestation, checks each chain edge against the parent
-digest, re-hashes each selected shard and its per-expert spans, and validates
-tensor rank, dtypes, trellis/vector geometry and a finite positive rescale
-factor. Selection is decided from the signed plan *before* any payload is
-touched, so a narrowing consumer only needs the shards it selected. A requested
-expert or layer that the product does not carry is an error, not a silent
-downgrade. The emitted `fq-cartridge-adapter/2` records the base manifest it is
-bound to, the campaign identity, the verified signer, and per-stage per-layer
-coverage.
+combiner verifies the signed plan, campaign identity, every chain edge, each
+selected shard and per-expert span, and the tensor geometry and rescaling
+contract. Selection is decided from the signed plan before payload download. A
+requested expert or layer that the product does not carry is an error.
 
-## 6. Runtime constraint (still the blocker for serving)
+The emitted (pre-merge, not-yet-published) `fq-cartridge-adapter/3` directory is
+self-contained. Its
+`adapter_config.json` records the base compatibility identity, ordered chain
+and per-stage bitrate, MCG convention, TP layout and explicit ranks, coverage,
+and the path, size and SHA-256 digest of every safetensors shard. Its
+`producer_verified_signer` records which pinned key the combiner checked (or
+null for an explicitly unsigned combine); it is provenance, **not runtime
+authentication**. The runtime verifies shard hashes but does not authenticate
+that field. Do not move a shard without its manifest or edit a shard after
+combining it.
 
-These cartridges are full-rank additive trellis weights. Loading them needs an
-EXL3 MSRT-aware runtime; standard `add_lora` cannot. The reference
-implementation is
-[local-inference-lab/vllm#299](https://github.com/local-inference-lab/vllm/pull/299),
-still draft, currently TP=1 with one model-wide slot and dense FP16 shadow
-weights — which cannot hold GLM-5.2's 734 G routed weights on any single node.
-Encoding and publishing the artifacts does not depend on that PR; serving them
-at scale does.
+Producer and runtime share hard resource limits: `adapter_config.json` is at
+most 16 MiB, each shard at most 64 GiB, and all manifest-listed shards at most
+1 TiB. The combiner refuses to publish an artifact the runtime would reject.
+
+Adapter/3 is closed: unknown fields are rejected. It fixes
+`runtime_profile: exl3-msrt-additive/1`, `format: exl3-msrt-packed`,
+`rotation_ownership: base`, MCG codebook/multiplier, scalar positive float32
+stage scales, and the numerical operation
+`base + sum(stage / scale)`. Each covered `(layer, expert, projection, stage,
+rank)` has exactly one packed int16 `trellis_<label>` and one scalar float32
+`scale_<label>`; `suh`, `svh`, and codebook markers remain base-owned.
+
+## 6. Runtime loading
+
+These cartridges are additive trellis weights, not PEFT LoRA adapters. Serve
+the finalized `base/<label>` checkpoint with the EXL3 cartridge runtime, then
+pass the combined adapter directory to vLLM:
+
+```bash
+curl -X POST http://localhost:8000/load_exl3_cartridge \
+  -H 'content-type: application/json' \
+  -d '{"adapter_path":"/srv/cartridges/k4like"}'
+curl http://localhost:8000/exl3_cartridge_status
+curl -X POST http://localhost:8000/deactivate_exl3_cartridge
+```
+
+The HTTP routes require `VLLM_SERVER_DEV_MODE=1`. They are unauthenticated
+development endpoints; the path must resolve identically on every worker and
+must not be controlled by an untrusted client. The runtime keeps residual
+trellises packed, supports one model-wide slot, and recaptures CUDA graphs
+after load and deactivation. Runtime enablement is serving policy and is not
+baked into `quantization_config` by the artifact producer.
+
+The base has `runtime_profile: exl3-msrt-base/1`, exact
+`moe_layer_coverage`, and a closed `tensor_parallel` object declaring
+`storage_layout: full-rank`, storage rank `[0]`, 128-wide slice alignment and
+projection axes (gate/up output, down input). There is no ambiguous top-level
+`tp`. vLLM loads logical rank0 on each worker and slices at weight finalization,
+so the same base serves every TP size whose local intermediate dimension is
+128-aligned.
+
+The combiner defaults to `--tp-layout full --tp-world-size 1`: the manifest
+declares layout `full`, rank `[0]`, and any aligned runtime TP slices it. To
+materialize fixed ranks use, for example, `--tp-layout rank-sharded
+--tp-world-size 4`. That manifest declares ranks `[0,1,2,3]`; runtime TP must
+equal four. `rank-sharded` with world size one is intentionally distinct from
+`full` even though both tensor namespaces contain rank0—the manifest, never a
+rank-count heuristic, decides the semantics.
 
 ## 7. Trust-path scope
 

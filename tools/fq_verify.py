@@ -89,6 +89,7 @@ import hashlib
 import json
 import mmap
 import random
+import re
 import struct
 import sys
 import time
@@ -160,6 +161,29 @@ def validate_attestation_payload(payload: dict, *, where: str) -> None:
             not isinstance(derivation.get("rule"), str) or
             not derivation["rule"]):
         fail("derivation")
+
+    # fq_assemble_lora/3 signs the digest observed while privately staging
+    # every source shard consumed. Preserve older fq-attestation/1 producers,
+    # but do not accept a downgraded line when that stronger producer is named.
+    tool = payload.get("tool")
+    if (isinstance(tool, dict) and
+            tool.get("name") == "fq_assemble_lora" and
+            tool.get("version") == "fq_assemble_lora/3" and
+            payload.get("predicate") in {"encode-of", "repack-of"}):
+        materials = payload.get("materials")
+        source_shards = (materials.get("source_shards")
+                         if isinstance(materials, dict) else None)
+        if (not isinstance(source_shards, dict) or not source_shards or
+                any(not isinstance(name, str) or
+                    re.fullmatch(
+                        r"(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+\.safetensors", name
+                    ) is None or not is_sha256(digest)
+                    for name, digest in source_shards.items())):
+            fail("materials.source_shards")
+        if (payload["predicate"] == "repack-of" and
+                source_shards.get(materials.get("file")) !=
+                materials.get("file_sha256")):
+            fail("materials source binding")
 
 
 

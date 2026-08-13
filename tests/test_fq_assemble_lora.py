@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ FRUIT_RECIPE = RECIPES / "fruit-k2-k3k4-cart.json"
 
 
 # ── Recipes ───────────────────────────────────────────────────────────────
+
 
 def write_recipe(path: Path, **overrides) -> Path:
     recipe = {
@@ -45,9 +47,15 @@ def test_requested_glm_graph_encodes_nine_products_in_nine_passes():
         for assembly in recipe["assemblies"]
     }
     assert bitrates == {
-        "k2": 2.0, "k2-k3like": 3.0, "k2-k4like-stepped": 4.0,
-        "k2-k4like-direct": 4.0, "k2-k5like": 5.0, "k3": 3.0,
-        "k3-k4like": 4.0, "k3-k5like-stepped": 5.0, "k3-k5like-direct": 5.0,
+        "k2": 2.0,
+        "k2-k3like": 3.0,
+        "k2-k4like-stepped": 4.0,
+        "k2-k4like-direct": 4.0,
+        "k2-k5like": 5.0,
+        "k3": 3.0,
+        "k3-k4like": 4.0,
+        "k3-k5like-stepped": 5.0,
+        "k3-k5like-direct": 5.0,
     }
     # Nine products spanning 35 bits would cost 35 passes encoded separately;
     # sharing parents emits 14 bits in 9 passes.
@@ -62,31 +70,55 @@ def test_partial_stage_reports_its_real_mixed_bitrate():
     assert lora.encoded_bits_per_weight(recipe, 256) == pytest.approx(3.375)
 
 
-@pytest.mark.parametrize("overrides,message", [
-    ({"schema": "fq-cartridge/1"}, "schema must be"),
-    ({"bases": []}, "non-empty"),
-    ({"bases": [{"label": "k2", "k": 9}]}, "1..6"),
-    ({"bases": [{"label": "k2", "k": 2, "experts": [0]}]}, "bases cover all"),
-    ({"bases": [{"label": "k2", "k": 2}, {"label": "k2", "k": 3}]}, "duplicate"),
-    ({"stages": [{"label": "res1", "k": 1, "parent": "nope", "experts": "all"}]},
-     "is not a base or an earlier stage"),
-    ({"stages": [
-        {"label": "a", "k": 1, "parent": "b", "experts": "all"},
-        {"label": "b", "k": 1, "parent": "k2", "experts": "all"}]},
-     "parent-first"),
-    ({"stages": [
-        {"label": "res1", "k": 1, "parent": "k2", "experts": [0, 1]},
-        {"label": "res2", "k": 1, "parent": "res1", "experts": [1, 2]}]},
-     "subset of parent"),
-    ({"stages": [{"label": "res1", "k": 1, "parent": "k2", "experts": [0, 0]}]},
-     "unique non-negative"),
-    ({"moe_layers": []}, "moe_layers"),
-    ({"moe_layers": [1, 1]}, "moe_layers"),
-    ({"assemblies": [{"label": "x", "base": "nope", "chain": []}]},
-     "is not declared"),
-    ({"assemblies": [{"label": "x", "base": "k2", "chain": ["ghost"]}]},
-     "declared stage labels"),
-])
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"schema": "fq-cartridge/1"}, "schema must be"),
+        ({"bases": []}, "non-empty"),
+        ({"bases": [{"label": "k2", "k": 9}]}, "2..6"),
+        ({"bases": [{"label": "k1", "k": 1}]}, "2..6"),
+        ({"bases": [{"label": "k2", "k": 2, "experts": [0]}]}, "bases cover all"),
+        ({"bases": [{"label": "k2", "k": 2}, {"label": "k2", "k": 3}]}, "duplicate"),
+        ({"bases": [{"label": "_k2", "k": 2}]}, "label must match"),
+        ({"bases": [{"label": "k.2", "k": 2}]}, "label must match"),
+        (
+            {"stages": [{"label": "res1", "k": 1, "parent": "nope", "experts": "all"}]},
+            "is not a base or an earlier stage",
+        ),
+        (
+            {
+                "stages": [
+                    {"label": "a", "k": 1, "parent": "b", "experts": "all"},
+                    {"label": "b", "k": 1, "parent": "k2", "experts": "all"},
+                ]
+            },
+            "parent-first",
+        ),
+        (
+            {
+                "stages": [
+                    {"label": "res1", "k": 1, "parent": "k2", "experts": [0, 1]},
+                    {"label": "res2", "k": 1, "parent": "res1", "experts": [1, 2]},
+                ]
+            },
+            "subset of parent",
+        ),
+        (
+            {"stages": [{"label": "res1", "k": 1, "parent": "k2", "experts": [0, 0]}]},
+            "unique non-negative",
+        ),
+        ({"moe_layers": []}, "moe_layers"),
+        ({"moe_layers": [1, 1]}, "moe_layers"),
+        (
+            {"assemblies": [{"label": "x", "base": "nope", "chain": []}]},
+            "is not declared",
+        ),
+        (
+            {"assemblies": [{"label": "x", "base": "k2", "chain": ["ghost"]}]},
+            "declared stage labels",
+        ),
+    ],
+)
 def test_recipe_validation_rejects_unsafe_or_ambiguous_graphs(
     tmp_path: Path, overrides: dict, message: str
 ):
@@ -102,7 +134,8 @@ def test_assembly_chain_must_be_one_path_through_the_graph(tmp_path: Path):
             {"label": "a", "k": 1, "parent": "k2", "experts": "all"},
             {"label": "b", "k": 1, "parent": "k2", "experts": "all"},
         ],
-        assemblies=[{"label": "both", "base": "k2", "chain": ["a", "b"]}])
+        assemblies=[{"label": "both", "base": "k2", "chain": ["a", "b"]}],
+    )
     with pytest.raises(lora.CartridgeError, match="one path"):
         lora.load_recipe(path)
 
@@ -117,6 +150,7 @@ def test_stage_selection_is_per_expert():
 
 
 # ── Work partitioning ─────────────────────────────────────────────────────
+
 
 def test_expert_blocks_are_stable_and_cover_every_expert():
     blocks = lora.expert_blocks([5, 1, 4, 3, 2, 0], 4)
@@ -140,6 +174,7 @@ def test_layer_selection_rejects_layers_outside_the_recipe():
 
 
 # ── Source checkpoint ─────────────────────────────────────────────────────
+
 
 def expert_key(layer: int, expert: int, projection: str) -> str:
     return f"model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"
@@ -168,12 +203,16 @@ def build_source(root: Path, layers=(3, 4), experts=4, size=128, extra=True):
     from safetensors.torch import save_file
 
     root.mkdir(parents=True, exist_ok=True)
-    (root / "config.json").write_text(json.dumps({
-        "num_hidden_layers": max(layers) + 1,
-        "n_routed_experts": experts,
-        "hidden_size": size,
-        "moe_intermediate_size": size,
-    }))
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": max(layers) + 1,
+                "n_routed_experts": experts,
+                "hidden_size": size,
+                "moe_intermediate_size": size,
+            }
+        )
+    )
     (root / "tokenizer_config.json").write_text("{}")
     generator = torch.Generator().manual_seed(7)
     for layer in layers:
@@ -181,12 +220,15 @@ def build_source(root: Path, layers=(3, 4), experts=4, size=128, extra=True):
         for expert in range(experts):
             for projection in lora.PROJECTIONS:
                 tensors[expert_key(layer, expert, projection)] = torch.randn(
-                    size, size, generator=generator).to(torch.bfloat16)
+                    size, size, generator=generator
+                ).to(torch.bfloat16)
         if extra:
             tensors[f"model.layers.{layer}.mlp.gate.weight"] = torch.randn(
-                experts, size, generator=generator).to(torch.bfloat16)
+                experts, size, generator=generator
+            ).to(torch.bfloat16)
             tensors[f"model.layers.{layer}.input_layernorm.weight"] = torch.ones(
-                size, dtype=torch.bfloat16)
+                size, dtype=torch.bfloat16
+            )
         save_file(tensors, str(root / f"model-layer-{layer:03d}.safetensors"))
     return root
 
@@ -197,6 +239,20 @@ def test_source_reader_resolves_per_layer_experts(tmp_path: Path):
         assert source.layout == lora.SourceCheckpoint.PER_LAYER
         assert sorted(source.experts(3)) == [0, 1, 2, 3]
         assert source.experts(3)[2]["up_proj"] == expert_key(3, 2, "up_proj")
+        with pytest.raises(lora.CartridgeError, match="requires private staging"):
+            source.tensor("model-layer-003.safetensors", expert_key(3, 0, "gate_proj"))
+
+
+def test_source_reader_rejects_ambiguous_per_layer_shard_names(tmp_path: Path):
+    root = build_source(tmp_path / "src", layers=(3,), experts=1)
+    (root / "model-layer-0003.safetensors").write_bytes(
+        (root / "model-layer-003.safetensors").read_bytes()
+    )
+    with (
+        lora.SourceCheckpoint(root) as source,
+        pytest.raises(lora.CartridgeError, match="exactly one per-layer shard"),
+    ):
+        source.layer_shard(3)
 
 
 def test_source_reader_resolves_indexed_shards(tmp_path: Path):
@@ -211,11 +267,144 @@ def test_source_reader_resolves_indexed_shards(tmp_path: Path):
         weight_map[f"model.layers.{layer}.mlp.gate.weight"] = shard
         weight_map[f"model.layers.{layer}.input_layernorm.weight"] = shard
     (root / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": weight_map}))
+        json.dumps({"weight_map": weight_map})
+    )
     with lora.SourceCheckpoint(root) as source:
         assert source.layout == lora.SourceCheckpoint.INDEXED
         assert sorted(source.experts(4)) == [0, 1, 2, 3]
         assert source.absent_shards == []
+
+
+def test_source_staging_binds_one_inode_and_cleans_private_bytes(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    root = build_source(tmp_path / "src", layers=(3,), experts=1)
+    shard = "model-layer-003.safetensors"
+    original_sha = lora.sha256_file(root / shard)
+    out = tmp_path / "campaign"
+
+    with lora.SourceCheckpoint(root) as source:
+        key = source.experts(3)[0]["gate_proj"]
+        registry = lora.SourceDigestRegistry(source, out, {shard: original_sha})
+        with source.stage_shards({shard}, out, registry) as observed:
+            staged = source._staged_paths[shard]
+            assert staged.stat().st_mode & 0o777 == 0o600
+            assert staged.parent.stat().st_mode & 0o777 == 0o700
+            before_swap = source.tensor(shard, key).clone()
+
+            replacement = root / "replacement.safetensors"
+            tensors = {
+                expert_key(3, 0, projection): torch.full(
+                    (128, 128), 9, dtype=torch.bfloat16
+                )
+                for projection in lora.PROJECTIONS
+            }
+            tensors["model.layers.3.mlp.gate.weight"] = torch.full(
+                (1, 128), 9, dtype=torch.bfloat16
+            )
+            tensors["model.layers.3.input_layernorm.weight"] = torch.full(
+                (128,), 9, dtype=torch.bfloat16
+            )
+            save_file(tensors, replacement)
+            os.replace(replacement, root / shard)
+
+            assert torch.equal(source.tensor(shard, key), before_swap)
+            assert observed == {shard: original_sha}
+
+    assert json.loads((out / "source-digests.json").read_text()) == {
+        shard: original_sha
+    }
+    assert not any((out / lora.SOURCE_STAGING_DIR).iterdir())
+
+
+def test_source_staging_rejects_expected_and_cached_digest_drift(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    root = build_source(tmp_path / "src", layers=(3,), experts=1)
+    shard = "model-layer-003.safetensors"
+    expected_a = lora.sha256_file(root / shard)
+    save_file(
+        {
+            expert_key(3, 0, projection): torch.full(
+                (128, 128), 4, dtype=torch.bfloat16
+            )
+            for projection in lora.PROJECTIONS
+        },
+        root / shard,
+    )
+    assert lora.sha256_file(root / shard) != expected_a
+
+    out = tmp_path / "expected-mismatch"
+    with lora.SourceCheckpoint(root) as source:
+        registry = lora.SourceDigestRegistry(source, out, {shard: expected_a})
+        with (
+            pytest.raises(lora.CartridgeError, match="not expected"),
+            source.stage_shards({shard}, out, registry),
+        ):
+            pass
+    assert not any((out / lora.SOURCE_STAGING_DIR).iterdir())
+
+    stale = tmp_path / "stale-cache"
+    stale.mkdir()
+    (stale / "source-digests.json").write_text(json.dumps({shard: "0" * 64}))
+    with lora.SourceCheckpoint(root) as source:
+        registry = lora.SourceDigestRegistry(source, stale)
+        with (
+            pytest.raises(lora.CartridgeError, match="not expected"),
+            source.stage_shards({shard}, stale, registry),
+        ):
+            pass
+    assert not any((stale / lora.SOURCE_STAGING_DIR).iterdir())
+
+
+def test_source_digest_declarations_fail_closed(tmp_path: Path):
+    root = build_source(tmp_path / "src", layers=(3,), experts=1)
+    shard = "model-layer-003.safetensors"
+    declarations = tmp_path / "source-digests.json"
+    declarations.write_text(
+        json.dumps({shard: "not-a-sha256", "unrelated.bin": "0" * 64})
+    )
+    with pytest.raises(lora.CartridgeError, match="invalid source digest entry"):
+        lora.load_digest_map(declarations)
+
+    (root / "MANIFEST.sha256").write_text(f"{'0' * 64}  {shard}\n{'1' * 64}  {shard}\n")
+    with (
+        lora.SourceCheckpoint(root) as source,
+        pytest.raises(lora.CartridgeError, match="duplicate claim"),
+    ):
+        lora.SourceDigestRegistry(source, tmp_path / "duplicate")
+
+    (root / "MANIFEST.sha256").write_text(f"{'0' * 64}  ../escape.safetensors\n")
+    with (
+        lora.SourceCheckpoint(root) as source,
+        pytest.raises(lora.CartridgeError, match="invalid source digest entry"),
+    ):
+        lora.SourceDigestRegistry(source, tmp_path / "unsafe")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
+def test_source_staging_rejects_nonregular_entries(tmp_path: Path, kind: str):
+    root = tmp_path / kind / "src"
+    root.mkdir(parents=True)
+    (root / "config.json").write_text("{}")
+    shard = root / "model-layer-003.safetensors"
+    if kind == "symlink":
+        target = root / "target.safetensors"
+        target.write_bytes(b"not-a-shard")
+        shard.symlink_to(target.name)
+    elif kind == "fifo":
+        os.mkfifo(shard)
+    else:
+        shard.mkdir()
+    out = tmp_path / kind / "campaign"
+    with lora.SourceCheckpoint(root) as source:
+        registry = lora.SourceDigestRegistry(source, out)
+        with (
+            pytest.raises(lora.CartridgeError, match="regular file"),
+            source.stage_shards({shard.name}, out, registry),
+        ):
+            pass
+    assert not any((out / lora.SOURCE_STAGING_DIR).iterdir())
 
 
 def test_skeleton_keeps_router_and_norms_and_drops_quantized_experts(tmp_path: Path):
@@ -232,6 +421,7 @@ def test_skeleton_keeps_router_and_norms_and_drops_quantized_experts(tmp_path: P
 
 # ── Quantization primitives ───────────────────────────────────────────────
 
+
 def identity_hadamard(size, device, dtype, scale):
     torch = pytest.importorskip("torch")
     return torch.eye(size, device=device, dtype=dtype)
@@ -242,11 +432,11 @@ def test_zero_weight_serialized_scales_are_finite_and_round_trip():
     device = torch.device("cpu")
     weight = torch.zeros(lora.HADAMARD_BLOCK, lora.HADAMARD_BLOCK)
     regularized, suh, svh = lora.regularize_with_vectors(
-        weight, device, identity_hadamard, 1.24371088)
+        weight, device, identity_hadamard, 1.24371088
+    )
     assert torch.isfinite(suh).all() and (suh != 0).all()
     assert torch.isfinite(svh).all() and (svh != 0).all()
-    restored = lora.inverse_regularize(
-        regularized, suh, svh, device, identity_hadamard)
+    restored = lora.inverse_regularize(regularized, suh, svh, device, identity_hadamard)
     assert torch.equal(restored, weight)
 
 
@@ -287,8 +477,7 @@ def rounding_quantizer(tiles, options):
     """Lossy but deterministic stand-in for the Viterbi trellis encoder."""
     torch = pytest.importorskip("torch")
     step = 2.0 ** -options["K"]
-    return (tiles / step).round() * step, torch.zeros_like(
-        tiles, dtype=torch.int16)
+    return (tiles / step).round() * step, torch.zeros_like(tiles, dtype=torch.int16)
 
 
 FAKE_IDENTITY = {
@@ -301,9 +490,14 @@ FAKE_IDENTITY = {
 
 def fake_encoder(ext=None) -> lora.Encoder:
     return lora.Encoder(
-        ext=ext or FakeExtension(), ghd=identity_hadamard,
-        tcp=identity_permutation, tcpi=identity_permutation,
-        qtf=rounding_quantizer, cbs=1.24371088, identity=FAKE_IDENTITY)
+        ext=ext or FakeExtension(),
+        ghd=identity_hadamard,
+        tcp=identity_permutation,
+        tcpi=identity_permutation,
+        qtf=rounding_quantizer,
+        cbs=1.24371088,
+        identity=FAKE_IDENTITY,
+    )
 
 
 def test_dag_encoder_emits_one_node_per_graph_node_and_shares_parents():
@@ -317,8 +511,7 @@ def test_dag_encoder_emits_one_node_per_graph_node_and_shares_parents():
         {"label": "k2r1r1", "k": 1, "parent": "k2r1", "experts": "all"},
         {"label": "k2r2", "k": 2, "parent": "k2", "experts": "all"},
     ]
-    nodes = lora.encode_matrix_dag(
-        weight, bases, stages, torch.device("cpu"), enc)
+    nodes = lora.encode_matrix_dag(weight, bases, stages, torch.device("cpu"), enc)
     assert set(nodes) == {"k2", "k3", "k2r1", "k2r1r1", "k2r2"}
     assert len(ext.calls) == 5, "one quantization pass per node, not per product"
     # Every stage improves on the parent it names, and a deeper chain is better
@@ -328,8 +521,11 @@ def test_dag_encoder_emits_one_node_per_graph_node_and_shares_parents():
     assert nodes["k2r2"]["regularized_mse"] < nodes["k2"]["regularized_mse"]
     assert nodes["k3"]["regularized_mse"] < nodes["k2"]["regularized_mse"]
     for label, node in nodes.items():
-        assert node["trellis"].shape == (8, 16, 16 * (
-            {"k2": 2, "k3": 3, "k2r1": 1, "k2r1r1": 1, "k2r2": 2}[label]))
+        assert node["trellis"].shape == (
+            8,
+            16,
+            16 * ({"k2": 2, "k3": 3, "k2r1": 1, "k2r1r1": 1, "k2r2": 2}[label]),
+        )
         assert (node["scale"] is None) == (label in {"k2", "k3"})
 
 
@@ -337,32 +533,37 @@ def test_dag_encoder_refuses_a_stage_whose_parent_is_absent():
     torch = pytest.importorskip("torch")
     with pytest.raises(lora.CartridgeError, match="was not encoded"):
         lora.encode_matrix_dag(
-            torch.zeros(128, 128), [{"label": "k2", "k": 2}],
+            torch.zeros(128, 128),
+            [{"label": "k2", "k": 2}],
             [{"label": "orphan", "k": 1, "parent": "ghost", "experts": "all"}],
-            torch.device("cpu"), fake_encoder())
+            torch.device("cpu"),
+            fake_encoder(),
+        )
 
 
 def test_emitted_tensor_names_are_the_runtime_key_contract():
-    """The runtime finds weights by name; the key set is the contract.
-
-    `Exl3LoraCartridge` matches `...rank<N>.trellis_<label>` plus
-    `suh_`/`svh_`/`scale_` companions, and the base tier is the unsuffixed
-    quartet. Dropping one component leaves a shard that still validates as
-    safetensors and still decodes trellis indices, but reconstructs nothing.
-    """
+    """Residuals reuse base rotations; stage shards carry only data and scale."""
     torch = pytest.importorskip("torch")
-    node = {"trellis": torch.zeros(8, 8, 16, dtype=torch.int16),
-            "suh": torch.ones(128, dtype=torch.float16),
-            "svh": torch.ones(128, dtype=torch.float16),
-            "scale": 2.0}
+    node = {
+        "trellis": torch.zeros(8, 8, 16, dtype=torch.int16),
+        "suh": torch.ones(128, dtype=torch.float16),
+        "svh": torch.ones(128, dtype=torch.float16),
+        "scale": 2.0,
+    }
     prefix = "model.layers.3.mlp.experts.7.gate_proj.rank0"
     assert set(lora.base_tensor_names(3, 7, "gate_proj", node)) == {
-        f"{prefix}.trellis", f"{prefix}.suh", f"{prefix}.svh", f"{prefix}.mcg"}
+        f"{prefix}.trellis",
+        f"{prefix}.suh",
+        f"{prefix}.svh",
+        f"{prefix}.mcg",
+    }
     stage = lora.stage_tensor_names(3, 7, "gate_proj", "res1", node)
     assert set(stage) == {
-        f"{prefix}.trellis_res1", f"{prefix}.suh_res1",
-        f"{prefix}.svh_res1", f"{prefix}.scale_res1"}
+        f"{prefix}.trellis_res1",
+        f"{prefix}.scale_res1",
+    }
     assert stage[f"{prefix}.scale_res1"].dtype is torch.float32
+
 
 def test_packed_quantization_refuses_missing_runtime_packer():
     torch = pytest.importorskip("torch")
@@ -373,20 +574,37 @@ def test_packed_quantization_refuses_missing_runtime_packer():
 
 # ── Campaign output discipline ────────────────────────────────────────────
 
+
 def test_committed_shard_is_resumable_and_recipe_drift_is_fatal(tmp_path: Path):
     torch = pytest.importorskip("torch")
     directory = tmp_path / "campaign" / "stages" / "res1"
-    expect = {"schema": lora.BLOCK_SCHEMA, "recipe_sha256": "a" * 64,
-              "label": "res1", "layer": "3", "block": "0", "experts": "0,1"}
-    groups = [("0", [("model.layers.3.mlp.experts.0.gate_proj.rank0.scale_res1",
-                      torch.ones(()))])]
+    expect = {
+        "schema": lora.BLOCK_SCHEMA,
+        "recipe_sha256": "a" * 64,
+        "label": "res1",
+        "layer": "3",
+        "block": "0",
+        "experts": "0,1",
+    }
+    groups = [
+        (
+            "0",
+            [
+                (
+                    "model.layers.3.mlp.experts.0.gate_proj.rank0.scale_res1",
+                    torch.ones(()),
+                )
+            ],
+        )
+    ]
     assert not lora.shard_is_complete(directory, "s.safetensors", expect)
     lora.write_shard(groups, directory, "s.safetensors", dict(expect))
     assert lora.shard_is_complete(directory, "s.safetensors", expect)
     assert lora.read_digest(directory, "s.safetensors")
     with pytest.raises(lora.CartridgeError, match="different recipe"):
-        lora.shard_is_complete(directory, "s.safetensors",
-                               {**expect, "recipe_sha256": "b" * 64})
+        lora.shard_is_complete(
+            directory, "s.safetensors", {**expect, "recipe_sha256": "b" * 64}
+        )
 
 
 def test_written_shard_is_readable_and_expert_contiguous(tmp_path: Path):
@@ -397,33 +615,125 @@ def test_written_shard_is_readable_and_expert_contiguous(tmp_path: Path):
     groups = []
     for expert in (0, 1):
         prefix = f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0"
-        groups.append((str(expert), [
-            (f"{prefix}.trellis", torch.ones(2, 2, 32, dtype=torch.int16)),
-            (f"{prefix}.suh", torch.ones(128, dtype=torch.float16)),
-            (f"{prefix}.svh", torch.ones(128, dtype=torch.float16)),
-            (f"{prefix}.mcg", torch.tensor(7, dtype=torch.int32)),
-        ]))
+        groups.append(
+            (
+                str(expert),
+                [
+                    (f"{prefix}.trellis", torch.ones(2, 2, 32, dtype=torch.int16)),
+                    (f"{prefix}.suh", torch.ones(128, dtype=torch.float16)),
+                    (f"{prefix}.svh", torch.ones(128, dtype=torch.float16)),
+                    (f"{prefix}.mcg", torch.tensor(7, dtype=torch.int32)),
+                ],
+            )
+        )
     target, sha, body, spans, digests = lora.write_grouped_shard(
-        groups, directory, "s.safetensors", {"schema": lora.BLOCK_SCHEMA})
+        groups, directory, "s.safetensors", {"schema": lora.BLOCK_SCHEMA}
+    )
     with safe_open(str(target), framework="pt") as handle:
         assert len(list(handle.keys())) == 8
         assert handle.metadata()["schema"] == lora.BLOCK_SCHEMA
-        assert handle.get_tensor(
-            "model.layers.3.mlp.experts.1.gate_proj.rank0.mcg").item() == 7
+        assert (
+            handle.get_tensor("model.layers.3.mlp.experts.1.gate_proj.rank0.mcg").item()
+            == 7
+        )
     # Each expert is one byte range, and re-reading the file reproduces every
     # digest the attestation would have claimed.
     assert spans["0"][1] == spans["1"][0]
     again_sha, again_body, again_digests = lora.verify_shard(
-        target, group_kind="expert")
+        target, group_kind="expert"
+    )
     assert (again_sha, again_body, again_digests) == (sha, body, digests)
+
+
+def test_base_compatibility_identity_binds_logical_bytes_not_file_layout(
+    tmp_path: Path,
+):
+    torch = pytest.importorskip("torch")
+    groups = [("0", [])]
+    for projection in lora.PROJECTIONS:
+        prefix = f"model.layers.3.mlp.experts.0.{projection}.rank0"
+        groups[0][1].extend(
+            [
+                (f"{prefix}.trellis", torch.ones(8, 8, 32, dtype=torch.int16)),
+                (f"{prefix}.suh", torch.ones(128, dtype=torch.float16)),
+                (f"{prefix}.svh", torch.ones(128, dtype=torch.float16)),
+                (
+                    f"{prefix}.mcg",
+                    torch.tensor(lora.MCG_SENTINEL_SIGNED, dtype=torch.int32),
+                ),
+            ]
+        )
+    target, *_ = lora.write_grouped_shard(
+        groups, tmp_path, "logical.safetensors", {"schema": lora.BLOCK_SCHEMA}
+    )
+    records = lora.verify_shard_details(target, group_kind="expert").tensors
+    other_layer = [
+        {**item, "name": item["name"].replace(".layers.3.", ".layers.4.")}
+        for item in records
+    ]
+    all_records = records + other_layer
+    first, by_layer = lora.base_compatibility_identity(2, all_records)
+    reversed_root, reversed_layers = lora.base_compatibility_identity(
+        2, list(reversed(all_records))
+    )
+    assert (first, by_layer) == (reversed_root, reversed_layers)
+    payloads = lora.base_layer_compatibility_payloads(2, all_records)
+    assert set(payloads) == {"3", "4"}
+    assert all(
+        ".rank" not in item["name"]
+        for payload in payloads.values()
+        for item in payload["tensors"]
+    )
+
+    altered = [dict(item) for item in all_records]
+    altered[0]["sha256"] = "0" * 64
+    altered_root, altered_layers = lora.base_compatibility_identity(2, altered)
+    assert altered_root != first
+    assert altered_layers["3"] != by_layer["3"]
+    assert altered_layers["4"] == by_layer["4"]
+
+
+def test_base_compatibility_identity_matches_vllm_contract_golden():
+    """Hard-coded cross-repo vector: changing either side breaks interchange."""
+    torch = pytest.importorskip("torch")
+    dtype = {
+        torch.float16: "F16",
+        torch.int16: "I16",
+        torch.int32: "I32",
+    }
+    records = []
+    for projection in lora.PROJECTIONS:
+        prefix = f"model.layers.3.mlp.experts.0.{projection}.rank0"
+        tensors = {
+            f"{prefix}.trellis": torch.zeros(8, 8, 32, dtype=torch.int16),
+            f"{prefix}.suh": torch.zeros(128, dtype=torch.float16),
+            f"{prefix}.svh": torch.zeros(128, dtype=torch.float16),
+            f"{prefix}.mcg": torch.tensor(lora.MCG_SENTINEL_SIGNED, dtype=torch.int32),
+        }
+        records.extend(
+            {
+                "name": name,
+                "dtype": dtype[tensor.dtype],
+                "shape": list(tensor.shape),
+                "sha256": hashlib.sha256(lora.tensor_bytes(tensor)).hexdigest(),
+            }
+            for name, tensor in tensors.items()
+        )
+    root, by_layer = lora.base_compatibility_identity(2, records)
+    assert (
+        by_layer["3"]
+        == "3518095ac1ae5fd32f775862acce5daa5f0c8a4c96fb308b45df4e95da377d58"
+    )
+    assert root == "cbb1f591900487ad16f33fd2d33174beb09d55d301f164aff37ed829f712ce01"
 
 
 def test_uncommitted_shard_without_a_digest_is_re_encoded(tmp_path: Path):
     torch = pytest.importorskip("torch")
     directory = tmp_path / "campaign" / "stages" / "res1"
     expect = {"schema": lora.BLOCK_SCHEMA}
-    lora.save_shard_tensors({"x": torch.ones(2)}, directory, "s.safetensors",
-                            dict(expect))
+    lora.save_shard_tensors(
+        {"x": torch.ones(2)}, directory, "s.safetensors", dict(expect)
+    )
     assert (directory / "s.safetensors").is_file()
     assert not lora.shard_is_complete(directory, "s.safetensors", expect)
 
@@ -433,38 +743,49 @@ def test_campaign_directory_refuses_a_different_graph_or_source(tmp_path: Path):
     out = tmp_path / "out"
     identity = {"base_model": "acme/proxy", "base_revision": SOURCE_REVISION}
     with lora.SourceCheckpoint(build_source(tmp_path / "src")) as source:
-        lora.prepare_out_dir(out, recipe_path=recipe, recipe_sha="a" * 64,
-                             source=source, block_size=32, force=False,
-                             **identity)
+        lora.prepare_out_dir(
+            out,
+            recipe_path=recipe,
+            recipe_sha="a" * 64,
+            source=source,
+            block_size=32,
+            force=False,
+            **identity,
+        )
         recorded = json.loads((out / lora.SENTINEL).read_text())
         assert recorded["base_revision"] == SOURCE_REVISION
         assert recorded["topology_id"] == source.topology_id
 
         # Re-attaching with the same identity is the normal resume path.
-        lora.prepare_out_dir(out, recipe_path=recipe, recipe_sha="a" * 64,
-                             source=source, block_size=32, force=False,
-                             **identity)
+        lora.prepare_out_dir(
+            out,
+            recipe_path=recipe,
+            recipe_sha="a" * 64,
+            source=source,
+            block_size=32,
+            force=False,
+            **identity,
+        )
 
         # Identity drift is fatal with or without --force: converting a
         # campaign in place would leave the previous layout's shards behind.
         for force in (False, True):
-            for drifted in ({"recipe_sha": "b" * 64},
-                            {"block_size": 64},
-                            {"base_revision": "c" * 40}):
+            for drifted in (
+                {"recipe_sha": "b" * 64},
+                {"block_size": 64},
+                {"base_revision": "c" * 40},
+            ):
                 kwargs = {"recipe_sha": "a" * 64, "block_size": 32, **identity}
                 kwargs.update(drifted)
-                with pytest.raises(lora.CartridgeError,
-                                   match="does not match this run"):
+                with pytest.raises(
+                    lora.CartridgeError, match="does not match this run"
+                ):
                     lora.prepare_out_dir(
-                        out, recipe_path=recipe, source=source, force=force,
-                        **kwargs)
+                        out, recipe_path=recipe, source=source, force=force, **kwargs
+                    )
 
 
-
-
-def test_plan_names_the_shards_no_layer_window_would_stage(
-    tmp_path: Path, capsys
-):
+def test_plan_names_the_shards_no_layer_window_would_stage(tmp_path: Path, capsys):
     """Staging from `layers` alone misses whole-model tensors.
 
     Embeddings, `lm_head` and the dense layers live in shards that hold no
@@ -477,10 +798,16 @@ def test_plan_names_the_shards_no_layer_window_would_stage(
 
     source = tmp_path / "src"
     source.mkdir()
-    (source / "config.json").write_text(json.dumps({
-        "num_hidden_layers": 5, "n_routed_experts": 2,
-        "hidden_size": 8, "moe_intermediate_size": 8,
-    }))
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 5,
+                "n_routed_experts": 2,
+                "hidden_size": 8,
+                "moe_intermediate_size": 8,
+            }
+        )
+    )
     weight_map, generator = {}, torch.Generator().manual_seed(3)
     for index, layer in enumerate((3, 4), start=1):
         shard = f"model-{index:05d}-of-00003.safetensors"
@@ -488,8 +815,7 @@ def test_plan_names_the_shards_no_layer_window_would_stage(
         for expert in range(2):
             for projection in lora.PROJECTIONS:
                 key = expert_key(layer, expert, projection)
-                tensors[key] = torch.randn(
-                    8, 8, generator=generator).to(torch.bfloat16)
+                tensors[key] = torch.randn(8, 8, generator=generator).to(torch.bfloat16)
         save_file(tensors, str(source / shard))
         weight_map.update({key: shard for key in tensors})
     orphan = "model-00003-of-00003.safetensors"
@@ -500,12 +826,18 @@ def test_plan_names_the_shards_no_layer_window_would_stage(
     save_file(whole_model, str(source / orphan))
     weight_map.update({key: orphan for key in whole_model})
     (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": weight_map}))
+        json.dumps({"weight_map": weight_map})
+    )
 
     recipe = write_recipe(tmp_path / "r.json", **DAG_RECIPE)
-    assert lora.cmd_plan(SimpleNamespace(
-        source=source, recipe=recipe, layers=None, block_size=2,
-        out_plan=None)) == 0
+    assert (
+        lora.cmd_plan(
+            SimpleNamespace(
+                source=source, recipe=recipe, layers=None, block_size=2, out_plan=None
+            )
+        )
+        == 0
+    )
     plan = json.loads(capsys.readouterr().out)
 
     assert orphan in plan["skeleton_only_shards"]
@@ -541,8 +873,10 @@ def test_a_crash_between_two_node_commits_leaves_the_block_incomplete(
     name = lora.block_name(3, 0)
     labels = ("k2", "k2r1")
     recipe_doc = lora.load_recipe(recipe)
-    before = {label: lora.read_digest(
-        lora.node_dir(out, recipe_doc, label), name) for label in labels}
+    before = {
+        label: lora.read_digest(lora.node_dir(out, recipe_doc, label), name)
+        for label in labels
+    }
     assert all(before.values())
 
     # Crash the second write of a forced re-encode.
@@ -561,13 +895,12 @@ def test_a_crash_between_two_node_commits_leaves_the_block_incomplete(
     # The node that was being written when the process died must not carry a
     # marker, so the block cannot read as complete and cannot be skipped.
     monkeypatch.setattr(lora, "write_shard", real_write_shard)
-    assert lora.read_digest(lora.node_dir(out, recipe_doc, labels[1]),
-                            name) is None
+    assert lora.read_digest(lora.node_dir(out, recipe_doc, labels[1]), name) is None
     with lora.SourceCheckpoint(source) as opened:
         item = lora.build_work_list(opened, recipe_doc, [3], 2)[0]
         assert not lora.block_is_complete(
-            out, recipe_doc, lora.sha256_file(recipe), opened,
-            SOURCE_REVISION, item, 2)
+            out, recipe_doc, lora.sha256_file(recipe), opened, SOURCE_REVISION, item, 2
+        )
 
     # A plain resume therefore rewrites the whole block, and the stage it writes
     # names the base digest that shipped beside it in the same pass.
@@ -577,7 +910,6 @@ def test_a_crash_between_two_node_commits_leaves_the_block_incomplete(
         assert lora.read_digest(lora.node_dir(out, recipe_doc, label), name)
     stage = lora.read_attestation(lora.node_dir(out, recipe_doc, labels[1]), name)
     assert stage["parents"][0]["sha256"] == lora.read_digest(base_dir, name)
-
 
 
 def test_one_campaign_directory_takes_one_launcher(tmp_path: Path):
@@ -619,7 +951,7 @@ def test_a_block_claim_is_ownership_not_a_leftover_file(tmp_path: Path):
     with lora.block_claim(out, 3, 0) as owned:
         assert owned is True
         with lora.block_claim(out, 3, 0) as again:
-            assert again is False          # a live owner keeps the block
+            assert again is False  # a live owner keeps the block
         with lora.campaign_lock(out, what="encode"):
             with pytest.raises(lora.CartridgeError, match="takes one finalize"):
                 with lora.campaign_lock(out, what="finalize"):
@@ -628,7 +960,8 @@ def test_a_block_claim_is_ownership_not_a_leftover_file(tmp_path: Path):
     # opened would give the same block to two owners.
     assert (out / "locks" / "layer-003-b000.lock").is_file()
     with lora.block_claim(out, 3, 0) as reclaimed:
-        assert reclaimed is True           # released, so claimable again
+        assert reclaimed is True  # released, so claimable again
+
 
 def test_publication_and_encoding_are_mutually_exclusive(tmp_path: Path):
     """A launcher's lock dies with the launcher; its workers do not.
@@ -647,6 +980,7 @@ def test_publication_and_encoding_are_mutually_exclusive(tmp_path: Path):
 
 # ── End to end, on CPU, with a stand-in quantizer ─────────────────────────
 
+
 @contextmanager
 def _fake_bootstrap(_source, tile_batch=lora.TILE_BATCH):
     yield fake_encoder()._replace(tile_batch=tile_batch)
@@ -657,12 +991,23 @@ SOURCE_REVISION = "b4734de4facf877f85769a911abafc5283eab3d9"
 
 def encode_args(source: Path, recipe: Path, out: Path, **overrides):
     args = SimpleNamespace(
-        source=source, recipe=recipe, out=out, block_size=2,
-        encoder_source=Path("/nonexistent"), device="cpu", devices=None,
-        layers=None, shard_index=0, shard_count=1, force=False,
-        tile_batch=lora.TILE_BATCH, sign_key=source.parent / "sign.key",
-        base_model="acme/proxy", base_revision=SOURCE_REVISION,
-        source_digests=None)
+        source=source,
+        recipe=recipe,
+        out=out,
+        block_size=2,
+        encoder_source=Path("/nonexistent"),
+        device="cpu",
+        devices=None,
+        layers=None,
+        shard_index=0,
+        shard_count=1,
+        force=False,
+        tile_batch=lora.TILE_BATCH,
+        sign_key=source.parent / "sign.key",
+        base_model="acme/proxy",
+        base_revision=SOURCE_REVISION,
+        source_digests=None,
+    )
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -697,9 +1042,71 @@ def campaign(tmp_path: Path, monkeypatch):
     return SimpleNamespace(root=out, source=source, recipe=recipe)
 
 
-def test_two_encodes_of_one_block_produce_identical_bytes(
+def test_encode_attests_every_privately_staged_source_shard(
     tmp_path: Path, monkeypatch
 ):
+    torch = pytest.importorskip("torch")
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "n_routed_experts": 1,
+                "hidden_size": 128,
+                "moe_intermediate_size": 128,
+            }
+        )
+    )
+    gate = expert_key(3, 0, "gate_proj")
+    up = expert_key(3, 0, "up_proj")
+    down = expert_key(3, 0, "down_proj")
+    first = "model-00001-of-00002.safetensors"
+    second = "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            gate: torch.ones(128, 128, dtype=torch.bfloat16),
+            up: torch.ones(128, 128, dtype=torch.bfloat16),
+        },
+        source / first,
+    )
+    save_file(
+        {
+            down: torch.ones(128, 128, dtype=torch.bfloat16),
+            "model.layers.3.mlp.gate.weight": torch.ones(1, 128, dtype=torch.bfloat16),
+        },
+        source / second,
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    gate: first,
+                    up: first,
+                    down: second,
+                    "model.layers.3.mlp.gate.weight": second,
+                }
+            }
+        )
+    )
+    recipe = write_recipe(tmp_path / "recipe.json", moe_layers=[3])
+    out = tmp_path / "campaign"
+    monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
+    assert lora.cmd_encode(encode_args(source, recipe, out)) == 0
+
+    attestation = lora.read_attestation(out / "base" / "k2", lora.block_name(3, 0))
+    assert attestation["materials"]["source_shards"] == {
+        first: lora.sha256_file(source / first),
+        second: lora.sha256_file(source / second),
+    }
+    assert (
+        json.loads((out / "source-digests.json").read_text())
+        == attestation["materials"]["source_shards"]
+    )
+    assert not any((out / lora.SOURCE_STAGING_DIR).iterdir())
+
+
+def test_two_encodes_of_one_block_produce_identical_bytes(tmp_path: Path, monkeypatch):
     """The signed reproducibility claim, tested as bytes.
 
     Every attestation declares a `determinism_scope` and asserts that
@@ -717,10 +1124,12 @@ def test_two_encodes_of_one_block_produce_identical_bytes(
     for run in ("a", "b"):
         out = tmp_path / run
         assert lora.cmd_encode(encode_args(source, recipe, out)) == 0
-        shards.append({
-            path.relative_to(out): path.read_bytes()
-            for path in sorted(out.rglob("model-*.safetensors"))
-        })
+        shards.append(
+            {
+                path.relative_to(out): path.read_bytes()
+                for path in sorted(out.rglob("model-*.safetensors"))
+            }
+        )
         time.sleep(1.1)  # cross a wall-clock second between the two encodes
 
     first, second = shards
@@ -730,13 +1139,12 @@ def test_two_encodes_of_one_block_produce_identical_bytes(
     # The digest sidecars must agree too, since they are what resume trusts.
     for name in first:
         directory = (tmp_path / "a" / name).parent
-        assert (lora.read_digest(directory, name.name)
-                == lora.read_digest((tmp_path / "b" / name).parent, name.name))
+        assert lora.read_digest(directory, name.name) == lora.read_digest(
+            (tmp_path / "b" / name).parent, name.name
+        )
 
 
-def test_finalize_is_resumable_after_it_linked_the_skeleton(
-    campaign, monkeypatch
-):
+def test_finalize_is_resumable_after_it_linked_the_skeleton(campaign, monkeypatch):
     """Finalize re-reads and re-hashes the whole campaign, so it can be cut off.
 
     On a real campaign that pass is terabytes long and minutes wide. Publishing
@@ -746,8 +1154,9 @@ def test_finalize_is_resumable_after_it_linked_the_skeleton(
     """
     monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
     base = campaign.root / "base" / "k2"
-    skeleton = {path.name for path
-                in (campaign.root / "skeleton").glob("model-*.safetensors")}
+    skeleton = {
+        path.name for path in (campaign.root / "skeleton").glob("model-*.safetensors")
+    }
     linked = skeleton & {path.name for path in base.glob("model-*.safetensors")}
     assert linked == skeleton, "finalize must publish the skeleton into the base"
 
@@ -756,7 +1165,8 @@ def test_finalize_is_resumable_after_it_linked_the_skeleton(
     assert lora.cmd_finalize(args) == 0
     # A shard from a different block layout is still refused.
     (base / lora.block_name(3, 9)).write_bytes(
-        (base / lora.block_name(3, 0)).read_bytes())
+        (base / lora.block_name(3, 0)).read_bytes()
+    )
     with pytest.raises(lora.CartridgeError, match="does not describe"):
         lora.cmd_finalize(args)
 
@@ -764,6 +1174,13 @@ def test_finalize_is_resumable_after_it_linked_the_skeleton(
 def test_campaign_encodes_finalizes_and_resumes(tmp_path: Path, monkeypatch):
     pytest.importorskip("torch")
     source = build_source(tmp_path / "src", layers=(3, 4), experts=4)
+    source_config = json.loads((source / "config.json").read_text())
+    source_config["hybrid_tr3_tail"] = {
+        "tp": 1,
+        "k_values": [2, 3],
+        "stale_unknown": True,
+    }
+    (source / "config.json").write_text(json.dumps(source_config))
     recipe = write_recipe(
         tmp_path / "recipe.json",
         bases=[{"label": "k2", "k": 2}, {"label": "k3", "k": 3}],
@@ -775,7 +1192,8 @@ def test_campaign_encodes_finalizes_and_resumes(tmp_path: Path, monkeypatch):
             {"label": "k3like", "base": "k2", "chain": ["k2r1"]},
             {"label": "hot-k4like", "base": "k2", "chain": ["k2r1", "hot"]},
         ],
-        moe_layers=[3, 4])
+        moe_layers=[3, 4],
+    )
     out = tmp_path / "campaign"
     monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
 
@@ -783,29 +1201,76 @@ def test_campaign_encodes_finalizes_and_resumes(tmp_path: Path, monkeypatch):
     assert lora.cmd_encode(encode_args(source, recipe, out)) == 0
     assert lora.cmd_finalize(encode_args(source, recipe, out)) == 0
 
+    source_shard = "model-layer-003.safetensors"
+    skeleton_attestation = lora.read_attestation(out / "skeleton", source_shard)
+    observed_source_sha = lora.sha256_file(source / source_shard)
+    assert skeleton_attestation["materials"]["file_sha256"] == observed_source_sha
+    assert skeleton_attestation["materials"]["source_shards"] == {
+        source_shard: observed_source_sha
+    }
+
     # Two complete base checkpoints, each with its own loader metadata.
+    base_compatibilities = {}
     for label, bits in (("k2", 2.0), ("k3", 3.0)):
         base = out / "base" / label
         config = json.loads((base / "config.json").read_text())
         assert config["quantization_config"]["bits"] == bits
+        assert "cartridge_runtime" not in config["quantization_config"]
+        assert config["hybrid_tr3_tail"]["runtime_profile"] == lora.BASE_RUNTIME_PROFILE
+        assert (
+            config["hybrid_tr3_tail"]["tensor_parallel"]
+            == lora.base_tensor_parallel_contract()
+        )
+        assert set(config["hybrid_tr3_tail"]) == {
+            "format",
+            "runtime_profile",
+            "bits",
+            "codebook",
+            "moe_layers",
+            "moe_layer_coverage",
+            "tensor_schema",
+            "tensor_parallel",
+            "mcg_multiplier",
+            "compatibility_sha256",
+            "compatibility_by_layer",
+            "experts_per_layer",
+        }
+        assert config["hybrid_tr3_tail"]["moe_layer_coverage"] == [3, 4]
         assert config["hybrid_tr3_tail"]["moe_layers"] == [3, 4]
+        compatibility = config["hybrid_tr3_tail"]["compatibility_sha256"]
+        assert len(compatibility) == 64
+        base_compatibilities[label] = compatibility
         index = json.loads((base / "model.safetensors.index.json").read_text())
-        assert ("model.layers.3.mlp.experts.0.gate_proj.rank0.trellis"
-                in index["weight_map"])
+        assert (
+            "model.layers.3.mlp.experts.0.gate_proj.rank0.trellis"
+            in index["weight_map"]
+        )
         assert "model.layers.3.mlp.gate.weight" in index["weight_map"], (
-            "the router must be present in every base checkpoint")
+            "the router must be present in every base checkpoint"
+        )
         manifest = (base / "MANIFEST.sha256").read_text()
         assert "model-layer-003-b000.safetensors" in manifest
-        assert json.loads((base / "tier_bitmap.json").read_text())["3"]["k"] == [
-            int(bits)] * 4
+        assert (
+            json.loads((base / "tier_bitmap.json").read_text())["3"]["k"]
+            == [int(bits)] * 4
+        )
 
     # The partial stage only wrote the blocks that hold its experts.
     hot_blocks = sorted(p.name for p in (out / "stages" / "hot").glob("*.safetensors"))
-    assert hot_blocks == ["model-layer-003-b000.safetensors",
-                          "model-layer-004-b000.safetensors"]
+    assert hot_blocks == [
+        "model-layer-003-b000.safetensors",
+        "model-layer-004-b000.safetensors",
+    ]
     plan = json.loads((out / "assemblies" / "hot-k4like" / "assembly.json").read_text())
     assert plan["schema"] == lora.ASSEMBLY_SCHEMA
     assert plan["bits_per_weight"] == pytest.approx(2 + 1 + 2 / 4)
+    assert plan["tensor_parallel"] == {
+        "layout": "full",
+        "world_size": 1,
+        "ranks": [0],
+        "axis_by_projection": lora.TP_AXIS_BY_PROJECTION,
+    }
+    assert plan["base"]["compatibility_sha256"] == base_compatibilities["k2"]
     assert {entry["label"] for entry in plan["stage_shards"]} == {"k2r1", "hot"}
 
     summary = json.loads((out / "campaign_summary.json").read_text())
@@ -832,6 +1297,48 @@ def test_finalize_names_the_blocks_that_are_still_missing(tmp_path: Path, monkey
     assert lora.cmd_finalize(encode_args(source, recipe, out)) == 0
 
 
+def test_finalize_rejects_mixed_source_digests_across_resumed_blocks(
+    tmp_path: Path, monkeypatch
+):
+    """Signed fragments, not the mutable resume cache, are final authority."""
+    pytest.importorskip("torch")
+    safetensors = pytest.importorskip("safetensors.torch")
+    source = build_source(tmp_path / "src", layers=(3,), experts=4, extra=False)
+    recipe = write_recipe(tmp_path / "recipe.json", moe_layers=[3])
+    out = tmp_path / "campaign"
+    monkeypatch.setattr(lora, "bootstrap_encoder", _fake_bootstrap)
+
+    assert lora.cmd_skeleton(encode_args(source, recipe, out)) == 0
+    first = encode_args(source, recipe, out, shard_index=0, shard_count=2)
+    assert lora.cmd_encode(first) == 0
+    source_name = "model-layer-003.safetensors"
+    digest_a = lora.read_attestation(out / "base" / "k2", lora.block_name(3, 0))[
+        "materials"
+    ]["source_shards"][source_name]
+
+    # Model a lost mutable cache between workers, then replace the shared
+    # source shard without changing its tensor topology.
+    (out / "source-digests.json").unlink()
+    source_path = source / source_name
+    changed = {
+        name: tensor + 1
+        for name, tensor in safetensors.load_file(str(source_path)).items()
+    }
+    replacement = source / "replacement.safetensors"
+    safetensors.save_file(changed, str(replacement))
+    os.replace(replacement, source_path)
+
+    second = encode_args(source, recipe, out, shard_index=1, shard_count=2)
+    assert lora.cmd_encode(second) == 0
+    digest_b = lora.read_attestation(out / "base" / "k2", lora.block_name(3, 1))[
+        "materials"
+    ]["source_shards"][source_name]
+    assert digest_a != digest_b
+
+    with pytest.raises(lora.CartridgeError, match="conflicting observed digests"):
+        lora.cmd_finalize(encode_args(source, recipe, out))
+
+
 def test_workers_split_disjoint_blocks(tmp_path: Path):
     source = build_source(tmp_path / "src", layers=(3, 4), experts=4)
     recipe = lora.load_recipe(write_recipe(tmp_path / "r.json", moe_layers=[3, 4]))
@@ -840,7 +1347,8 @@ def test_workers_split_disjoint_blocks(tmp_path: Path):
     assert len(work) == 4
     shards = [work[i::2] for i in range(2)]
     assert not {(w["layer"], w["block"]) for w in shards[0]} & {
-        (w["layer"], w["block"]) for w in shards[1]}
+        (w["layer"], w["block"]) for w in shards[1]
+    }
     assert sum(len(s) for s in shards) == len(work)
 
 
@@ -877,19 +1385,17 @@ def test_resume_after_a_partial_block_rewrites_the_whole_graph(
     after = (base_shard.stat().st_mtime_ns, stage_shard.stat().st_mtime_ns)
     assert after[0] != before[0], (
         "the base must be re-encoded with its stage, or the published pair "
-        "could come from two different encoder runs")
+        "could come from two different encoder runs"
+    )
     assert after[1] != before[1]
     # And the pair that ships is internally consistent: the stage names the
     # exact parent bytes beside it.
     assert lora.cmd_finalize(args) == 0
     payload = lora.read_attestation(stage_shard.parent, name)
-    assert payload["parents"][0]["sha256"] == lora.read_digest(
-        base_shard.parent, name)
+    assert payload["parents"][0]["sha256"] == lora.read_digest(base_shard.parent, name)
 
 
-def test_finalize_rejects_shards_from_another_block_layout(
-    tmp_path: Path, monkeypatch
-):
+def test_finalize_rejects_shards_from_another_block_layout(tmp_path: Path, monkeypatch):
     pytest.importorskip("torch")
     source = build_source(tmp_path / "src", layers=(3,), experts=4)
     recipe = write_recipe(tmp_path / "recipe.json", moe_layers=[3])
@@ -901,7 +1407,8 @@ def test_finalize_rejects_shards_from_another_block_layout(
     # A shard a previous block layout would have left behind.
     stale = out / "stages" / "res1" / "model-layer-003-b009.safetensors"
     stale.write_bytes(
-        (out / "stages" / "res1" / "model-layer-003-b000.safetensors").read_bytes())
+        (out / "stages" / "res1" / "model-layer-003-b000.safetensors").read_bytes()
+    )
     with pytest.raises(lora.CartridgeError, match="does not describe"):
         lora.cmd_finalize(args)
 
@@ -917,8 +1424,11 @@ def test_finalize_rejects_a_block_copied_over_another(tmp_path: Path, monkeypatc
     lora.cmd_skeleton(args)
     lora.cmd_encode(args)
     node = out / "stages" / "res1"
-    for suffix, folder in (("", node), (".sha256", node / "digests"),
-                           (".jsonl", node / "attestations")):
+    for suffix, folder in (
+        ("", node),
+        (".sha256", node / "digests"),
+        (".jsonl", node / "attestations"),
+    ):
         first = folder / f"model-layer-003-b000.safetensors{suffix}"
         second = folder / f"model-layer-003-b001.safetensors{suffix}"
         second.write_bytes(first.read_bytes())

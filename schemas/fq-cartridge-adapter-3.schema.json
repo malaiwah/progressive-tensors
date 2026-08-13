@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/malaiwah/progressive-tensors/schemas/fq-cartridge-adapter-3.schema.json",
+  "title": "Packed EXL3 MSRT cartridge adapter",
+  "description": "Self-contained runtime manifest binding ordered residual stages and digest-pinned tensor shards to exact base routed-expert bytes and a declared tensor-parallel layout.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "assembly", "base", "chain", "format", "runtime_profile",
+    "rotation_ownership",
+    "standard_lora_compatible", "runtime_operation", "codebook",
+    "mcg_multiplier", "mcg_ownership", "scale_shape", "tensor_parallel",
+    "shards", "num_tensors", "selected_experts", "selected_layers",
+    "coverage", "producer_verified_signer", "campaign", "source_assembly",
+    "tool_version", "created_utc"
+  ],
+  "properties": {
+    "schema": {"const": "fq-cartridge-adapter/3"},
+    "assembly": {"$ref": "#/$defs/label"},
+    "base": {"$ref": "#/$defs/base"},
+    "chain": {
+      "type": "array", "minItems": 1,
+      "items": {"$ref": "#/$defs/stage"}
+    },
+    "format": {"const": "exl3-msrt-packed"},
+    "runtime_profile": {"const": "exl3-msrt-additive/1"},
+    "rotation_ownership": {"const": "base"},
+    "standard_lora_compatible": {"const": false},
+    "runtime_operation": {
+      "const": "base_exl3_gemm + sum(stage_exl3_gemm / stage_scale)"
+    },
+    "codebook": {"const": "mcg"},
+    "mcg_multiplier": {"const": 3417055213},
+    "mcg_ownership": {"const": "adapter-config"},
+    "scale_shape": {"const": []},
+    "tensor_parallel": {"$ref": "#/$defs/tensorParallel"},
+    "shards": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "size", "sha256"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relativePath"},
+          "size": {
+            "type": "integer", "minimum": 1, "maximum": 68719476736
+          },
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "num_tensors": {"type": "integer", "minimum": 1},
+    "selected_experts": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "selected_layers": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "coverage": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/label"},
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+        "additionalProperties": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "producer_verified_signer": {
+      "description": "Pinned key checked by the producer while combining, or null for explicitly unsigned production. This is provenance only; runtime loaders do not authenticate it.",
+      "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+    },
+    "campaign": {"$ref": "#/$defs/campaign"},
+    "source_assembly": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "tool_version": {"type": "string", "minLength": 1},
+    "created_utc": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "label": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "relativePath": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "bits": {"type": "integer", "minimum": 1, "maximum": 6},
+    "base": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "label", "k", "compatibility_sha256", "compatibility_by_layer"
+      ],
+      "properties": {
+        "label": {"$ref": "#/$defs/label"},
+        "k": {"type": "integer", "minimum": 2, "maximum": 6},
+        "compatibility_sha256": {"$ref": "#/$defs/sha256"},
+        "compatibility_by_layer": {"$ref": "#/$defs/compatibilityByLayer"}
+      }
+    },
+    "stage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["label", "k", "parent", "experts"],
+      "properties": {
+        "label": {"$ref": "#/$defs/label"},
+        "k": {"$ref": "#/$defs/bits"},
+        "parent": {"$ref": "#/$defs/label"},
+        "experts": {
+          "oneOf": [
+            {"const": "all"},
+            {"type": "array", "minItems": 1, "uniqueItems": true,
+             "items": {"type": "integer", "minimum": 0}}
+          ]
+        }
+      }
+    },
+    "tensorParallel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["layout", "world_size", "ranks", "axis_by_projection"],
+      "properties": {
+        "layout": {"enum": ["full", "rank-sharded"]},
+        "world_size": {"type": "integer", "minimum": 1},
+        "ranks": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "axis_by_projection": {
+          "const": {
+            "gate_proj": "output",
+            "up_proj": "output",
+            "down_proj": "input"
+          }
+        }
+      },
+      "allOf": [{
+        "if": {"properties": {"layout": {"const": "full"}}},
+        "then": {
+          "properties": {
+            "world_size": {"const": 1},
+            "ranks": {"const": [0]}
+          }
+        }
+      }]
+    },
+    "compatibilityByLayer": {
+      "type": "object", "minProperties": 1,
+      "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+      "additionalProperties": {"$ref": "#/$defs/sha256"}
+    },
+    "campaign": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "recipe_sha256", "base_model", "base_revision", "encoder_sha256",
+        "signer_pubkey", "block_size", "moe_layers"
+      ],
+      "properties": {
+        "recipe_sha256": {"$ref": "#/$defs/sha256"},
+        "base_model": {"type": "string", "minLength": 1},
+        "base_revision": {"type": "string", "minLength": 1},
+        "encoder_sha256": {
+          "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+        },
+        "signer_pubkey": {"$ref": "#/$defs/sha256"},
+        "block_size": {"type": "integer", "minimum": 1},
+        "moe_layers": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}

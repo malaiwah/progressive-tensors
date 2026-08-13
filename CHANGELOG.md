@@ -60,7 +60,7 @@ measured, what is implemented, and what is not.
   repository can and cannot do under fingerprint pinning.
 - **JSON Schemas** in [`schemas/`](schemas/) for `fq-segment/1` (segment
   metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`,
-  `fq-cartridge/2`, `fq-cartridge-adapter/2`, `fq-cartridge-assembly/1`, and
+  `fq-cartridge/2`, `fq-cartridge-adapter/3`, `fq-cartridge-assembly/2`, and
   `fq-release/1` — derived
   from real emitted artifacts and re-validated against freshly emitted
   documents on every CI run.
@@ -85,7 +85,7 @@ measured, what is implemented, and what is not.
   GPU over disjoint blocks. One campaign directory takes one launcher and one
   signing key, both enforced rather than advised, and publication cannot overlap
   encoding. `fq-combine-cartridges` turns one published
-  assembly plan into a self-contained `fq-cartridge-adapter/2` cartridge under
+  assembly plan into a self-contained `fq-cartridge-adapter/3` cartridge under
   a pinned signer, narrowing a full-expert stage to the experts a consumer
   actually wants — decided from the signed plan before any payload is read, and
   checked against the base checkpoint it will be loaded onto.
@@ -95,6 +95,24 @@ measured, what is implemented, and what is not.
   copies, after verifying the branch carries every file the finalized campaign
   holds. These custom cartridges are explicitly not standard PEFT/LoRA adapters
   and require an EXL3 MSRT-aware runtime.
+- **Source-byte provenance is one transaction** — skeleton repacks and raw
+  encoder reads copy and SHA-256 one `O_NOFOLLOW` regular-file fd into private
+  `0600` staging, validate the inode before/after, deserialize only staged
+  bytes, and attest that observed digest directly. Hub/manifest digests and the
+  resume cache are strict expectations rather than substitutes for
+  observation; symlinks, FIFOs, nonregular files, source drift and stale cache
+  entries are refused.
+- **Versioned MSRT runtime binding** — the pre-merge closed
+  `fq-cartridge-assembly/2` and `fq-cartridge-adapter/3` contracts bind an
+  ordered residual chain to exact per-layer logical base identities plus a
+  TP-layout-invariant family root. Adapter/3 fixes base-owned rotations,
+  packed int16 trellis plus scalar float32 scale semantics, and an explicit
+  full-vs-rank-sharded layout/rank/axis map (unambiguous even at world size
+  one). Every shard carries size and SHA-256; producer/runtime share config,
+  shard, and total-size limits. `producer_verified_signer` records combiner
+  provenance only, not runtime authentication. The paired vLLM loader rejects
+  unversioned, incomplete, tampered, wrong-base, or wrong-TP cartridges before
+  tensor deserialization.
 - **Two recipes for GLM-5.2, priced against each other.**
   `recipes/glm52-k2k3-dag.json` ships nine products including two that sell a
   +1-bit upgrade to an installed 3 or 4 bpw tier;

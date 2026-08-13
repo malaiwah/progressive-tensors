@@ -113,6 +113,17 @@
                   "type": "null"
                 }
               ]
+            },
+            "source_shards": {
+              "type": "object",
+              "description": "Source shard path -> SHA-256 observed while privately staging the exact regular-file bytes consumed by this producer. Published expectations and caches are cross-checks, never substitutes for this observation.",
+              "minProperties": 1,
+              "propertyNames": {
+                "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+\\.safetensors$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/sha256"
+              }
             }
           },
           "additionalProperties": true
@@ -208,6 +219,18 @@
         "base_model": {
           "type": "string"
         },
+        "tool": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
         "calibration_corpus_sha256": {
           "oneOf": [
             {
@@ -297,6 +320,49 @@
             "required": [
               "expert_sha256"
             ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "tool",
+              "predicate"
+            ],
+            "properties": {
+              "tool": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "version"
+                ],
+                "properties": {
+                  "name": {
+                    "const": "fq_assemble_lora"
+                  },
+                  "version": {
+                    "const": "fq_assemble_lora/3"
+                  }
+                }
+              },
+              "predicate": {
+                "enum": [
+                  "encode-of",
+                  "repack-of"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "materials"
+            ],
+            "properties": {
+              "materials": {
+                "required": [
+                  "source_shards"
+                ]
+              }
+            }
           }
         }
       ],

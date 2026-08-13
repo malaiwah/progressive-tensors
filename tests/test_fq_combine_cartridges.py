@@ -25,47 +25,50 @@ def stage_tensors(label="res1", k=1, layer=3, experts=(0,)):
         for projection in lora.PROJECTIONS:
             root = f"{prefix}.{projection}.rank0"
             tensors[f"{root}.trellis_{label}"] = torch.zeros(
-                8, 8, k * 16, dtype=torch.int16)
-            tensors[f"{root}.suh_{label}"] = torch.ones(128, dtype=torch.float16)
-            tensors[f"{root}.svh_{label}"] = torch.ones(128, dtype=torch.float16)
-            tensors[f"{root}.scale_{label}"] = torch.tensor(
-                2.0, dtype=torch.float32)
+                8, 8, k * 16, dtype=torch.int16
+            )
+            tensors[f"{root}.scale_{label}"] = torch.tensor(2.0, dtype=torch.float32)
     return tensors
 
 
 def test_stage_tensor_validation_requires_complete_components_and_k_geometry():
     stage = {"label": "res1", "k": 1, "experts": [0]}
-    combine.validate_stage_tensors(
-        stage_tensors(), stage, {0}, 3, "stage.safetensors")
+    combine.validate_stage_tensors(stage_tensors(), stage, {0}, 3, "stage.safetensors")
 
     missing = stage_tensors()
     missing.pop(next(key for key in missing if ".scale_res1" in key))
     with pytest.raises(lora.CartridgeError, match="components"):
-        combine.validate_stage_tensors(
-            missing, stage, {0}, 3, "stage.safetensors")
+        combine.validate_stage_tensors(missing, stage, {0}, 3, "stage.safetensors")
 
     with pytest.raises(lora.CartridgeError, match="last dimension is 16"):
         combine.validate_stage_tensors(
-            stage_tensors(k=2), stage, {0}, 3, "stage.safetensors")
+            stage_tensors(k=2), stage, {0}, 3, "stage.safetensors"
+        )
 
     with pytest.raises(lora.CartridgeError, match="carries label"):
         combine.validate_stage_tensors(
-            stage_tensors(label="other"), stage, {0}, 3, "stage.safetensors")
+            stage_tensors(label="other"), stage, {0}, 3, "stage.safetensors"
+        )
 
     with pytest.raises(lora.CartridgeError, match="belongs to layer"):
         combine.validate_stage_tensors(
-            stage_tensors(layer=4), stage, {0}, 3, "stage.safetensors")
+            stage_tensors(layer=4), stage, {0}, 3, "stage.safetensors"
+        )
 
     with pytest.raises(lora.CartridgeError, match="!= selected"):
         combine.validate_stage_tensors(
-            stage_tensors(experts=(0, 1)), stage, {0}, 3, "stage.safetensors")
+            stage_tensors(experts=(0, 1)), stage, {0}, 3, "stage.safetensors"
+        )
 
 
-@pytest.mark.parametrize("value,expected", [
-    ("0-3", {0, 1, 2, 3}),
-    ("5", {5}),
-    ("0-2,7", {0, 1, 2, 7}),
-])
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("0-3", {0, 1, 2, 3}),
+        ("5", {5}),
+        ("0-2,7", {0, 1, 2, 7}),
+    ],
+)
 def test_id_selection_parses_ranges(value, expected):
     assert combine.parse_ids(value) == expected
 
@@ -88,18 +91,28 @@ def signer_of(campaign) -> str:
     return summary["provenance"]["signer_pubkey"]
 
 
-@pytest.mark.parametrize("overrides,message", [
-    ({"schema": "fq-cartridge-adapter/1"}, "schema must be"),
-    ({"format": "peft-lora"}, "unsupported format"),
-    ({"standard_lora_compatible": True}, "must be false"),
-    ({"base": {"label": "k2", "k": 2, "manifest_sha256": "short"}},
-     "invalid base checkpoint identity"),
-    ({"chain": [{"label": "hot", "k": 1, "parent": "k2r1", "experts": [0, 1]}]},
-     "not one path"),
-])
-def test_assembly_plan_validation_rejects_broken_plans(
-    campaign, overrides, message
-):
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"schema": "fq-cartridge-adapter/1"}, "schema must be"),
+        ({"format": "peft-lora"}, "unsupported format"),
+        ({"standard_lora_compatible": True}, "must be false"),
+        (
+            {"base": {"label": "k2", "k": 2, "manifest_sha256": "short"}},
+            "invalid base checkpoint identity",
+        ),
+        (
+            {"chain": [{"label": "hot", "k": 1, "parent": "k2r1", "experts": [0, 1]}]},
+            "not one path",
+        ),
+        ({"bits_per_weight": 0.0}, "accounting metadata"),
+        ({"num_tensors": True}, "accounting metadata"),
+        ({"tool_version": "unknown"}, "accounting metadata"),
+        ({"created_utc": "2026-08-13T12:34:56"}, "accounting metadata"),
+        ({"num_tensors": 999}, "published stage shard headers"),
+    ],
+)
+def test_assembly_plan_validation_rejects_broken_plans(campaign, overrides, message):
     mutate_plan(campaign.root, "hot-k4like", **overrides)
     with pytest.raises(lora.CartridgeError, match=message):
         combine.load_assembly(campaign.root, "hot-k4like", trust=None)
@@ -107,7 +120,8 @@ def test_assembly_plan_validation_rejects_broken_plans(
 
 def test_assembly_plan_rejects_path_traversal(campaign):
     plan = json.loads(
-        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text())
+        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text()
+    )
     plan["stage_shards"][0]["path"] = "../../etc/passwd.safetensors"
     mutate_plan(campaign.root, "k3like", stage_shards=plan["stage_shards"])
     with pytest.raises(lora.CartridgeError, match="campaign-relative"):
@@ -115,10 +129,17 @@ def test_assembly_plan_rejects_path_traversal(campaign):
 
 
 def combine_args(root: Path, assembly: str, out: Path, **overrides):
-    args = SimpleNamespace(root=root, assembly=assembly, out=out,
-                           experts=None, layers=None, force=False,
-                           trust_key=None, insecure_unsigned=True,
-                           base=None)
+    args = SimpleNamespace(
+        root=root,
+        assembly=assembly,
+        out=out,
+        experts=None,
+        layers=None,
+        force=False,
+        trust_key=None,
+        insecure_unsigned=True,
+        base=None,
+    )
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -130,26 +151,38 @@ def adapter_of(out: Path) -> dict:
 
 def test_combiner_requires_an_explicit_trust_decision(campaign, tmp_path: Path):
     with pytest.raises(lora.CartridgeError, match="--trust-key"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "a", insecure_unsigned=False))
+        combine.combine(
+            combine_args(
+                campaign.root, "k3like", tmp_path / "a", insecure_unsigned=False
+            )
+        )
 
 
-def test_combiner_verifies_the_signed_plan_and_every_fragment(
-    campaign, tmp_path: Path
-):
+def test_combiner_verifies_the_signed_plan_and_every_fragment(campaign, tmp_path: Path):
     key = signer_of(campaign)
     out = tmp_path / "trusted"
-    assert combine.combine(combine_args(
-        campaign.root, "hot-k4like", out,
-        trust_key=key, insecure_unsigned=False)) == 0
-    assert adapter_of(out)["verified_signer"] == key
+    assert (
+        combine.combine(
+            combine_args(
+                campaign.root, "hot-k4like", out, trust_key=key, insecure_unsigned=False
+            )
+        )
+        == 0
+    )
+    assert adapter_of(out)["producer_verified_signer"] == key
 
 
 def test_combiner_rejects_another_signer(campaign, tmp_path: Path):
     with pytest.raises(lora.CartridgeError, match="not the pinned"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "b",
-            trust_key="c" * 64, insecure_unsigned=False))
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "b",
+                trust_key="c" * 64,
+                insecure_unsigned=False,
+            )
+        )
 
 
 def test_combiner_detects_a_tampered_signed_plan(campaign, tmp_path: Path):
@@ -157,13 +190,18 @@ def test_combiner_detects_a_tampered_signed_plan(campaign, tmp_path: Path):
     envelope = json.loads(signed.read_text())
     payload = json.loads(base64.b64decode(envelope["payload"]))
     payload["mcg_multiplier"] = 1
-    envelope["payload"] = base64.b64encode(
-        json.dumps(payload).encode()).decode()
+    envelope["payload"] = base64.b64encode(json.dumps(payload).encode()).decode()
     signed.write_text(json.dumps(envelope) + "\n")
     with pytest.raises(lora.CartridgeError, match="unusable|signature"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "c",
-            trust_key=signer_of(campaign), insecure_unsigned=False))
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "c",
+                trust_key=signer_of(campaign),
+                insecure_unsigned=False,
+            )
+        )
 
 
 def test_combiner_refuses_an_altered_runtime_contract(campaign, tmp_path: Path):
@@ -180,25 +218,29 @@ def test_combiner_refuses_a_base_only_product(campaign, tmp_path: Path):
 
 def test_combiner_refuses_duplicate_or_foreign_shard_entries(campaign):
     plan = json.loads(
-        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text())
+        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text()
+    )
     doubled = plan["stage_shards"] + [plan["stage_shards"][0]]
     mutate_plan(campaign.root, "k3like", stage_shards=doubled)
     with pytest.raises(lora.CartridgeError, match="listed twice"):
         combine.load_assembly(campaign.root, "k3like", trust=None)
 
-    foreign = [dict(plan["stage_shards"][0],
-                    path="stages/other/model-layer-003-b000.safetensors")]
+    foreign = [
+        dict(
+            plan["stage_shards"][0],
+            path="stages/other/model-layer-003-b000.safetensors",
+        )
+    ]
     mutate_plan(campaign.root, "k3like", stage_shards=foreign)
     with pytest.raises(lora.CartridgeError, match="does not live under"):
         combine.load_assembly(campaign.root, "k3like", trust=None)
 
 
-def test_combiner_refuses_experts_the_assembly_does_not_cover(
-    campaign, tmp_path: Path
-):
+def test_combiner_refuses_experts_the_assembly_does_not_cover(campaign, tmp_path: Path):
     with pytest.raises(lora.CartridgeError, match="not covered by assembly"):
-        combine.combine(combine_args(
-            campaign.root, "hot-k4like", tmp_path / "d", experts="1,99"))
+        combine.combine(
+            combine_args(campaign.root, "hot-k4like", tmp_path / "d", experts="1,99")
+        )
 
 
 def test_tiered_assembly_states_which_experts_reach_which_stage(
@@ -206,8 +248,7 @@ def test_tiered_assembly_states_which_experts_reach_which_stage(
 ):
     """A mixed product covers different experts at different depths."""
     out = tmp_path / "tiered"
-    assert combine.combine(combine_args(
-        campaign.root, "hot-k4like", out)) == 0
+    assert combine.combine(combine_args(campaign.root, "hot-k4like", out)) == 0
     config = adapter_of(out)
     assert config["coverage"]["k2r1"] == {"3": [0, 1, 2, 3], "4": [0, 1, 2, 3]}
     assert config["coverage"]["hot"] == {"3": [0, 1], "4": [0, 1]}
@@ -239,35 +280,126 @@ def test_combiner_rejects_a_stage_from_another_campaign(
         dst = campaign.root / "stages" / "k2r1" / folder / f"{name}{suffix}"
         dst.write_bytes(src.read_bytes())
     with pytest.raises(lora.CartridgeError, match="sha256|parent|campaign"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "swapped"))
+        combine.combine(combine_args(campaign.root, "k3like", tmp_path / "swapped"))
 
 
 def test_narrowed_adapter_states_per_layer_coverage(campaign, tmp_path: Path):
     out = tmp_path / "hot"
-    assert combine.combine(combine_args(
-        campaign.root, "hot-k4like", out, experts="1")) == 0
+    assert (
+        combine.combine(combine_args(campaign.root, "hot-k4like", out, experts="1"))
+        == 0
+    )
     config = adapter_of(out)
     assert config["selected_experts"] == [1]
     assert config["selected_layers"] == [3, 4]
+    assert [stage["experts"] for stage in config["chain"]] == [[1], [1]]
+    assert set(config["coverage"]) == {stage["label"] for stage in config["chain"]}
     assert config["coverage"]["hot"] == {"3": [1], "4": [1]}
 
 
-def test_combiner_verifies_the_base_checkpoint_it_binds_to(
-    campaign, tmp_path: Path
-):
+def test_combiner_rejects_child_only_effective_coverage(campaign, tmp_path: Path):
+    """Even valid individual shards cannot publish a child without its parent."""
+    safe_open = pytest.importorskip("safetensors").safe_open
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    plan_path = campaign.root / "assemblies" / "hot-k4like" / "assembly.json"
+    plan = json.loads(plan_path.read_text())
+
+    def narrow(label: str, expert: int) -> tuple[dict, str]:
+        entry = next(
+            item
+            for item in plan["stage_shards"]
+            if item["label"] == label and item["layer"] == 3 and item["block"] == 0
+        )
+        path = campaign.root / entry["path"]
+        with safe_open(str(path), framework="pt") as handle:
+            metadata = dict(handle.metadata() or {})
+            tensor_names = tuple(handle.keys())
+            tensors = {
+                key: handle.get_tensor(key)
+                for key in tensor_names
+                if f".experts.{expert}." in key
+            }
+        metadata["covered_experts"] = str(expert)
+        save_file(tensors, str(path), metadata=metadata)
+        entry["experts"] = [expert]
+        entry["sha256"] = lora.sha256_file(path)
+        return entry, entry["sha256"]
+
+    _parent, parent_sha = narrow("k2r1", 0)
+    child, _child_sha = narrow("hot", 1)
+    child["parent_sha256"] = parent_sha
+    plan["num_tensors"] -= 12
+    plan_path.write_text(json.dumps(plan))
+
+    with pytest.raises(lora.CartridgeError, match="not a subset of parent"):
+        combine.combine(
+            combine_args(campaign.root, "hot-k4like", tmp_path / "child-only")
+        )
+
+
+def test_combiner_verifies_the_base_checkpoint_it_binds_to(campaign, tmp_path: Path):
     """A cartridge applied to the wrong base corrects other weights."""
     key = signer_of(campaign)
     good = campaign.root / "base" / "k2"
-    assert combine.combine(combine_args(
-        campaign.root, "k3like", tmp_path / "bound", base=good,
-        trust_key=key, insecure_unsigned=False)) == 0
+    assert (
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "bound",
+                base=good,
+                trust_key=key,
+                insecure_unsigned=False,
+            )
+        )
+        == 0
+    )
 
     wrong = campaign.root / "base" / "k3"
     with pytest.raises(lora.CartridgeError, match="not the .* this cartridge"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "unbound", base=wrong,
-            trust_key=key, insecure_unsigned=False))
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "unbound",
+                base=wrong,
+                trust_key=key,
+                insecure_unsigned=False,
+            )
+        )
+
+
+def test_combiner_base_verification_hashes_actual_payloads(campaign, tmp_path: Path):
+    base = campaign.root / "base" / "k2"
+    victim = base / "model-layer-003-b000.safetensors"
+    payload = bytearray(victim.read_bytes())
+    payload[-1] ^= 0x01
+    victim.write_bytes(payload)
+    with pytest.raises(lora.CartridgeError, match="does not match MANIFEST"):
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "tampered-base",
+                base=base,
+                trust_key=signer_of(campaign),
+                insecure_unsigned=False,
+            )
+        )
+
+
+def test_combiner_rejects_noncanonical_closed_base_metadata(campaign):
+    base = campaign.root / "base" / "k2"
+    config_path = base / "config.json"
+    config = json.loads(config_path.read_text())
+    config["hybrid_tr3_tail"]["stale_unknown"] = True
+    config_path.write_text(json.dumps(config))
+    lora.regenerate_manifest(base)
+
+    plan, _ = combine.load_assembly(campaign.root, "k3like", trust=None)
+    plan["base"]["manifest_sha256"] = lora.sha256_file(base / "MANIFEST.sha256")
+    with pytest.raises(lora.CartridgeError, match="base contract"):
+        combine.verify_base(base, plan, campaign.root, trust=None)
 
 
 def test_combiner_merges_every_stage_of_the_chain(campaign, tmp_path: Path):
@@ -279,29 +411,132 @@ def test_combiner_merges_every_stage_of_the_chain(campaign, tmp_path: Path):
     assert config["schema"] == lora.ADAPTER_CONFIG_SCHEMA
     assert [stage["label"] for stage in config["chain"]] == ["k2r1", "hot"]
     assert config["selected_experts"] == [0, 1, 2, 3]
+    assert config["tensor_parallel"] == combine.tensor_parallel_contract("full", 1)
     assert "stage_shards" not in config, "the emitted adapter is self-contained"
     labels = set()
     for shard in config["shards"]:
-        assert (out / shard).is_file()
-        with safe_open(str(out / shard), framework="pt") as handle:
-            for key in handle.keys():
+        assert (out / shard["path"]).is_file()
+        assert (out / shard["path"]).stat().st_size == shard["size"]
+        assert combine.sha256_file(out / shard["path"]) == shard["sha256"]
+        with safe_open(str(out / shard["path"]), framework="pt") as handle:
+            for key in tuple(handle.keys()):
                 labels.add(key.rsplit("_", 1)[1])
     assert labels == {"k2r1", "hot"}
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_combiner_materializes_explicit_rank_sharded_tp(
+    tmp_path: Path, monkeypatch, world_size: int
+):
+    import test_fq_assemble_lora as helpers
+
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from safetensors import safe_open
+
+    source = helpers.build_source(
+        tmp_path / "source",
+        layers=(3,),
+        experts=1,
+        size=128 * world_size,
+    )
+    recipe = helpers.write_recipe(tmp_path / "recipe.json", moe_layers=[3])
+    root = tmp_path / "campaign"
+    monkeypatch.setattr(lora, "bootstrap_encoder", helpers._fake_bootstrap)
+    args = helpers.encode_args(source, recipe, root)
+    assert lora.cmd_skeleton(args) == 0
+    assert lora.cmd_encode(args) == 0
+    assert lora.cmd_finalize(args) == 0
+
+    full_out = tmp_path / f"full-for-tp{world_size}"
+    assert combine.combine(combine_args(root, "k3like", full_out)) == 0
+    out = tmp_path / f"tp{world_size}"
+    assert (
+        combine.combine(
+            combine_args(
+                root,
+                "k3like",
+                out,
+                tp_layout="rank-sharded",
+                tp_world_size=world_size,
+            )
+        )
+        == 0
+    )
+    config = adapter_of(out)
+    assert config["format"] == "exl3-msrt-packed"
+    assert config["runtime_profile"] == lora.RUNTIME_PROFILE
+    assert config["rotation_ownership"] == "base"
+    assert config["tensor_parallel"] == combine.tensor_parallel_contract(
+        "rank-sharded", world_size
+    )
+
+    def load_tensors(directory: Path):
+        loaded = {}
+        for shard in adapter_of(directory)["shards"]:
+            with safe_open(str(directory / shard["path"]), framework="pt") as handle:
+                shard_keys = tuple(handle.keys())
+                loaded.update({key: handle.get_tensor(key) for key in shard_keys})
+        return loaded
+
+    full = load_tensors(full_out)
+    ranked = load_tensors(out)
+    keys = list(ranked)
+    for shard in config["shards"]:
+        with safe_open(str(out / shard["path"]), framework="pt") as handle:
+            for key in tuple(handle.keys()):
+                assert not key.endswith((".suh", ".svh", ".mcg"))
+                if ".scale_" in key:
+                    assert handle.get_tensor(key).ndim == 0
+                    assert handle.get_tensor(key).dtype is torch.float32
+    ranks = {int(key.split(".rank", 1)[1].split(".", 1)[0]) for key in keys}
+    assert ranks == set(range(world_size))
+    assert config["num_tensors"] == len(keys)
+    for key, tensor in full.items():
+        pieces = [
+            ranked[key.replace(".rank0.", f".rank{rank}.")]
+            for rank in range(world_size)
+        ]
+        if ".trellis_" in key:
+            projection = next(p for p in lora.PROJECTIONS if f".{p}." in key)
+            dim = 0 if projection == "down_proj" else 1
+            assert torch.equal(torch.cat(pieces, dim=dim), tensor)
+        else:
+            assert tensor.ndim == 0 and tensor.dtype is torch.float32
+            assert all(piece.ndim == 0 for piece in pieces)
+            assert all(piece.dtype is torch.float32 for piece in pieces)
+            assert all(torch.equal(piece, tensor) for piece in pieces)
+
+
+def test_rank_sharding_rejects_unaligned_local_intermediate(campaign, tmp_path: Path):
+    with pytest.raises(lora.CartridgeError, match="128-aligned TP ranks"):
+        combine.combine(
+            combine_args(
+                campaign.root,
+                "k3like",
+                tmp_path / "tp3",
+                tp_layout="rank-sharded",
+                tp_world_size=3,
+            )
+        )
 
 
 def test_combiner_narrows_a_full_stage_to_selected_experts(campaign, tmp_path: Path):
     from safetensors import safe_open
 
     out = tmp_path / "hot-only"
-    assert combine.combine(
-        combine_args(campaign.root, "k3like", out, experts="1,3")) == 0
+    assert (
+        combine.combine(combine_args(campaign.root, "k3like", out, experts="1,3")) == 0
+    )
     config = adapter_of(out)
     assert config["selected_experts"] == [1, 3]
     seen = set()
     for shard in config["shards"]:
-        with safe_open(str(out / shard), framework="pt") as handle:
-            experts = {int(key.split(".experts.")[1].split(".")[0])
-                       for key in handle.keys()}
+        with safe_open(str(out / shard["path"]), framework="pt") as handle:
+            experts = {
+                int(key.split(".experts.")[1].split(".")[0])
+                for key in tuple(handle.keys())
+            }
         assert experts <= {1, 3}, "unselected experts must not be paid for"
         seen |= experts
     assert seen == {1, 3}
@@ -312,21 +547,22 @@ def test_combiner_narrows_a_full_stage_to_selected_experts(campaign, tmp_path: P
 
 def test_combiner_restricts_to_selected_layers(campaign, tmp_path: Path):
     out = tmp_path / "layer3"
-    assert combine.combine(
-        combine_args(campaign.root, "k3like", out, layers="3")) == 0
+    assert combine.combine(combine_args(campaign.root, "k3like", out, layers="3")) == 0
     shards = adapter_of(out)["shards"]
-    assert shards and all("layer-003" in name for name in shards)
+    assert shards and all("layer-003" in shard["path"] for shard in shards)
 
 
 def test_combiner_refuses_an_empty_selection(campaign, tmp_path: Path):
     with pytest.raises(lora.CartridgeError, match="matched no experts"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "none", experts="99"))
+        combine.combine(
+            combine_args(campaign.root, "k3like", tmp_path / "none", experts="99")
+        )
 
 
 def test_combiner_refuses_altered_stage_bytes(campaign, tmp_path: Path):
     plan = json.loads(
-        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text())
+        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text()
+    )
     victim = campaign.root / plan["stage_shards"][0]["path"]
     payload = bytearray(victim.read_bytes())
     payload[-1] ^= 0xFF
@@ -335,26 +571,57 @@ def test_combiner_refuses_altered_stage_bytes(campaign, tmp_path: Path):
         combine.combine(combine_args(campaign.root, "k3like", tmp_path / "bad"))
 
 
+def test_combiner_deserializes_the_private_verified_stage_copy(
+    campaign, tmp_path: Path, monkeypatch
+):
+    original = combine.read_block
+
+    def replace_after_staging(root, entry, staging_dir, **kwargs):
+        result = original(root, entry, staging_dir, **kwargs)
+        source = root / entry["path"]
+        replacement = source.with_suffix(".replacement")
+        replacement.write_bytes(b"not a safetensors file")
+        replacement.replace(source)
+        return result
+
+    monkeypatch.setattr(combine, "read_block", replace_after_staging)
+    assert (
+        combine.combine(
+            combine_args(campaign.root, "k3like", tmp_path / "staged-source")
+        )
+        == 0
+    )
+
+
 def test_combiner_reports_a_missing_stage_shard(campaign, tmp_path: Path):
     plan = json.loads(
-        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text())
+        (campaign.root / "assemblies" / "k3like" / "assembly.json").read_text()
+    )
     (campaign.root / plan["stage_shards"][0]["path"]).unlink()
     with pytest.raises(lora.CartridgeError, match="missing stage shard"):
         combine.combine(combine_args(campaign.root, "k3like", tmp_path / "gone"))
 
 
-@pytest.mark.parametrize("component,replacement,message", [
-    ("trellis", lambda torch: torch.zeros(8, 8, 16, dtype=torch.float16),
-     "3-D int16 trellis"),
-    ("suh", lambda torch: torch.ones(128, dtype=torch.float32),
-     "1-D float16 vector"),
-    ("suh", lambda torch: torch.ones(64, dtype=torch.float16),
-     "expected 128"),
-    ("scale", lambda torch: torch.tensor(0.0, dtype=torch.float32),
-     "finite and positive"),
-    ("scale", lambda torch: torch.tensor(-1.0, dtype=torch.float32),
-     "finite and positive"),
-])
+@pytest.mark.parametrize(
+    "component,replacement,message",
+    [
+        (
+            "trellis",
+            lambda torch: torch.zeros(8, 8, 16, dtype=torch.float16),
+            "3-D int16 trellis",
+        ),
+        (
+            "scale",
+            lambda torch: torch.tensor(0.0, dtype=torch.float32),
+            "finite and positive",
+        ),
+        (
+            "scale",
+            lambda torch: torch.tensor(-1.0, dtype=torch.float32),
+            "finite and positive",
+        ),
+    ],
+)
 def test_stage_tensor_validation_rejects_unusable_payloads(
     component, replacement, message
 ):
@@ -365,8 +632,7 @@ def test_stage_tensor_validation_rejects_unusable_payloads(
     key = next(k for k in tensors if k.endswith(f".{component}_res1"))
     tensors[key] = replacement(torch)
     with pytest.raises(lora.CartridgeError, match=message):
-        combine.validate_stage_tensors(
-            tensors, stage, {0}, 3, "stage.safetensors")
+        combine.validate_stage_tensors(tensors, stage, {0}, 3, "stage.safetensors")
 
 
 def test_combiner_rejects_a_traversing_assembly_label(campaign, tmp_path: Path):
@@ -374,12 +640,11 @@ def test_combiner_rejects_a_traversing_assembly_label(campaign, tmp_path: Path):
         combine.load_assembly(campaign.root, "../../etc", trust=None)
 
 
-def test_combiner_refuses_layers_the_assembly_does_not_cover(
-    campaign, tmp_path: Path
-):
+def test_combiner_refuses_layers_the_assembly_does_not_cover(campaign, tmp_path: Path):
     with pytest.raises(lora.CartridgeError, match="layers .* not"):
-        combine.combine(combine_args(
-            campaign.root, "k3like", tmp_path / "e", layers="3,999"))
+        combine.combine(
+            combine_args(campaign.root, "k3like", tmp_path / "e", layers="3,999")
+        )
 
 
 if __name__ == "__main__":

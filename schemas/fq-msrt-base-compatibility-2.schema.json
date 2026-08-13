@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/malaiwah/progressive-tensors/schemas/fq-msrt-base-compatibility-2.schema.json",
+  "title": "TP-invariant MSRT base compatibility root",
+  "description": "Canonical root over exact per-layer logical tensor identities, independent of safetensors sharding, TP partitioning, and process-local layer ownership.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "k", "layers"],
+  "properties": {
+    "schema": {"const": "fq-msrt-base-compatibility/2"},
+    "k": {"type": "integer", "minimum": 2, "maximum": 6},
+    "layers": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    }
+  }
+}
