@@ -11,6 +11,7 @@ Real published artifacts (~/fq-segments, ~/fq-0c, ~/fq-primed) are validated
 too when they happen to be present; they are absent on CI machines and the
 tests skip rather than pretend.
 """
+import base64
 import json
 import struct
 import sys
@@ -201,6 +202,38 @@ def test_campaign_assembly_plan_and_adapter_match_their_schemas(
     check("fq-cartridge-adapter-2",
           json.loads((out / "adapter_config.json").read_text()),
           label="adapter_config.json")
+
+
+def test_campaign_attestations_match_the_schema_and_the_verifier(campaign):
+    """Every line the campaign signs must satisfy the schema it claims.
+
+    Expert fragments carry `expert_sha256`; a skeleton shard carries no routed
+    expert, so it declares `kind: "skeleton"` and maps its tensors instead.
+    Both profiles are checked here against `fq-attestation/1` *and* against the
+    shared verifier in fq_verify, so a campaign cannot emit provenance that its
+    own trust tooling would reject.
+    """
+    import fq_verify
+
+    seen = set()
+    for node in ("base/k2", "stages/k2r1", "stages/hot", "skeleton"):
+        directory = campaign.root / node
+        for line in sorted((directory / "attestations").glob("*.jsonl")):
+            payload = json.loads(base64.b64decode(
+                json.loads(line.read_text())["payload"]))
+            check("fq-attestation-1", payload,
+                  pointer="#/$defs/payload", label=f"{node}/{line.name}")
+            fq_verify.validate_attestation_payload(
+                payload, where=f"{node}/{line.name}")
+            seen.add(payload["predicate"])
+            if payload.get("kind") == "skeleton":
+                assert payload["tensor_sha256"]
+                assert "expert_sha256" not in payload
+            else:
+                assert payload["expert_sha256"]
+                assert payload["materials"]["encoder_sha256"]
+                assert payload["determinism_scope"]
+    assert seen == {"encode-of", "repack-of"}
 
 
 # ----------------------------------------------- documents that must NOT pass
