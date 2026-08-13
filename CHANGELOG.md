@@ -73,23 +73,44 @@ measured, what is implemented, and what is not.
   `fq-cartridge/2` graph in one pass over the weights: every declared base
   tier becomes a complete EXL3 checkpoint, and every stage is a rescaled
   trellis residual against the reconstruction of the `parent` it names, so
-  nine loadable products spanning 35 bits per weight cost nine quantization
-  passes emitting 14 (measured on real GLM-5.2 experts: 1.83x less trellis
-  kernel time and 2.5x fewer bytes than encoding each product separately).
-  Subcommands
+  seven loadable products spanning 26 bits per weight cost seven quantization
+  passes emitting 12 (measured on real GLM-5.2 experts: 1.58x less trellis
+  kernel time and 2.17x fewer bytes than encoding each product separately; the
+  nine-product graph is 1.83x and 2.5x). Subcommands
   `plan` / `skeleton` / `encode` / `finalize`; reads standard indexed Hugging
   Face shards or per-layer shards without ever loading a whole shard; work is
-  addressed as (layer, 32-expert block), claimed with an `O_EXCL` lock and
-  committed as one atomic unit, so an interrupted or preempted run resumes at
-  block granularity and `--devices` runs one worker per GPU over disjoint
-  blocks with no shared state. `fq-combine-cartridges` turns one published
+  addressed as (layer, 32-expert block), owned by an `flock` the kernel releases
+  however the owner dies, and committed as one atomic unit, so an interrupted or
+  preempted run resumes at block granularity and `--devices` runs one worker per
+  GPU over disjoint blocks. One campaign directory takes one launcher and one
+  signing key, both enforced rather than advised, and publication cannot overlap
+  encoding. `fq-combine-cartridges` turns one published
   assembly plan into a self-contained `fq-cartridge-adapter/2` cartridge under
   a pinned signer, narrowing a full-expert stage to the experts a consumer
-  actually wants — decided from the signed plan before any payload is read.
+  actually wants — decided from the signed plan before any payload is read, and
+  checked against the base checkpoint it will be loaded onto.
   `fq-measure-mse-fruit` compares the actual SIQ checkpoint against every
-  graph node through the production encoder itself. These custom cartridges are
-  explicitly not standard PEFT/LoRA adapters and require an EXL3 MSRT-aware
-  runtime.
+  graph node through the production encoder itself. `fq-promote-campaign`
+  publishes a staged campaign to `main` in a single commit of server-side
+  copies, after verifying the branch carries every file the finalized campaign
+  holds. These custom cartridges are explicitly not standard PEFT/LoRA adapters
+  and require an EXL3 MSRT-aware runtime.
+- **Two recipes for GLM-5.2, priced against each other.**
+  `recipes/glm52-k2k3-dag.json` ships nine products including two that sell a
+  +1-bit upgrade to an installed 3 or 4 bpw tier;
+  `recipes/glm52-k2k3-lean.json` drops those two. Measured on 168 comparisons
+  across real GLM-5.2 layers and on all 88 blocks of a proxy rehearsal, the
+  narrow-step path they serve is 9.0% (K2 family) and 6.8% (K3) worse than
+  fetching the wider residual at the same bitrate, while costing twice the
+  kernel time — so the lean graph is the recommended rental: **132.6 GPU-hours
+  against 186.9**, both measured back to back on one RTX 5090.
+- **[tools/msrt_campaign.sh](tools/msrt_campaign.sh)** — the campaign as one
+  checked driver: window staging with last-use source retention, skeleton,
+  encode, retirement, and a `PHASE=finalize` pass for a CPU machine. Refuses a
+  `WINDOWS` list that does not cover the recipe exactly once, refuses to start
+  without an explicit `DEVICES`, and refuses to let the GPU fleet be released
+  until every prerequisite for finishing the campaign is on one persistent
+  filesystem.
 - **Signed provenance for every encoded fragment.** Each shard ships a
   `fq-attestation/1` line beside it: `encode-of` for expert shards, naming the
   sha256 of each expert's contiguous byte range, the encoder bundle (Python
@@ -101,12 +122,14 @@ measured, what is implemented, and what is not.
   `finalize` re-hashes all of it before publishing anything and refuses a
   campaign that spans two signers or two encoder builds, whose stages do not
   name the parents this campaign published, or that holds shards the recipe
-  does not describe.
+  does not describe. It is also resumable: a preemption during that
+  multi-terabyte pass costs the re-read, not the campaign.
 - **[docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md)** — the GLM-5.2 campaign
-  runbook: per-K trellis cost and a full 32-expert block measured on real
-  GLM-5.2 weights, the resulting 201 GPU-hour / 1.332 TB projection with its
-  measured/derived/unmeasured labels, the gates to run before renting a fleet,
-  and the resume, publish and verification procedure.
+  runbook: per-K trellis cost, both graphs measured as full 32-expert blocks on
+  real GLM-5.2 weights, the resulting 133 GPU-hour / 1.147 TB projection with
+  its measured/derived/unmeasured labels, exact window geometry from the pinned
+  index, fleet sizing, the gates to run before renting, and the resume, publish
+  and verification procedure — rehearsed end to end on a proxy.
 - **[docs/PRIOR-ART.md](docs/PRIOR-ART.md)** — commissioned independent
   prior-art review, and the single narrow claim this project makes.
 

@@ -552,37 +552,45 @@ naming the `parent` reconstruction it corrects, so the products share their
 ancestors' work instead of re-encoding it.
 
 ```bash
-# nine loadable products (K2, K3, and K3/K4/K5-like cartridges over both
-# bases) in nine quantization passes emitting 14 bits per weight
+# seven loadable products (K2, K3, and K4/K5-like cartridges over both bases)
+# in seven quantization passes emitting 12 bits per weight
 uv run tools/fq_assemble_lora.py plan --source <bf16-dir> \
-  --recipe recipes/glm52-k2k3-dag.json --block-size 32
+  --recipe recipes/glm52-k2k3-lean.json --block-size 32
 uv run tools/fq_assemble_lora.py skeleton --source <bf16-dir> \
-  --recipe recipes/glm52-k2k3-dag.json --out ./campaign --sign-key ~/.fq_keys/c.key
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign --sign-key ~/.fq_keys/c.key
 uv run tools/fq_assemble_lora.py encode --source <bf16-dir> \
-  --recipe recipes/glm52-k2k3-dag.json --out ./campaign \
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign \
   --encoder-source <exllamav3-pkg> --sign-key ~/.fq_keys/c.key \
   --devices cuda:0,cuda:1
 uv run tools/fq_assemble_lora.py finalize --source <bf16-dir> \
-  --recipe recipes/glm52-k2k3-dag.json --out ./campaign --sign-key ~/.fq_keys/c.key
+  --recipe recipes/glm52-k2k3-lean.json --out ./campaign --sign-key ~/.fq_keys/c.key
 
 # consumer: one product, narrowed to the experts you actually want upgraded,
-# under a pinned signer
+# under a pinned signer, checked against the base it will be loaded onto
 uv run tools/fq_combine_cartridges.py --root ./campaign \
   --assembly k2-k4like-direct --out ./k4like-hot96 --experts 0-95 \
-  --trust-key <64-hex campaign signer>
+  --trust-key <64-hex campaign signer> --base ./campaign/base/k2
 ```
+
+For a whole campaign, `tools/msrt_campaign.sh` runs that sequence window by
+window with source retention, then hands off to a CPU machine for `finalize` and
+`fq-promote-campaign`, which publishes the result in one commit.
 
 Work is addressed as (layer, 32-expert block) and committed as one atomic unit,
 so a preempted run resumes at block granularity and `--devices` runs one worker
-per GPU over disjoint blocks with no shared state. Every shard ships a signed
-`fq-attestation/1` line naming the sha256 of each expert's byte range, the
+per GPU over disjoint blocks. Block ownership is an `flock`, so a crashed worker
+frees its block and no launcher has to guess whether a claim is stale; one
+campaign directory takes one launcher and one signing key. Every shard ships a
+signed `fq-attestation/1` line naming the sha256 of each expert's byte range, the
 encoder bundle that produced it and — for a residual — the exact parent shard
 digest it corrects; `finalize` re-hashes all of it before publishing and the
 combiner re-checks it under a key you pin. Measured on real GLM-5.2 experts, the
-shared-parent graph costs **1.83x less trellis kernel time and 2.5x fewer
-bytes** than encoding the same nine products separately;
-[docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md) carries the per-K cost table, the
-full-campaign projection and the runbook.
+shared-parent graph costs **1.58x less trellis kernel time and 2.17x fewer
+bytes** than encoding the same seven products separately (1.83x and 2.5x for the
+nine-product `glm52-k2k3-dag.json`, whose two extra products sell +1-bit upgrades
+at measurably worse error — [docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md) §1.1
+prices the choice, and carries the per-K cost table, the full-campaign
+projection and the runbook).
 
 ## Status & roadmap
 
