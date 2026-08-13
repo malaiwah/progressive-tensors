@@ -1386,7 +1386,7 @@ def test_full_header_fallback_reauthenticates_cache_and_reuses_pass_bytes(
         "build", "--dir", str(repo), "--release", "test 0.1.0",
         "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
     served["mount"]("test/pub", repo)
-    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     argv = ["--policy", str(policy), "--out", str(out), "--source",
             f"test/pub@{REV}", "--trust-signer", pub,
@@ -1443,7 +1443,7 @@ def test_signed_header_cache_reduces_restart_authentication_cost(tmp_path, serve
         "build", "--dir", str(repo), "--release", "test 0.1.0",
         "--repo", "test/pub", "--revision", REV, "--sign-key", str(key)]) == 0
     served["mount"]("test/pub", repo)
-    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3, 4, 4, 4]})
+    policy = write_policy(tmp_path / "recipe.json", {LAYERS[0]: [3] * E})
     out = tmp_path / "fetched"
     argv = ["--policy", str(policy), "--out", str(out), "--source",
             f"test/pub@{REV}", "--trust-signer", pub,
