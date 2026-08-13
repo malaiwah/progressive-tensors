@@ -1,16 +1,21 @@
 {
-  "schema": "fq-cartridge/1",
-  "base_k": 2,
+  "schema": "fq-cartridge/2",
+  "description": "Fruit proxy for the SIQ tier split: K2 base + K1 residual on all experts + a second K1 residual on the 96 hot experts, i.e. 160 K3-equivalent and 96 K4-equivalent experts at 3.375 bits per weight overall.",
+  "bases": [
+    {"label": "k2", "k": 2, "description": "2 bpw base for all 256 experts"}
+  ],
   "stages": [
     {
       "k": 1,
       "label": "res1",
+      "parent": "k2",
       "experts": "all",
-      "description": "K1 rescaled trellis residual on ALL experts → K3-equivalent (3bpw)"
+      "description": "K1 rescaled trellis residual on ALL experts -> K3-equivalent (3bpw)"
     },
     {
       "k": 1,
       "label": "res2",
+      "parent": "res1",
       "experts": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
                   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
                   30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
@@ -18,9 +23,14 @@
                   58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
                   72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
                   86, 87, 88, 89, 90, 91, 92, 93, 94, 95],
-      "description": "K1 residual on the recipe-selected 96 experts; total K4-equivalent"
+      "description": "Second K1 residual on the recipe-selected 96 hot experts; those experts become K4-equivalent"
     }
   ],
-  "moe_layers": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
-  "description": "Fruit proxy: K2 base + K1 residual on all + K1 residual on selected 96 = 160 K3 and 96 K4 (3.375 bpw)"
+  "assemblies": [
+    {"label": "k3like", "base": "k2", "chain": ["res1"],
+     "description": "All 256 experts at 3 bpw"},
+    {"label": "siq-proxy", "base": "k2", "chain": ["res1", "res2"],
+     "description": "160 experts at 3 bpw and 96 at 4 bpw: 3.375 bpw overall"}
+  ],
+  "moe_layers": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 }

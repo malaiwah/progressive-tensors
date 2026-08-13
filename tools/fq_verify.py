@@ -123,11 +123,20 @@ def validate_attestation_payload(payload: dict, *, where: str) -> None:
             ("size" in fragment and
              (not isinstance(fragment["size"], int) or fragment["size"] < 1))):
         fail("fragment")
-    experts = payload.get("expert_sha256")
-    if (not isinstance(experts, dict) or not experts or
-            any(not isinstance(eid, str) or not eid.isdigit() or
-                not is_sha256(digest) for eid, digest in experts.items())):
-        fail("expert_sha256")
+    if payload.get("kind") == "skeleton":
+        # A fragment with no routed experts (an MSRT campaign skeleton shard)
+        # maps its tensors instead; fq-attestation/1 requires one or the other.
+        tensors = payload.get("tensor_sha256")
+        if (not isinstance(tensors, dict) or not tensors or
+                any(not isinstance(name, str) or not is_sha256(digest)
+                    for name, digest in tensors.items())):
+            fail("tensor_sha256")
+    else:
+        experts = payload.get("expert_sha256")
+        if (not isinstance(experts, dict) or not experts or
+                any(not isinstance(eid, str) or not eid.isdigit() or
+                    not is_sha256(digest) for eid, digest in experts.items())):
+            fail("expert_sha256")
     created = payload.get("created_utc")
     if (not isinstance(created, str) or len(created) != 20 or
             created[4:5] != "-" or created[7:8] != "-" or

@@ -15,13 +15,14 @@ import json
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 jsonschema = pytest.importorskip("jsonschema")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
-import fq_assemble_lora
+import fq_assemble_lora  # noqa: F401  (imported for its emitted documents)
 import fq_fetch  # imported for its emitted documents
 import fq_release
 from test_fq_fetch import (
@@ -32,7 +33,7 @@ from test_fq_fetch import (
 )
 from test_fq_repack import LAYERS
 
-pytest_plugins = ("test_fq_fetch",)
+pytest_plugins = ("test_fq_fetch", "test_fq_assemble_lora")
 
 
 def _schemas_dir() -> Path | None:
@@ -172,27 +173,34 @@ def test_release_output_matches_the_schema(emitted):
           pointer="#/$defs/payload", label="release payload")
 
 
-def test_fruit_cartridge_recipe_matches_schema():
-    recipe = (
-        Path(__file__).parent.parent / "recipes" / "fruit-k2-k3k4-cart.json"
-    )
-    check("fq-cartridge-1", json.loads(recipe.read_text()), label=recipe.name)
+@pytest.mark.parametrize("name", [
+    "glm52-k2k3-dag", "fruit-k2k3-dag", "fruit-k2-k3k4-cart",
+])
+def test_published_cartridge_recipes_match_schema(name):
+    recipe = Path(__file__).parent.parent / "recipes" / f"{name}.json"
+    check("fq-cartridge-2", json.loads(recipe.read_text()), label=recipe.name)
 
 
-def test_emitted_cartridge_adapter_config_matches_schema(tmp_path):
-    fq_assemble_lora.write_adapter_config(
-        tmp_path,
-        2,
-        "a" * 64,
-        [{"label": "res1", "k": 1, "experts": [0]}],
-        ["res1/model-layer-003.safetensors"],
-        12,
-    )
-    check(
-        "fq-cartridge-adapter-1",
-        json.loads((tmp_path / "adapter_config.json").read_text()),
-        label="adapter_config.json",
-    )
+def test_campaign_assembly_plan_and_adapter_match_their_schemas(
+    campaign, tmp_path
+):
+    import fq_combine_cartridges as combine
+
+    for label in ("k3like", "hot-k4like"):
+        plan = campaign.root / "assemblies" / label / "assembly.json"
+        check("fq-cartridge-assembly-1", json.loads(plan.read_text()),
+              label=f"{label}/assembly.json")
+
+    out = tmp_path / "adapter"
+    combine.combine(SimpleNamespace(
+        root=campaign.root, assembly="hot-k4like", out=out, experts=None,
+        layers=None, force=False, insecure_unsigned=False,
+        trust_key=json.loads(
+            (campaign.root / "campaign_summary.json").read_text()
+        )["provenance"]["signer_pubkey"]))
+    check("fq-cartridge-adapter-2",
+          json.loads((out / "adapter_config.json").read_text()),
+          label="adapter_config.json")
 
 
 # ----------------------------------------------- documents that must NOT pass

@@ -1,0 +1,36 @@
+{
+  "schema": "fq-cartridge/2",
+  "description": "Fruit SIQ proxy rehearsal for the GLM-5.2 graph: identical bases, stages and assemblies as recipes/glm52-k2k3-dag.json, restricted to the Fruit MoE layers so the whole campaign can be measured end to end on one GPU before renting anything.",
+  "bases": [
+    {"label": "k2", "k": 2, "description": "2 bpw progressive fast-load base"},
+    {"label": "k3", "k": 3, "description": "3 bpw base"}
+  ],
+  "stages": [
+    {"label": "k2r1", "k": 1, "parent": "k2", "experts": "all",
+     "description": "K2+1 -> 3 bpw, K3-like"},
+    {"label": "k2r1r1", "k": 1, "parent": "k2r1", "experts": "all",
+     "description": "K2+1+1 -> 4 bpw, K4-like"},
+    {"label": "k2r2", "k": 2, "parent": "k2", "experts": "all",
+     "description": "K2+2 -> 4 bpw, K4-like"},
+    {"label": "k2r2r1", "k": 1, "parent": "k2r2", "experts": "all",
+     "description": "K2+2+1 -> 5 bpw, K5-like"},
+    {"label": "k3r1", "k": 1, "parent": "k3", "experts": "all",
+     "description": "K3+1 -> 4 bpw, K4-like"},
+    {"label": "k3r1r1", "k": 1, "parent": "k3r1", "experts": "all",
+     "description": "K3+1+1 -> 5 bpw, K5-like"},
+    {"label": "k3r2", "k": 2, "parent": "k3", "experts": "all",
+     "description": "K3+2 -> 5 bpw, K5-like"}
+  ],
+  "assemblies": [
+    {"label": "k2", "base": "k2", "chain": []},
+    {"label": "k2-k3like", "base": "k2", "chain": ["k2r1"]},
+    {"label": "k2-k4like-stepped", "base": "k2", "chain": ["k2r1", "k2r1r1"]},
+    {"label": "k2-k4like-direct", "base": "k2", "chain": ["k2r2"]},
+    {"label": "k2-k5like", "base": "k2", "chain": ["k2r2", "k2r2r1"]},
+    {"label": "k3", "base": "k3", "chain": []},
+    {"label": "k3-k4like", "base": "k3", "chain": ["k3r1"]},
+    {"label": "k3-k5like-stepped", "base": "k3", "chain": ["k3r1", "k3r1r1"]},
+    {"label": "k3-k5like-direct", "base": "k3", "chain": ["k3r2"]}
+  ],
+  "moe_layers": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+}

@@ -1,37 +1,78 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://malaiwah.github.io/progressive-tensors/schemas/fq-attestation-1.schema.json",
-  "title": "fq-attestation/1 — signed provenance line",
-  "description": "One line of attestations/layer-LLL.kK.jsonl. The file is JSON Lines: each line is a detached-signature ENVELOPE whose payload is the base64 of the canonical JSON (sorted keys, no spaces) that was signed. Multiple lines per file are expected — one per fragment covered, and eventually countersignatures by third parties — so consumers must iterate lines, not json.loads the whole file. Verifying the signature requires a public key obtained OUT OF BAND (keys/FINGERPRINTS in the git repo); the keyid field says which key signed, it does not confer authority. Derived from files emitted by fq_repack and fq_prime (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ/attestations, ~/fq-primed/segments-342/{shared-h,expanded}/attestations).",
+  "title": "fq-attestation/1 \u2014 signed provenance line",
+  "description": "One line of attestations/layer-LLL.kK.jsonl. The file is JSON Lines: each line is a detached-signature ENVELOPE whose payload is the base64 of the canonical JSON (sorted keys, no spaces) that was signed. Multiple lines per file are expected \u2014 one per fragment covered, and eventually countersignatures by third parties \u2014 so consumers must iterate lines, not json.loads the whole file. Verifying the signature requires a public key obtained OUT OF BAND (keys/FINGERPRINTS in the git repo); the keyid field says which key signed, it does not confer authority. Derived from files emitted by fq_repack and fq_prime (real examples: ~/fq-segments/GLM-5.2-EXL3-FQ/attestations, ~/fq-primed/segments-342/{shared-h,expanded}/attestations).",
   "$ref": "#/$defs/envelope",
   "$defs": {
-    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "envelope": {
       "type": "object",
-      "required": ["payload", "signature", "keyid"],
+      "required": [
+        "payload",
+        "signature",
+        "keyid"
+      ],
       "properties": {
-        "payload": { "type": "string", "contentEncoding": "base64", "contentMediaType": "application/json", "description": "base64 of the exact bytes that were signed" },
-        "signature": { "type": "string", "contentEncoding": "base64", "description": "base64 ed25519 signature, 64 bytes decoded — anything shorter is a failed verification, not a placeholder" },
-        "keyid": { "$ref": "#/$defs/sha256", "description": "hex ed25519 public key that made the signature; authority comes from keys/FINGERPRINTS, not from this field" }
+        "payload": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "contentMediaType": "application/json",
+          "description": "base64 of the exact bytes that were signed"
+        },
+        "signature": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "base64 ed25519 signature, 64 bytes decoded \u2014 anything shorter is a failed verification, not a placeholder"
+        },
+        "keyid": {
+          "$ref": "#/$defs/sha256",
+          "description": "hex ed25519 public key that made the signature; authority comes from keys/FINGERPRINTS, not from this field"
+        }
       },
       "additionalProperties": false
     },
     "payload": {
       "type": "object",
-      "required": ["schema", "predicate", "fragment", "expert_sha256", "created_utc"],
+      "required": [
+        "schema",
+        "predicate",
+        "fragment",
+        "created_utc"
+      ],
       "properties": {
-        "schema": { "const": "fq-attestation/1" },
+        "schema": {
+          "const": "fq-attestation/1"
+        },
         "predicate": {
-          "description": "repack-of: the fragment's bytes were copied verbatim from `materials`. derived-from: computed from `parents` by the exact rule in `derivation`. encode-of: produced by running the pinned encoder on the pinned inputs — reproducible only within the determinism scope declared in `determinism_scope`; across stacks the honest claim is equivalence-of, not identity. equivalence-of: measured numeric equivalence, not byte identity.",
-          "enum": ["repack-of", "derived-from", "encode-of", "equivalence-of"]
+          "description": "repack-of: the fragment's bytes were copied verbatim from `materials`. derived-from: computed from `parents` by the exact rule in `derivation`. encode-of: produced by running the pinned encoder on the pinned inputs \u2014 reproducible only within the determinism scope declared in `determinism_scope`; across stacks the honest claim is equivalence-of, not identity. equivalence-of: measured numeric equivalence, not byte identity.",
+          "enum": [
+            "repack-of",
+            "derived-from",
+            "encode-of",
+            "equivalence-of"
+          ]
         },
         "fragment": {
           "type": "object",
-          "required": ["file", "sha256"],
+          "required": [
+            "file",
+            "sha256"
+          ],
           "properties": {
-            "file": { "type": "string" },
-            "sha256": { "$ref": "#/$defs/sha256" },
-            "size": { "type": "integer", "minimum": 1 }
+            "file": {
+              "type": "string"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 1
+            }
           },
           "additionalProperties": true
         },
@@ -39,18 +80,40 @@
           "type": "object",
           "description": "expert id -> sha256 of that expert's contiguous byte span in the fragment. This is what makes a single-expert ranged read verifiable.",
           "minProperties": 1,
-          "propertyNames": { "pattern": "^[0-9]+$" },
-          "additionalProperties": { "$ref": "#/$defs/sha256" }
+          "propertyNames": {
+            "pattern": "^[0-9]+$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/sha256"
+          }
         },
-        "created_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "created_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
         "materials": {
           "type": "object",
           "description": "repack-of: what the bytes were copied out of. encode-of: the pinned base model/revision and encoder capture evidence; it deliberately does not use repack-of's repo/revision/file aliases.",
           "properties": {
-            "repo": { "type": "string" },
-            "revision": { "type": "string" },
-            "file": { "type": "string" },
-            "file_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] }
+            "repo": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "file_sha256": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/sha256"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
           },
           "additionalProperties": true
         },
@@ -59,12 +122,23 @@
           "description": "derived-from: the fragments this one was computed from, pinned by digest",
           "items": {
             "type": "object",
-            "required": ["file", "sha256"],
+            "required": [
+              "file",
+              "sha256"
+            ],
             "properties": {
-              "file": { "type": "string" },
-              "sha256": { "$ref": "#/$defs/sha256" },
-              "role": { "type": "string" },
-              "family": { "type": "string" }
+              "file": {
+                "type": "string"
+              },
+              "sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "role": {
+                "type": "string"
+              },
+              "family": {
+                "type": "string"
+              }
             },
             "additionalProperties": true
           }
@@ -72,10 +146,16 @@
         "derivation": {
           "type": "object",
           "description": "derived-from: the exact rule, named and described",
-          "required": ["rule"],
+          "required": [
+            "rule"
+          ],
           "properties": {
-            "rule": { "type": "string" },
-            "description": { "type": "string" }
+            "rule": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            }
           },
           "additionalProperties": true
         },
@@ -84,11 +164,20 @@
           "description": "other files needed to interpret this fragment (e.g. a shared_h profile)",
           "items": {
             "type": "object",
-            "required": ["file", "sha256"],
+            "required": [
+              "file",
+              "sha256"
+            ],
             "properties": {
-              "file": { "type": "string" },
-              "sha256": { "$ref": "#/$defs/sha256" },
-              "role": { "type": "string" }
+              "file": {
+                "type": "string"
+              },
+              "sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "role": {
+                "type": "string"
+              }
             },
             "additionalProperties": true
           }
@@ -98,31 +187,119 @@
           "description": "encode-of: the boundary within which re-running the encoder is expected to reproduce these bytes. Outside it, the honest claim is measured equivalence, not identity.",
           "additionalProperties": true
         },
-        "quant_args": { "type": "object", "additionalProperties": true, "description": "encode-of: the encoder's effective arguments" },
-        "supersedes": { "description": "digest, file name, or note identifying an earlier attestation this line replaces", "additionalProperties": true },
-        "k": { "type": ["integer", "string"] },
-        "layout": { "type": "string" },
-        "base_model": { "type": "string" },
-        "calibration_corpus_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
-        "source_config": { "type": "object", "additionalProperties": true },
-        "source_spans": { "type": "object", "additionalProperties": true },
-        "expert_k": { "type": "object", "additionalProperties": true }
+        "quant_args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "encode-of: the encoder's effective arguments"
+        },
+        "supersedes": {
+          "description": "digest, file name, or note identifying an earlier attestation this line replaces",
+          "additionalProperties": true
+        },
+        "k": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "layout": {
+          "type": "string"
+        },
+        "base_model": {
+          "type": "string"
+        },
+        "calibration_corpus_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "source_spans": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "expert_k": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tensor_sha256": {
+          "type": "object",
+          "description": "tensor name -> sha256 of that tensor's contiguous byte span, for fragments that carry no routed experts (shared_h profiles, and the MSRT campaign's skeleton shards).",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "kind": {
+          "type": "string"
+        }
       },
-        "allOf": [
-          {
-            "if": { "properties": { "predicate": { "const": "encode-of" } } },
-            "then": {
-              "required": ["materials", "quant_args", "determinism_scope"],
-              "properties": {
-                "materials": {
-                  "required": ["base_model", "base_revision", "capture_fingerprint", "encoder", "encoder_bundle", "encoder_sha256"]
-                },
-                "quant_args": { "minProperties": 1 },
-                "determinism_scope": { "minProperties": 1 }
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "predicate": {
+                "const": "encode-of"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "materials",
+              "quant_args",
+              "determinism_scope"
+            ],
+            "properties": {
+              "materials": {
+                "required": [
+                  "base_model",
+                  "base_revision",
+                  "capture_fingerprint",
+                  "encoder",
+                  "encoder_bundle",
+                  "encoder_sha256"
+                ]
+              },
+              "quant_args": {
+                "minProperties": 1
+              },
+              "determinism_scope": {
+                "minProperties": 1
               }
             }
           }
-        ],
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "skeleton"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "tensor_sha256"
+            ]
+          },
+          "else": {
+            "required": [
+              "expert_sha256"
+            ]
+          }
+        }
+      ],
       "additionalProperties": true
     }
   }

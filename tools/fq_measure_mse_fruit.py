@@ -28,8 +28,10 @@ def parse_ids(value: str | None) -> list[int] | None:
     try:
         values = [int(token) for token in value.split(",") if token]
     except ValueError as exc:
-        raise lora.CartridgeError(f"invalid comma-separated integer list {value!r}") from exc
-    if not values or any(value < 0 for value in values) or len(set(values)) != len(values):
+        raise lora.CartridgeError(
+            f"invalid comma-separated integer list {value!r}") from exc
+    if (not values or any(value < 0 for value in values)
+            or len(set(values)) != len(values)):
         raise lora.CartridgeError("ID lists must contain unique non-negative integers")
     return values
 
@@ -37,10 +39,10 @@ def parse_ids(value: str | None) -> list[int] | None:
 def select_stratified_experts(
     expert_ids: list[int], stages: list[dict[str, Any]], per_tier: int
 ) -> dict[str, list[int]]:
-    """Group by emitted stage chain and sample each tier independently."""
+    """Group by emitted stage set and sample each tier independently."""
     tiers: dict[str, list[int]] = {}
     for expert in expert_ids:
-        labels = [stage["label"] for stage in lora.selected_stages(stages, expert)]
+        labels = [stage["label"] for stage in lora.stages_for_expert(stages, expert)]
         tier = "+".join(labels) if labels else "base"
         tiers.setdefault(tier, []).append(expert)
     if per_tier > 0:
@@ -82,27 +84,17 @@ def mse(reference, reconstructed) -> float:
     return (reference.float() - reconstructed.float()).square().mean().item()
 
 
-def simulate_msrt(
-    weight, recipe, device, ghd, tcp, tcpi, qtf, cbs, expert: int
-) -> dict[str, float]:
-    """Use production regularization/quantization primitives for all variants."""
-    regularized, suh, svh = lora.regularize_with_vectors(
-        weight, device, ghd, cbs)
-    current = lora.quantize_trellis(
-        regularized, recipe["base_k"], device, tcp, tcpi, qtf)
-    reconstructed = lora.inverse_regularize(current, suh, svh, device, ghd)
-    values = {"msrt_base": mse(weight, reconstructed)}
-    for stage in lora.selected_stages(recipe["stages"], expert):
-        residual = regularized - current
-        residual_rms = residual.square().mean().sqrt().item()
-        if residual_rms >= 1e-12:
-            scale = abs(float(cbs)) / residual_rms
-            correction = lora.quantize_trellis(
-                residual * scale, stage["k"], device, tcp, tcpi, qtf)
-            current = current + correction / scale
-        reconstructed = lora.inverse_regularize(current, suh, svh, device, ghd)
-        values[f"msrt_through_{stage['label']}"] = mse(weight, reconstructed)
-    return values
+def simulate_msrt(weight, recipe, device, enc, expert: int) -> dict[str, float]:
+    """Measure every graph node through the production encoder itself.
+
+    The encoder already reports original-space MSE per node, so this tool never
+    keeps a second copy of the quantization pipeline that could drift from the
+    one that writes checkpoints.
+    """
+    nodes = lora.encode_matrix_dag(
+        weight, recipe["bases"],
+        lora.stages_for_expert(recipe["stages"], expert), device, enc)
+    return {f"msrt_{label}": node["mse"] for label, node in nodes.items()}
 
 
 def run_measurement(args) -> dict[str, Any]:
@@ -124,8 +116,7 @@ def run_measurement(args) -> dict[str, Any]:
     try:
         from safetensors import safe_open
 
-        with lora.bootstrap_encoder(args.encoder_source) as encoder:
-            _, ghd, tcp, tcpi, qtf, cbs = encoder
+        with lora.bootstrap_encoder(args.encoder_source) as enc:
             for layer in layers:
                 with safe_open(str(bf16_shards[layer]), framework="pt") as source:
                     keys = list(source.keys())
@@ -135,7 +126,8 @@ def run_measurement(args) -> dict[str, Any]:
                         missing = set(requested_experts) - set(available)
                         if missing:
                             raise lora.CartridgeError(
-                                f"layer {layer}: requested experts missing: {sorted(missing)}")
+                                f"layer {layer}: requested experts missing: "
+                                f"{sorted(missing)}")
                         tiers = {"explicit": requested_experts}
                     else:
                         tiers = select_stratified_experts(
@@ -149,8 +141,8 @@ def run_measurement(args) -> dict[str, Any]:
                                 experts[expert][projection]).float()
                             internal = source_weight.T.contiguous().to(device)
                             for name, value in simulate_msrt(
-                                    internal, recipe, device, ghd, tcp, tcpi,
-                                    qtf, cbs, expert).items():
+                                    internal, recipe, device, enc,
+                                    expert).items():
                                 sums[name] = sums.get(name, 0.0) + value
                                 counts[name] = counts.get(name, 0) + 1
 

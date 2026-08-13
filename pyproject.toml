@@ -69,7 +69,7 @@ sources = ["tools"]
 [tool.hatch.build.targets.wheel.force-include]
 "keys/FINGERPRINTS" = "fq_data/keys/FINGERPRINTS"
 "schemas" = "fq_data/schemas"
-"recipes/fruit-k2-k3k4-cart.json" = "fq_data/recipes/fruit-k2-k3k4-cart.json"
+"recipes" = "fq_data/recipes"
 
 [tool.hatch.build.targets.sdist]
 include = [

@@ -60,7 +60,8 @@ measured, what is implemented, and what is not.
   repository can and cannot do under fingerprint pinning.
 - **JSON Schemas** in [`schemas/`](schemas/) for `fq-segment/1` (segment
   metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`,
-  `fq-cartridge/1`, `fq-cartridge-adapter/1`, and `fq-release/1` — derived
+  `fq-cartridge/2`, `fq-cartridge-adapter/2`, `fq-cartridge-assembly/1`, and
+  `fq-release/1` — derived
   from real emitted artifacts and re-validated against freshly emitted
   documents on every CI run.
 - **Packaging** — `pyproject.toml` with console entry points (`fq-repack`,
@@ -68,12 +69,44 @@ measured, what is implemented, and what is not.
   `fq-eps`), a hashed universal dev lock (`requirements-dev.txt`), and
   GitHub Actions CI running the suite on ubuntu-latest and macos-latest for
   Python 3.11 / 3.12 / 3.13, plus wheel-build and trust-root jobs.
-- **MSRT cartridge tools** — `fq-assemble-lora` creates a complete EXL3 base
-  checkpoint plus validated, sharded full-rank residual cartridges;
-  `fq-combine-cartridges` validates and combines separately encoded stages;
-  `fq-measure-mse-fruit` compares the actual SIQ checkpoint and MSRT variants
-  in original weight space. These custom cartridges are explicitly not
-  standard PEFT/LoRA adapters and require an EXL3 MSRT-aware runtime.
+- **MSRT cartridge campaign tools** — `fq-assemble-lora` encodes a whole
+  `fq-cartridge/2` graph in one pass over the weights: every declared base
+  tier becomes a complete EXL3 checkpoint, and every stage is a rescaled
+  trellis residual against the reconstruction of the `parent` it names, so
+  nine loadable products spanning 35 bits per weight cost nine quantization
+  passes emitting 14 (measured on real GLM-5.2 experts: 1.83x less trellis
+  kernel time and 2.5x fewer bytes than encoding each product separately).
+  Subcommands
+  `plan` / `skeleton` / `encode` / `finalize`; reads standard indexed Hugging
+  Face shards or per-layer shards without ever loading a whole shard; work is
+  addressed as (layer, 32-expert block), claimed with an `O_EXCL` lock and
+  committed as one atomic unit, so an interrupted or preempted run resumes at
+  block granularity and `--devices` runs one worker per GPU over disjoint
+  blocks with no shared state. `fq-combine-cartridges` turns one published
+  assembly plan into a self-contained `fq-cartridge-adapter/2` cartridge under
+  a pinned signer, narrowing a full-expert stage to the experts a consumer
+  actually wants — decided from the signed plan before any payload is read.
+  `fq-measure-mse-fruit` compares the actual SIQ checkpoint against every
+  graph node through the production encoder itself. These custom cartridges are
+  explicitly not standard PEFT/LoRA adapters and require an EXL3 MSRT-aware
+  runtime.
+- **Signed provenance for every encoded fragment.** Each shard ships a
+  `fq-attestation/1` line beside it: `encode-of` for expert shards, naming the
+  sha256 of each expert's contiguous byte range, the encoder bundle (Python
+  modules *and* the compiled extension), the determinism scope, the effective
+  quant arguments, and the exact parent shard digest the residual corrects;
+  `repack-of` for skeleton shards, naming per-tensor digests and the source
+  file the bytes were copied from. Shard payloads carry no timestamp, so
+  re-encoding inside the declared scope reproduces them byte for byte.
+  `finalize` re-hashes all of it before publishing anything and refuses a
+  campaign that spans two signers or two encoder builds, whose stages do not
+  name the parents this campaign published, or that holds shards the recipe
+  does not describe.
+- **[docs/MSRT-CAMPAIGN.md](docs/MSRT-CAMPAIGN.md)** — the GLM-5.2 campaign
+  runbook: per-K trellis cost and a full 32-expert block measured on real
+  GLM-5.2 weights, the resulting 201 GPU-hour / 1.332 TB projection with its
+  measured/derived/unmeasured labels, the gates to run before renting a fleet,
+  and the resume, publish and verification procedure.
 - **[docs/PRIOR-ART.md](docs/PRIOR-ART.md)** — commissioned independent
   prior-art review, and the single narrow claim this project makes.
 
