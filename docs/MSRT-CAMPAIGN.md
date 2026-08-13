@@ -394,17 +394,24 @@ export HF_HUB_DISABLE_XET=1                # source staging: see below
 
 # the reviewed tree and the client, on the volume the CPU VM will inherit
 git clone https://github.com/malaiwah/progressive-tensors "$REPO"
-git -C "$REPO" checkout f25536e          # or the reviewed commit you audited
+git -C "$REPO" checkout msrt-campaign-ready   # the reviewed, rehearsed commit
+git -C "$REPO" describe --tags --always       # record what you are about to run
 python3 -m venv /data/venv && /data/venv/bin/pip install -q \
   "$REPO"[quant] 'huggingface_hub[cli,hf_xet]'
 export PATH=/data/venv/bin:$PATH
 hf auth login                              # or export HF_TOKEN=...
 
 # the encoder bundle: the trellis kernels every attestation pins by digest
+# every attestation pins this bundle by digest, so the revision is part of the
+# published contract: record it, and do not change it mid-campaign
+export ENC_REV=<exllamav3 commit>          # 40-hex; the encode refuses drift
 git clone https://github.com/turboderp-org/exllamav3 /data/exllamav3
-git -C /data/exllamav3 checkout <the build you intend to publish under>
+git -C /data/exllamav3 checkout "$ENC_REV"
 /data/venv/bin/pip install -q -e /data/exllamav3
 export ENC=/data/exllamav3/exllamav3
+# the rehearsal in 3.5/3.6 used encoder_sha256
+# 386e8fc8e6486835883319ebe73cb54486d8359bcf101758b7ca10e5ce701a88 with
+# torch 2.12.0+cu132, CUDA 13.2, Python 3.12.3, compute capability 12.0
 
 # a small MoE checkpoint for the parity gate: same expert layout, 9.5 GB
 export PROXY=/data/parity-proxy
@@ -478,14 +485,21 @@ this reason: shell exports do not follow a volume to another machine. After the
 reattach:
 
 ```bash
-source /data/glm52-msrt/campaign.env
-export PATH=/data/venv/bin:$PATH
-PHASE=finalize "$REPO/tools/msrt_campaign.sh"   # needs no GPU, no encoder bundle
+source /data/glm52-msrt/campaign.env   # carries $DRIVER, $REPO, $PATH and the rest
+PHASE=finalize "$DRIVER"               # needs no GPU and no encoder bundle
 ```
 
-Set `ALLOW_ROOT_CAMPAIGN=1` only for a rehearsal on a machine that has no
-separate volume; on a rental it is the check that stops you from releasing the
-instance holding your only copy. Each finished window leaves a marker bound to the
+`campaign.env` is written by the encode phase precisely so this works on a
+machine that has only the volume. Set `REHEARSAL=1` when no rented fleet is at
+stake — it downgrades the survivability checks to warnings. On a rental, leave it
+unset: it is what stops you releasing the instance that holds your only copy.
+
+**The gate cannot tell a persistent volume from an instance-local disk mounted at
+the same path.** Both pass. So before encoding: create the filesystem through the
+provider, record its ID, attach it in the region the GPUs are in, put `$CAMPAIGN`,
+`$SRC`, `$KEY`, `$REPO` and the venv under its real mount, and confirm the same ID
+can be attached to a CPU instance. The gate proves everything is on one non-root
+filesystem; only you can prove that filesystem outlives the instance. Each finished window leaves a marker bound to the
 recipe digest, revision, block size and window partition, so a rerun after a
 preemption skips completed windows instead of re-staging a terabyte, and a
 drifted rerun is refused rather than silently skipping work it never did.

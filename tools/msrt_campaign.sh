@@ -118,6 +118,9 @@ export RECIPE=$RECIPE
 export BLOCK_SIZE=$BLOCK_SIZE
 export WINDOWS="$WINDOWS"
 export FQ="${FQ:-fq-assemble-lora}"
+export REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+export DRIVER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+export PATH="$(dirname "$(command -v "${FQ_CMD[0]}" || echo /usr/bin/false)"):\$PATH"
 ENV
 fi
 
@@ -224,25 +227,32 @@ fi
 # Everything finalize needs must already live on the filesystem that will be
 # reattached, and it must be the SAME one -- a key or a checkout under the
 # instance's root disk disappears with the instance.
+# REHEARSAL=1 means "no rented fleet is about to be released", so survivability
+# findings are reported and not enforced. On a rental they are the whole point:
+# the campaign, the key, the recipe, the source metadata, this driver and the CLI
+# it calls must all be on the one filesystem that gets reattached.
 gate_failed=0
+gate_note() {
+  if [[ -n ${REHEARSAL:-} ]]; then echo "rehearsal, not enforced: $1" >&2
+  else echo "$1" >&2; gate_failed=1; fi
+}
 mount_of() { findmnt -no TARGET --target "$1" 2>/dev/null; }
 campaign_mount=$(mount_of "$CAMPAIGN")
-[[ -n $campaign_mount ]] || { echo "cannot resolve the mount of $CAMPAIGN" >&2
-                              gate_failed=1; }
-if [[ $campaign_mount == "/" && -z ${ALLOW_ROOT_CAMPAIGN:-} ]]; then
-  echo "REFUSING: $CAMPAIGN is on the root filesystem, which does not survive" \
-       "releasing the instance. Put the campaign on the persistent volume," \
-       "or set ALLOW_ROOT_CAMPAIGN=1 for a rehearsal on a machine with no volume." >&2
-  gate_failed=1
+[[ -n $campaign_mount ]] || gate_note "cannot resolve the mount of $CAMPAIGN"
+if [[ $campaign_mount == "/" ]]; then
+  gate_note "REFUSING: $CAMPAIGN is on the root filesystem, which does not
+survive releasing the instance. Put the campaign on the persistent volume, or
+set REHEARSAL=1 if no rented fleet is at stake."
 fi
+driver_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+cli_path=$(command -v "${FQ_CMD[0]}" || true)
 for path in "$KEY" "$RECIPE" "$SRC/model.safetensors.index.json" \
-            "$SRC/config.json" "$ENV_FILE" "$CAMPAIGN"; do
+            "$SRC/config.json" "$ENV_FILE" "$CAMPAIGN" \
+            "$driver_path" ${cli_path:+"$cli_path"}; do
   if [[ ! -e $path ]]; then
-    echo "MISSING, finalize would fail after the release: $path" >&2
-    gate_failed=1
+    gate_note "MISSING, finalize would fail after the release: $path"
   elif [[ $(mount_of "$path") != "$campaign_mount" ]]; then
-    echo "NOT on $campaign_mount (so it will not be reattached): $path" >&2
-    gate_failed=1
+    gate_note "NOT on $campaign_mount, so it will not be reattached: $path"
   fi
 done
 if [[ $gate_failed != 0 ]]; then
@@ -250,6 +260,7 @@ if [[ $gate_failed != 0 ]]; then
   exit 1
 fi
 echo "$campaign_mount holds the campaign, the key, the recipe, the source"
-echo "metadata and campaign.env. Release the GPUs, reattach this filesystem,"
-echo "then:  source $ENV_FILE && PHASE=finalize <this script>"
+echo "metadata, campaign.env, this driver and the fq-assemble-lora it calls."
+echo "Release the GPUs, reattach this filesystem, then:"
+echo "  source $ENV_FILE && PHASE=finalize \"\$DRIVER\""
 findmnt -no SOURCE,TARGET,SIZE,AVAIL --target "$CAMPAIGN"

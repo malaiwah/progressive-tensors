@@ -27,30 +27,28 @@ from pathlib import Path
 
 from huggingface_hub import CommitOperationCopy, HfApi
 
-# Written by the campaign, not uploaded: local bookkeeping and the resume state.
-LOCAL_ONLY = {".fq-msrt-encode.json", "source-digests.json"}
-LOCAL_ONLY_DIRS = {"logs", "locks", ".driver", "skeleton"}
+# What a campaign publishes. An allow-list, not a blacklist: a campaign directory
+# also accumulates operational files -- logs, locks, the sentinel, plan JSON, the
+# source digest cache, campaign.env, the driver's window state -- and a new one
+# appearing must not silently become a required upload or a spurious mismatch.
+# `skeleton/` is absent on purpose: finalize hardlinks its shards into each base,
+# which is what makes a base loadable, so publishing it separately would upload
+# the same bytes twice.
+PUBLISH_DIRS = ("base", "stages", "assemblies")
+PUBLISH_FILES = ("campaign_summary.json",)
 
 
 def campaign_files(campaign: Path) -> dict[str, int]:
-    """Every path a finalized campaign publishes, relative to the repo root.
-
-    `skeleton/` is excluded because `finalize` hardlinks its shards into each
-    base, which is what makes a base loadable; publishing it twice would double
-    the upload for nothing.
-    """
+    """Every path a finalized campaign publishes, relative to the repo root."""
     out: dict[str, int] = {}
-    for path in campaign.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(campaign)
-        if relative.parts[0] in LOCAL_ONLY_DIRS or relative.name in LOCAL_ONLY:
-            continue
-        # Every dotted path in a campaign is local bookkeeping: the sentinel and
-        # its guard, the campaign and worker locks, the driver's window state.
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-        out[relative.as_posix()] = path.stat().st_size
+    for name in PUBLISH_FILES:
+        path = campaign / name
+        if path.is_file():
+            out[name] = path.stat().st_size
+    for directory in PUBLISH_DIRS:
+        for path in (campaign / directory).rglob("*"):
+            if path.is_file():
+                out[path.relative_to(campaign).as_posix()] = path.stat().st_size
     return out
 
 
@@ -108,26 +106,26 @@ def main(argv=None) -> int:
         return 2
 
     api = HfApi()
-    local = campaign_files(args.campaign)
-    remote = staged(api, args.repo, args.source)
-    problems = compare(local, remote)
-    if problems:
-        for problem in problems:
-            print(f"error: {problem}", file=sys.stderr)
-        return 2
-    print(f"{len(local)} files on {args.repo}@{args.source} match the campaign "
-          f"byte for byte in name and size")
-    if args.check:
-        return 0
-
-    # Pin the branch to an immutable commit before copying from it, so a
-    # concurrent upload cannot change what "staging" means mid-promotion.
+    # Resolve first: comparing the branch name and then copying from a SHA
+    # resolved afterwards would leave exactly the window a concurrent upload
+    # needs to get unverified bytes onto main.
     refs = api.list_repo_refs(repo_id=args.repo)
     pinned = next((branch.target_commit for branch in refs.branches
                    if branch.name == args.source), None)
     if pinned is None:
         print(f"error: {args.repo} has no branch {args.source}", file=sys.stderr)
         return 2
+    local = campaign_files(args.campaign)
+    remote = staged(api, args.repo, pinned)
+    problems = compare(local, remote)
+    if problems:
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return 2
+    print(f"{len(local)} files at {args.repo}@{pinned[:12]} ({args.source}) "
+          f"match the campaign in name and size")
+    if args.check:
+        return 0
 
     operations = [
         CommitOperationCopy(src_path_in_repo=path, path_in_repo=path,
