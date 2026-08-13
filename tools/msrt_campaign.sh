@@ -103,7 +103,11 @@ mkdir -p "$WORK"
 # arguments that decide what a window contains, so a drifted rerun cannot skip
 # work it never did. The campaign sentinel already refuses recipe, revision and
 # block-size drift; the window partition is only known here.
-identity="recipe=$(sha256sum "$RECIPE" | cut -d' ' -f1) rev=$REV \
+digest_of() {  # sha256sum is GNU; shasum is the BSD/macOS spelling
+  command sha256sum "$1" 2>/dev/null | cut -d' ' -f1 ||
+    shasum -a 256 "$1" | cut -d' ' -f1
+}
+identity="recipe=$(digest_of "$RECIPE") rev=$REV \
 block=$BLOCK_SIZE windows=$WINDOWS"
 if [[ -e $WORK/identity ]]; then
   if [[ $(cat "$WORK/identity") != "$identity" ]]; then
@@ -123,6 +127,37 @@ if [[ ${PHASE:-encode} == finalize ]]; then
   echo "=== finalized; upload the bases and promote (docs/MSRT-CAMPAIGN.md 4.5)"
   exit 0
 fi
+
+# WINDOWS decides what gets encoded. A range that quietly omits one recipe layer
+# would encode 75 of 76, retire the source those layers needed, and be discovered
+# by finalize after the fleet was paid for. It must cover every recipe layer
+# exactly once, and that is checked before a single byte is staged.
+python3 - "$RECIPE" "$WINDOWS" <<'PY' || exit 2
+import json, sys
+recipe = json.load(open(sys.argv[1]))
+want = list(recipe["moe_layers"])
+seen = []
+for part in sys.argv[2].split():
+    if "-" in part:
+        lo, hi = part.split("-", 1)
+        seen += list(range(int(lo), int(hi) + 1))
+    elif part.strip():
+        seen.append(int(part))
+problems = []
+missing = sorted(set(want) - set(seen))
+extra = sorted(set(seen) - set(want))
+repeated = sorted({layer for layer in seen if seen.count(layer) > 1})
+if missing:
+    problems.append("never encodes recipe layers %s" % missing)
+if extra:
+    problems.append("names layers the recipe does not have: %s" % extra)
+if repeated:
+    problems.append("encodes layers twice: %s" % repeated)
+if problems:
+    print("error: WINDOWS " + "; ".join(problems), file=sys.stderr)
+    raise SystemExit(2)
+print("windows cover all %d recipe layers exactly once" % len(want))
+PY
 
 read -r -a windows <<< "$WINDOWS"
 for index in "${!windows[@]}"; do
