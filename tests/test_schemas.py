@@ -23,6 +23,7 @@ jsonschema = pytest.importorskip("jsonschema")
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 import fq_fetch  # noqa: E402,F401  (imported for its emitted documents)
 import fq_release  # noqa: E402
+import fq_assemble_lora  # noqa: E402
 import fq_repack  # noqa: E402
 from test_fq_fetch import (REV, build_source, served, trust_root,  # noqa: E402,F401
                            write_policy)
@@ -172,6 +173,22 @@ def test_fruit_cartridge_recipe_matches_schema():
         Path(__file__).parent.parent / "recipes" / "fruit-k2-k3k4-cart.json"
     )
     check("fq-cartridge-1", json.loads(recipe.read_text()), label=recipe.name)
+
+
+def test_emitted_cartridge_adapter_config_matches_schema(tmp_path):
+    fq_assemble_lora.write_adapter_config(
+        tmp_path,
+        2,
+        "a" * 64,
+        [{"label": "res1", "k": 1, "experts": [0]}],
+        ["res1/model-layer-003.safetensors"],
+        12,
+    )
+    check(
+        "fq-cartridge-adapter-1",
+        json.loads((tmp_path / "adapter_config.json").read_text()),
+        label="adapter_config.json",
+    )
 
 
 # ----------------------------------------------- documents that must NOT pass

@@ -60,8 +60,9 @@ measured, what is implemented, and what is not.
   repository can and cannot do under fingerprint pinning.
 - **JSON Schemas** in [`schemas/`](schemas/) for `fq-segment/1` (segment
   metadata and index), `fq-attestation/1`, `fq-manifest/1`, `fq-policy/2`,
-  `fq-cartridge/1`, and `fq-release/1` — derived from real emitted artifacts
-  and re-validated against freshly emitted documents on every CI run.
+  `fq-cartridge/1`, `fq-cartridge-adapter/1`, and `fq-release/1` — derived
+  from real emitted artifacts and re-validated against freshly emitted
+  documents on every CI run.
 - **Packaging** — `pyproject.toml` with console entry points (`fq-repack`,
   `fq-assemble`, `fq-fetch`, `fq-prime`, `fq-verify`, `fq-release`,
   `fq-eps`), a hashed universal dev lock (`requirements-dev.txt`), and

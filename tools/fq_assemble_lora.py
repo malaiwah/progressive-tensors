@@ -40,10 +40,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import shutil
-import struct
 import sys
 import time
 from contextlib import contextmanager
@@ -56,7 +54,7 @@ except ModuleNotFoundError:  # Base installs must still support --help.
     torch = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from fq_assemble import (  # noqa: E402
+from fq_assemble import (
     AssemblyError,
     StagedOutput,
     check_out_dir,
@@ -64,7 +62,7 @@ from fq_assemble import (  # noqa: E402
     regenerate_shard_index,
     sha256_file,
 )
-from fq_repack import PROJ_ORDER  # noqa: E402
+from fq_repack import PROJ_ORDER
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -156,7 +154,7 @@ def bootstrap_encoder(encoder_source: str):
 
         memory = types.ModuleType("exllamav3.util.memory")
         memory.free_mem = lambda: None
-        memory.list_gpu_tensors = lambda: []
+        memory.list_gpu_tensors = list
         sys.modules["exllamav3.util.memory"] = memory
 
         util = types.ModuleType("exllamav3.util")

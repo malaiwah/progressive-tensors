@@ -35,7 +35,7 @@ hub = ["huggingface_hub>=0.23"]
 # the bare wheel and runs `--help` on all of them to keep that true.
 numeric = ["numpy>=1.24"]
 charts = ["numpy>=1.24", "matplotlib>=3.7"]
-quant = ["torch>=2.3", "safetensors>=0.4"]
+quant = ["torch>=2.3", "safetensors>=0.4", "numpy>=1.24"]
 
 [project.urls]
 Homepage = "https://github.com/malaiwah/progressive-tensors"

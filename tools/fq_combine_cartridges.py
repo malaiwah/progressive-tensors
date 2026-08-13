@@ -160,8 +160,9 @@ def combine(args) -> int:
                 if not source.is_file():
                     raise lora.CartridgeError(f"missing stage shard {relative}")
                 with safe_open(str(source), framework="pt") as handle:
+                    keys = list(handle.keys())
                     tensors = {
-                        key: handle.get_tensor(key) for key in handle
+                        key: handle.get_tensor(key) for key in keys
                     }
                 validate_stage_tensors(tensors, stage, str(source))
                 collisions = set(combined) & set(tensors)

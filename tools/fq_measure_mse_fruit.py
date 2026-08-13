@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
-import fq_assemble_lora as lora  # noqa: E402
-from fq_verify import decode_proj  # noqa: E402
+import fq_assemble_lora as lora
+from fq_verify import decode_proj
 
 EXL3_KEY_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
@@ -54,7 +54,8 @@ def load_siq_slots(path: Path, layer: int, expert: int, projection: str):
 
     ranks: dict[int, dict[str, Any]] = {}
     with safe_open(str(path), framework="pt") as source:
-        for key in source.keys():
+        keys = list(source.keys())
+        for key in keys:
             match = EXL3_KEY_RE.fullmatch(key)
             if not match:
                 continue

@@ -3,6 +3,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,3 +72,52 @@ def test_stage_config_rejects_path_traversal_and_base_mismatch(tmp_path: Path):
     write_config(path, stage, base_manifest_sha256="b" * 64)
     with pytest.raises(lora.CartridgeError, match="base checkpoint identity"):
         combine.load_stage_config(path, stage, (2, "a" * 64))
+
+
+def test_combiner_merges_validated_stage_shards(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    if lora.torch is None:
+        pytest.skip("fq_assemble_lora imported without torch")
+
+    stages = [
+        {"label": "res1", "k": 1, "experts": "all"},
+        {"label": "res2", "k": 1, "experts": [0]},
+    ]
+    recipe = tmp_path / "recipe.json"
+    recipe.write_text(json.dumps({
+        "schema": "fq-cartridge/1",
+        "base_k": 2,
+        "stages": stages,
+        "moe_layers": [3],
+    }))
+    root = tmp_path / "stages"
+    shard_name = "model-layer-003.safetensors"
+    for stage in stages:
+        directory = root / stage["label"]
+        tensors = {}
+        for key, shape in stage_tensors(stage["label"], stage["k"]).items():
+            tensors[key] = torch.zeros(shape.shape)
+            if ".trellis_" in key:
+                tensors[key] = tensors[key].to(torch.int16)
+        lora.save_safetensors(tensors, directory / shard_name)
+        lora.write_adapter_config(
+            directory,
+            2,
+            "a" * 64,
+            [stage],
+            [f"{stage['label']}/{shard_name}"],
+            len(tensors),
+        )
+
+    output = tmp_path / "combined"
+    assert combine.combine(SimpleNamespace(
+        recipe=recipe,
+        cartridges=root,
+        out=output,
+        force=False,
+    )) == 0
+    config = json.loads((output / "adapter_config.json").read_text())
+    assert config["stages"] == stages
+    assert config["num_tensors"] == 24
+    assert (output / shard_name).is_file()
