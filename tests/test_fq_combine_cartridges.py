@@ -117,7 +117,8 @@ def test_assembly_plan_rejects_path_traversal(campaign):
 def combine_args(root: Path, assembly: str, out: Path, **overrides):
     args = SimpleNamespace(root=root, assembly=assembly, out=out,
                            experts=None, layers=None, force=False,
-                           trust_key=None, insecure_unsigned=True)
+                           trust_key=None, insecure_unsigned=True,
+                           base=None)
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -250,6 +251,23 @@ def test_narrowed_adapter_states_per_layer_coverage(campaign, tmp_path: Path):
     assert config["selected_experts"] == [1]
     assert config["selected_layers"] == [3, 4]
     assert config["coverage"]["hot"] == {"3": [1], "4": [1]}
+
+
+def test_combiner_verifies_the_base_checkpoint_it_binds_to(
+    campaign, tmp_path: Path
+):
+    """A cartridge applied to the wrong base corrects other weights."""
+    key = signer_of(campaign)
+    good = campaign.root / "base" / "k2"
+    assert combine.combine(combine_args(
+        campaign.root, "k3like", tmp_path / "bound", base=good,
+        trust_key=key, insecure_unsigned=False)) == 0
+
+    wrong = campaign.root / "base" / "k3"
+    with pytest.raises(lora.CartridgeError, match="not the .* this cartridge"):
+        combine.combine(combine_args(
+            campaign.root, "k3like", tmp_path / "unbound", base=wrong,
+            trust_key=key, insecure_unsigned=False))
 
 
 def test_combiner_merges_every_stage_of_the_chain(campaign, tmp_path: Path):

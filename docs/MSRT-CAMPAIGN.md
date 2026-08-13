@@ -342,11 +342,16 @@ KEYID=$(python -c 'import json,sys;print(json.load(open(sys.argv[1]))["provenanc
   campaign_summary.json)
 
 fq-combine-cartridges --root $CAMPAIGN --assembly k2-k4like-direct \
-  --out ./k4like --trust-key $KEYID
+  --out ./k4like --trust-key $KEYID --base $CAMPAIGN/base/k2
 # hottest 96 experts only: 96 experts of residual, not 256
 fq-combine-cartridges --root $CAMPAIGN --assembly k2-k4like-direct \
   --out ./k4like-hot96 --experts 0-95 --trust-key $KEYID
 ```
+
+`--base` is optional but worth passing whenever the base checkpoint is local: it
+compares the base's `MANIFEST.sha256` with the digest the plan pins and checks
+that the chain's first stage names the base block bytes this checkpoint
+publishes. A cartridge applied to a different base corrects other weights.
 
 `--trust-key` is required (or an explicit `--insecure-unsigned`). With it, the
 combiner verifies the signed plan, requires the campaign identity in the plan to

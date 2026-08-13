@@ -194,7 +194,7 @@ def test_campaign_assembly_plan_and_adapter_match_their_schemas(
     out = tmp_path / "adapter"
     combine.combine(SimpleNamespace(
         root=campaign.root, assembly="hot-k4like", out=out, experts=None,
-        layers=None, force=False, insecure_unsigned=False,
+        layers=None, force=False, insecure_unsigned=False, base=None,
         trust_key=json.loads(
             (campaign.root / "campaign_summary.json").read_text()
         )["provenance"]["signer_pubkey"]))

@@ -422,6 +422,49 @@ def validate_stage_tensors(
                 f"{sorted(missing)[:3]}")
 
 
+def verify_base(base_dir: Path | None, plan: dict[str, Any], root: Path, *,
+                trust: str | None) -> None:
+    """Check the base checkpoint this cartridge is bound to, when it is here.
+
+    The plan pins the base by its ``MANIFEST.sha256`` digest, and the first
+    stage of the chain names the base block bytes it corrects. Neither is worth
+    anything unless somebody compares them with the checkpoint that will be
+    loaded, so this runs whenever ``--base`` is given.
+    """
+    if base_dir is None:
+        return
+    base_dir = base_dir.expanduser().resolve()
+    manifest = base_dir / "MANIFEST.sha256"
+    if not manifest.is_file():
+        raise lora.CartridgeError(f"--base {base_dir} has no MANIFEST.sha256")
+    actual = sha256_file(manifest)
+    if actual != plan["base"]["manifest_sha256"]:
+        raise lora.CartridgeError(
+            f"--base {base_dir} manifest {actual[:16]} is not the "
+            f"{plan['base']['manifest_sha256'][:16]} this cartridge was built "
+            f"against; loading it would apply residuals to other weights")
+    first = plan["chain"][0]["label"]
+    for entry in plan["stage_shards"]:
+        if entry["label"] != first:
+            continue
+        name = Path(entry["path"]).name
+        published = lora.read_digest(base_dir, name)
+        if published is None:
+            raise lora.CartridgeError(
+                f"--base {base_dir} has no committed digest for {name}")
+        if published != entry["parent_sha256"]:
+            raise lora.CartridgeError(
+                f"{entry['path']} corrects base bytes "
+                f"{entry['parent_sha256'][:16]}, but this base publishes "
+                f"{published[:16]} for {name}")
+        if trust is not None:
+            payload = lora.read_attestation(base_dir, name)
+            if payload.pop("_keyid") != trust:
+                raise lora.CartridgeError(
+                    f"{base_dir}/{name}: base fragment is not signed by the "
+                    f"pinned key")
+
+
 def combine(args) -> int:
     lora.require_quant_dependencies()
     root = args.root.expanduser().resolve()
@@ -433,6 +476,7 @@ def combine(args) -> int:
             "pass --trust-key <64-hex public key> to check the campaign's "
             "signatures, or --insecure-unsigned to combine unverified bytes")
     plan, plan_path = load_assembly(root, args.assembly, trust=trust)
+    verify_base(args.base, plan, root, trust=trust)
     out = check_out_dir(args.out, source=root, policy=plan_path)
     wanted_experts = parse_ids(args.experts)
     wanted_layers = parse_ids(args.layers)
@@ -575,6 +619,10 @@ def main(argv=None) -> int:
     parser.add_argument("--experts",
                         help="Restrict to these expert ids, e.g. 0-95,200")
     parser.add_argument("--layers", help="Restrict to these layers, e.g. 3-40")
+    parser.add_argument("--base", type=Path,
+                        help="Base checkpoint directory to verify this "
+                             "cartridge against (manifest digest and the first "
+                             "chain edge)")
     parser.add_argument("--trust-key",
                         help="Pinned ed25519 public key (hex or file) that must "
                              "have signed the plan and every fragment")
