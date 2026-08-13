@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from contextlib import contextmanager
@@ -458,6 +459,106 @@ def test_campaign_directory_refuses_a_different_graph_or_source(tmp_path: Path):
                         out, recipe_path=recipe, source=source, force=force,
                         **kwargs)
 
+
+
+
+def test_plan_names_the_shards_no_layer_window_would_stage(
+    tmp_path: Path, capsys
+):
+    """Staging from `layers` alone misses whole-model tensors.
+
+    Embeddings, `lm_head` and the dense layers live in shards that hold no
+    routed expert, so they appear in no layer's shard list. An operator who
+    staged strictly from the per-layer plan would only find out when `finalize`
+    refused to publish a base, a whole campaign later.
+    """
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 5, "n_routed_experts": 2,
+        "hidden_size": 8, "moe_intermediate_size": 8,
+    }))
+    weight_map, generator = {}, torch.Generator().manual_seed(3)
+    for index, layer in enumerate((3, 4), start=1):
+        shard = f"model-{index:05d}-of-00003.safetensors"
+        tensors = {}
+        for expert in range(2):
+            for projection in lora.PROJECTIONS:
+                key = expert_key(layer, expert, projection)
+                tensors[key] = torch.randn(
+                    8, 8, generator=generator).to(torch.bfloat16)
+        save_file(tensors, str(source / shard))
+        weight_map.update({key: shard for key in tensors})
+    orphan = "model-00003-of-00003.safetensors"
+    whole_model = {
+        "model.embed_tokens.weight": torch.ones(4, 8, dtype=torch.bfloat16),
+        "lm_head.weight": torch.ones(4, 8, dtype=torch.bfloat16),
+    }
+    save_file(whole_model, str(source / orphan))
+    weight_map.update({key: orphan for key in whole_model})
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}))
+
+    recipe = write_recipe(tmp_path / "r.json", **DAG_RECIPE)
+    assert lora.cmd_plan(SimpleNamespace(
+        source=source, recipe=recipe, layers=None, block_size=2,
+        out_plan=None)) == 0
+    plan = json.loads(capsys.readouterr().out)
+
+    assert orphan in plan["skeleton_only_shards"]
+    staged = set(plan["skeleton_only_shards"])
+    for entry in plan["layers"]:
+        staged |= set(entry["shards"])
+    # Every shard the skeleton pass needs is reachable from one plan.
+    with lora.SourceCheckpoint(source) as opened:
+        needed = set(lora.skeleton_keys(opened, [3, 4]))
+    assert not needed - staged, f"skeleton needs unstaged shards: {needed - staged}"
+
+
+
+def test_one_campaign_directory_takes_one_launcher(tmp_path: Path):
+    """Per-block claims cannot police two launchers; the campaign lock does.
+
+    A launcher clears leftover block claims before forking, which is only safe
+    if no other launcher can be alive. Without an exclusive campaign claim, a
+    second launcher would delete the first one's live claims and both fleets
+    would quantize the same blocks -- and the first to finish a block would then
+    unlink the second's replacement claim.
+    """
+    out = tmp_path / "campaign"
+    with lora.campaign_lock(out, what="encode") as held:
+        assert held is True
+        with pytest.raises(lora.CartridgeError, match="takes one encode"):
+            with lora.campaign_lock(out, what="encode"):
+                pass
+        # A worker spawned by the holder must not deadlock against its parent.
+        os.environ[lora.CAMPAIGN_LOCK_ENV] = "1"
+        try:
+            with lora.campaign_lock(out, what="encode") as inherited:
+                assert inherited is False
+        finally:
+            del os.environ[lora.CAMPAIGN_LOCK_ENV]
+    # The kernel drops the flock when the holder exits, so a crashed campaign
+    # never needs a manual unlock.
+    with lora.campaign_lock(out, what="finalize") as after:
+        assert after is True
+
+
+def test_a_live_block_claim_is_never_cleared_by_another_launcher(tmp_path: Path):
+    """Finalize and encode must not run against each other either."""
+    out = tmp_path / "campaign"
+    with lora.block_claim(out, 3, 0) as owned:
+        assert owned is True
+        with lora.block_claim(out, 3, 0) as again:
+            assert again is False
+        with lora.campaign_lock(out, what="encode"):
+            with pytest.raises(lora.CartridgeError, match="takes one finalize"):
+                with lora.campaign_lock(out, what="finalize"):
+                    pass
+    assert not sorted((out / "locks").glob("*.lock"))
 
 # ── End to end, on CPU, with a stand-in quantizer ─────────────────────────
 

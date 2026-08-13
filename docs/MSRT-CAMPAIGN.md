@@ -58,10 +58,13 @@ than fetching the wider residual, on all 88 blocks of the Fruit rehearsal
 | `k2+k2r1+k2r1r1` vs `k2+k2r2` (4 bpw) | **1.0901x** worse, sigma 0.00017, 88/88 | **1.0902x** worse, sigma 0.00022, 84/84 |
 | `k3+k3r1+k3r1r1` vs `k3+k3r2` (5 bpw) | **1.0679x** worse, sigma 0.00053, 88/88 | **1.0684x** worse, sigma 0.00044, 84/84 |
 
-The GLM-5.2 column sweeps layers 3, 10, 19, 30, 40, 50, 60 and 70, six experts
-each, all three projections: **168 of 168 comparisons favour the wider residual**,
-and the three projections agree to four decimal places (1.07927 / 1.07937 /
-1.07935 mean over both families). The proxy and the real weights agree to three
+The GLM-5.2 column sweeps **28 (layer, expert) pairs x 3 projections = 84
+matrices per family**, requested as layers 3, 10, 19, 30, 40, 50, 60, 70 x
+experts 0, 1, 9, 73, 100, 128 and reduced to the pairs whose source shards are
+staged locally — four experts each in layers 10, 30, 40, 50, 60, 70 and two each
+in layers 3 and 19. **168 of 168 comparisons favour the wider residual**, and the
+three projections agree to four decimal places (mean 1.07927 gate, 1.07937 up,
+1.07935 down, over both families). The proxy and the real weights agree to three
 decimals. This is a property of greedy residual trellis coding, not of a model or
 a layer. The upgrade path is the only thing the extra passes buy, and it buys it
 at 9.0%/6.8% higher error. For reference, the wider residual alone improves on
@@ -87,9 +90,12 @@ block each, back to back (§2):
 | Logical WAN | 2.876 TB | **2.691 TB** |
 | Throughput needed to hide I/O | 273 Mbps | 360 Mbps |
 
-**Recommendation: rent for the lean recipe.** Measured, it saves **54.3 GPU-hours
-and $58 of compute**, 7.2 h of fleet wall time and 186 GB of storage, and every
-product it ships is better than the one it drops. Choose the full graph only if a
+**Recommendation: rent for the lean recipe.** It saves **54.3 GPU-hours**
+(measured: the difference between two blocks on this card, scaled to 58,368
+matrices), which is **[DERIVED] $53.77** at $0.99/GPU-h on a card as fast as this
+one and **$57–$60** at the projected parity-card range, plus 6.8 h of 8-GPU
+compute wall and 183 GB of storage. Every product it ships is better than the one
+it drops. Choose the full graph only if a
 +1-bit upgrade for an already installed 3 bpw or 4 bpw base is worth $58 and 9%
 more error on the two upgraded tiers. The rest of this runbook prices **both**:
 `$RECIPE` selects which.
@@ -179,14 +185,44 @@ Because the lean campaign shrinks compute by 29% but bytes by only 6%, it is the
 more I/O-bound of the two: hiding transfer under compute needs **360 Mbps**
 (`lean`) versus **273 Mbps** (`dag`).
 
-Budget for the recommended `lean` graph: **$155 planning centre, $200
-authorization cap** — engineering contingencies, not statistical bounds. Compute
-$118–$164; 1.6 TB for two days ~$10.67; gates ~$2 (one block $0.22, one 8-GPU
-layer 1.74 GPU-h/$1.73); CPU-side finalize and upload tails $3–$10. The cap
-additionally covers one full 8-layer-window redo (13.96 GPU-h, $13.82). A
-routine spot preemption with persistent storage loses at most the in-flight block
-per GPU: 1.74 GPU-h / $1.73 for all eight, not a window. For the `dag` graph add
-$54 of compute: **$210 centre, $270 cap**.
+Budget for the recommended `lean` graph: **$160 planning centre, $200
+authorization cap** — engineering contingencies, not statistical bounds.
+
+| Item | Cost |
+|---|---:|
+| Compute, roofline centre (fast card $118, slow card $164) | $139 |
+| Eight GPUs idle through the first stage and finalize (§2.1) | $12 |
+| 1.6 TB persistent storage, ~19 h of fleet plus tails | $5–$11 |
+| Gates: one block $0.22, one 8-GPU layer $1.73 | $2 |
+| CPU VM for finalize and the 3.4 h final drain | $1–$3 |
+| **Planning centre** | **$160** |
+| Contingency: one 8-layer-window redo (13.96 GPU-h) | $14 |
+| **Authorization cap** | **$200** |
+
+A routine spot preemption with persistent storage loses at most the in-flight
+block per GPU: 1.74 GPU-h / $1.73 for all eight, not a window. Forgetting the §4.5
+release gate costs $27 and is the single largest avoidable line item. For the
+`dag` graph add $54–$60 of compute: **$215 centre, $270 cap**.
+
+### 2.1 Fleet size
+
+Compute hours are fixed; what a larger fleet buys is wall time, and what it costs
+is idle GPU during the serial tails. With `lean` at the roofline centre
+(140.8 GPU-h), a 1.133 h first-window stage and a 0.351 h finalize during which
+GPUs do nothing, total cost as a function of fleet size `n` is
+`140.8 x 0.99 + n x 0.99 x 1.484 + 0.2223 x elapsed`:
+
+| GPUs | Compute wall | Elapsed | Total |
+|---:|---:|---:|---:|
+| 1 | 140.8 h | 142.3 h | $168.50 |
+| 2 | 70.4 h | 71.9 h | $154.68 |
+| 4 | 35.2 h | 36.7 h | **$149.98** |
+| 8 | 17.6 h | 19.1 h | $152.03 |
+
+**Eight GPUs costs $2.05 more than the four-GPU optimum and finishes 17.6 h
+sooner**, so take eight — but only with the release gate in §4.5. Leaving eight
+GPUs attached through finalize and the 3.4 h final upload adds $27, which is more
+than ten times the entire benefit of the fleet-size choice.
 
 Resolve the card range with the §4.0 probe. One block gives the committed rate;
 one complete layer across all eight GPUs gives the fleet rate under real storage
@@ -204,10 +240,32 @@ geometry, not shard locality, eight-process I/O, or sustained clocks over a day.
 | K2 stages, 184.6 GB each | 2 = 369.2 GB | 2 = 369.2 GB |
 | suh/svh metadata | 8.6 GB (9 nodes) | 6.7 GB (7 nodes) |
 | skeleton (everything not a routed expert) | 37.8 GB | 37.8 GB |
-| **campaign on disk** | **1.332 TB** | **1.146 TB** |
-| upload (the second base re-ships the skeleton) | 1.370 TB | 1.184 TB |
-| source download | 1.507 TB | 1.507 TB |
-| **total WAN** | **2.876 TB** | **2.691 TB** |
+| **campaign on disk** | **1.330 TB** | **1.147 TB** |
+| upload: stages, per window | 833.2 GB | 647.6 GB |
+| upload: both bases incl. their skeleton copy, after finalize | 536.6 GB | 536.6 GB |
+| source download, unique bytes | 1.5067 TB | 1.5067 TB |
+| **total WAN** | **2.877 TB** | **2.691 TB** |
+| same, if windows are re-downloaded naively | 2.984 TB | 2.798 TB |
+
+**Measured from the pinned index and the hub's own tree listing** (revision
+`b4734de4`, 282 shards, 1.506667 TB): the ten 8-layer windows are **198.6, 166.2,
+160.7, 166.2, 171.6, 166.2, 160.8, 166.2, 166.2, 85.8 GB**, not a uniform 150 GB,
+and **20 shards straddle a window boundary**. Deleting a window wholesale and
+re-fetching those 20 costs **+107.2 GB of WAN**; keeping a shard until its last
+consuming window costs **+5.3 GB of peak disk**. Keep them.
+
+Peak local bytes, window by window (campaign output so far plus resident source,
+with last-use retention):
+
+| | at first stage | peak | when |
+|---|---:|---:|---|
+| `lean` | 241.7 GB | **1.266 TB** | after encoding layers 67–74 |
+| `dag` | 241.7 GB | **1.439 TB** | after encoding layers 67–74 |
+
+**A 1.6 TB volume runs either graph** — 334 GB of headroom for `lean`, 161 GB for
+`dag` — provided the source is staged as real files (§4.1) and windows are
+deleted as they retire. `finalize` needs the whole campaign local, which is the
+peak above, not an extra copy.
 
 Per layer, `dag` emits 17.0 GB in 72 block files (9 nodes x 8 blocks of 32
 experts) and `lean` 14.6 GB in 56; the campaigns are 5,472 and 4,256 block files
@@ -283,24 +341,56 @@ combiner's component check rather than by the encoder.
 Set once:
 
 ```bash
-REPO_ID=zai-org/GLM-5.2
-REV=<40-hex-commit>                # the revision every attestation pins
-SRC=~/.cache/huggingface/hub/models--zai-org--GLM-5.2/snapshots/$REV
-CAMPAIGN=/data/glm52-msrt          # 1.6 TB volume for lean, 2 TB for dag
-KEY=~/.fq_keys/glm52-campaign.key  # NEVER inside $CAMPAIGN or $SRC
-REPO=~/progressive-tensors        # this checkout
-RECIPE=$REPO/recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
-ENC=/opt/exllamav3-python/exllamav3
+export REPO_ID=zai-org/GLM-5.2
+export REV=b4734de4facf877f85769a911abafc5283eab3d9   # pin; every attestation names it
+[[ $REV =~ ^[0-9a-f]{40}$ ]] || { echo "REV must be a 40-hex commit"; return 1; }
+export SRC=/data/glm52-src          # real files on the volume, NOT the HF cache
+export CAMPAIGN=/data/glm52-msrt    # same 1.6 TB volume
+export KEY=/data/keys/glm52-campaign.key   # on the volume, NEVER inside $CAMPAIGN or $SRC
+export REPO=/data/progressive-tensors      # the checkout, ON the volume
+export RECIPE=$REPO/recipes/glm52-k2k3-lean.json   # §1.1: the recommended menu
+export ENC=/opt/exllamav3-python/exllamav3
+export HF_XET_CACHE=/data/xet-cache        # keep the chunk cache off the root disk
+
+# metadata first: every later command resolves layers through the index
+hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
+  --include config.json --include model.safetensors.index.json \
+  --include 'tokenizer*' --include '*.py' --include '*.md'
 ```
 
-Every download must pass `--revision "$REV"`. Without it `hf download` populates
-the `main` snapshot instead of `$SRC`, which either leaves the pinned source
-incomplete or silently stages a different revision.
+Everything is `export`ed because the staging and cleanup snippets below run
+Python from a heredoc and read these names from the environment.
 
-`--base-model` and `--base-revision` are inferred from a Hugging Face snapshot
-path like the one above. Any other layout must state them explicitly; the
-revision must be an immutable 40-hex commit, because that is what every
-attestation pins.
+**Stage with `--local-dir`, never into the HF cache.** A cache download writes
+payload into `<cache>/blobs/<sha>` and puts a *symlink* in `snapshots/<rev>/`;
+deleting the snapshot entry frees 76 bytes, not 5 GB, so rolling windows would
+accumulate the entire 1.5067 TB source and blow through the volume. `--local-dir`
+writes real files that `rm` actually reclaims.
+
+Every download must pass `--revision "$REV"`. Without it `hf download` resolves
+`main`, which either stages a different revision or leaves the pinned one
+incomplete.
+
+Because `$SRC` is not a Hugging Face snapshot path, identity cannot be inferred
+from it: **every `skeleton`, `encode` and `finalize` invocation must pass
+`--base-model "$REPO_ID" --base-revision "$REV"`**, and the revision must be an
+immutable 40-hex commit, because that is what every attestation pins. Define the
+argument arrays once and reuse them so no invocation can drift:
+
+```bash
+IDENTITY=(--base-model "$REPO_ID" --base-revision "$REV")
+COMMON=(--source "$SRC" --recipe "$RECIPE" --out "$CAMPAIGN" --block-size 32)
+```
+
+`$KEY` and `$REPO` live on the **volume**, not in the GPU instance's home
+directory: §4.5 requires terminating the GPU instances and reattaching the volume
+to a CPU VM, and `finalize` needs both the key and the tool after that handoff.
+
+**`tools/msrt_campaign.sh` is this whole procedure as one checked driver** —
+staging, skeleton, encode, last-use retirement, finalize, in order, with the
+identity flags and the window arithmetic already right. Run `DRY_RUN=1` first to
+print the exact command sequence. The sections below explain what each step does
+and what it costs; the driver is what you should actually run.
 
 ### 4.0 Gates before the fleet
 
@@ -315,24 +405,50 @@ attestation pins.
    MSE it attested — encode, finalize, combine under a pinned key, then decode
    the combined adapter against the source weights.
 3. `fq-assemble-lora plan --source $SRC --recipe $RECIPE` — confirms layout,
-   block count and which source shards are absent.
-4. One block on one GPU (below). Compare the **committed** rate — the encoder
-   prints both `s/matrix` committed and the quantizing part of it — with §2.
-   Record the SKU, power limit and sustained clocks while it runs.
-5. One complete layer across all eight GPUs, timed with external wall clock:
-   1.74 GPU-h / ~$1.73 for `lean` (2.46 GPU-h / $2.43 for `dag`). This is the
-   only sample that includes eight-process I/O on one volume and multi-GPU
-   contention, and it is what the campaign figure is extrapolated from.
-6. Measure throughput to the hub (`hf download` one 5 GB shard): need
+   block count, which source shards are absent, and the `skeleton_only_shards`
+   that no layer window would stage. This needs the metadata download from the
+   "Set once" block above; on a fresh rental `$SRC` does not exist yet and the
+   command correctly refuses a directory with no `config.json`.
+4. One block on one GPU, then one complete layer on all eight, in a **throwaway
+   campaign directory** (below). The single block gives the committed rate — the
+   encoder prints both `s/matrix` committed and the quantizing part — to compare
+   with §2. Record the SKU, power limit and sustained clocks while it runs. The
+   eight-GPU layer costs 1.74 GPU-h / ~$1.73 for `lean` (2.46 GPU-h / $2.43 for
+   `dag`) and is the only sample that includes eight-process I/O on one volume
+   and multi-GPU contention; it is what the campaign figure is extrapolated from.
+5. Measure throughput to the hub (`hf download` one 5 GB shard): need
    ≥400 Mbps for `lean`, ≥350 Mbps for `dag` (§3).
-7. Run finalize on the rehearsal campaign twice. It must succeed both times:
+6. Run finalize on the rehearsal campaign twice. It must succeed both times:
    finalize re-reads the whole campaign, so on the real one it is a
    minutes-to-hours pass that has to be resumable after a preemption.
 
 ```bash
-fq-assemble-lora encode --source $SRC --recipe $RECIPE --out $CAMPAIGN \
-  --encoder-source $ENC --sign-key $KEY --block-size 32 \
+# a gate campaign, thrown away afterwards: never time a block into $CAMPAIGN,
+# because a completed block would be skipped by the timed full-layer run
+export GATE=/data/glm52-gate
+GATE_COMMON=(--source "$SRC" --recipe "$RECIPE" --out "$GATE" --block-size 32)
+
+# stage layer 40's payload (the metadata is already there from "Set once")
+fq-assemble-lora plan "${GATE_COMMON[@]}" --layers 40 --out-plan gate.json
+hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
+  $(python3 -c 'import json;print(" ".join(f"--include {s}" for L in json.load(open("gate.json"))["layers"] for s in L["shards"]))')
+
+# skeleton mints and binds the signing key; encode with --shard-count > 1 will
+# not create one, so this must come first even for a gate
+fq-assemble-lora skeleton "${GATE_COMMON[@]}" "${IDENTITY[@]}" --sign-key "$KEY"
+
+# gate 4a: one block, one GPU
+fq-assemble-lora encode "${GATE_COMMON[@]}" "${IDENTITY[@]}" \
+  --encoder-source "$ENC" --sign-key "$KEY" \
   --layers 40 --shard-index 4 --shard-count 8 --device cuda:0
+
+# gate 4b: the same layer across all eight GPUs, timed externally. --force
+# re-encodes the block 4a already finished, so the wall clock covers a full layer
+time fq-assemble-lora encode "${GATE_COMMON[@]}" "${IDENTITY[@]}" \
+  --encoder-source "$ENC" --sign-key "$KEY" --layers 40 --force \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7
+
+rm -rf "$GATE"          # the real campaign must start from an empty --out
 ```
 
 ### 4.1 Stage source bytes per window
@@ -340,40 +456,48 @@ fq-assemble-lora encode --source $SRC --recipe $RECIPE --out $CAMPAIGN \
 `plan` reports the exact shard files each layer needs:
 
 ```bash
-fq-assemble-lora plan --source $SRC --recipe $RECIPE \
-  --layers 3-10 --block-size 32 --out-plan window.json
-python - <<'PY'
-import json
-plan = json.load(open("window.json"))
+fq-assemble-lora plan "${COMMON[@]}" --layers 3-10 \
+  --out-plan "$CAMPAIGN/plans/3-10.json"
+WINDOW_PLAN=$CAMPAIGN/plans/3-10.json python3 - <<'PY'
+import json, os
+plan = json.load(open(os.environ["WINDOW_PLAN"]))
 shards = sorted({s for L in plan["layers"] for s in L["shards"]})
 print(" ".join(f"--include {s}" for s in shards))
 PY
 ```
 
-Stage exactly those, and nothing else:
+Stage exactly those, plus the shards that belong to no layer at all:
 
 ```bash
-# from $REPO at the pinned revision, into the same snapshot tree $SRC points at
-hf download "$REPO_ID" --revision "$REV" \
-  --include config.json --include model.safetensors.index.json \
-  $(python - <<'PY'
-import json
-plan = json.load(open("window.json"))
-for shard in sorted({s for L in plan["layers"] for s in L["shards"]}):
+hf download "$REPO_ID" --revision "$REV" --local-dir "$SRC" \
+  $(WINDOW_PLAN=$CAMPAIGN/plans/3-10.json python3 - <<'PY'
+import json, os
+plan = json.load(open(os.environ["WINDOW_PLAN"]))
+want = {s for L in plan["layers"] for s in L["shards"]}
+want |= set(plan["skeleton_only_shards"])      # embeddings, lm_head, dense layers
+for shard in sorted(want):
     print(f"--include {shard}", end=" ")
 PY
 )
 ```
 
-A GLM MoE layer spans ~4 shards (~21.4 GB); an 8-layer window is ~150 GB. Stage
-the first window *before* starting the GPUs.
+`skeleton_only_shards` is why that second line exists: for GLM-5.2 one shard
+(`model-00001-of-00282`, 5.3 GB) holds only non-expert tensors, so it appears in
+**no** layer's shard list. Staging strictly per layer leaves it absent, `skeleton`
+counts it as absent and returns 0, and `finalize` refuses to publish a base —
+after the whole campaign. `plan` emits the field for every window; staging it once
+is enough.
+
+**Measured window sizes** (§3): 198.6, 166.2, 160.7, 166.2, 171.6, 166.2, 160.8,
+166.2, 166.2, 85.8 GB for the ten 8-layer windows, first window plus the
+skeleton-only shard = 203.9 GB. Stage the first window *before* starting the GPUs.
 
 `$SRC` must keep `config.json` and `model.safetensors.index.json` for the whole
 campaign: every later command resolves layers and experts through the index, and
-`finalize` needs nothing else from the source (verified: finalize completes with
-every payload shard deleted). This holds for an **indexed** checkpoint, which
-`zai-org/GLM-5.2` is; a source without an index would have to open shards, so
-keep the payload until finalize if you ever run one.
+`finalize` needs nothing else from the source — **verified** by running finalize
+against a source directory holding only those two files. That holds for an
+**indexed** checkpoint, which `zai-org/GLM-5.2` is; a source without an index
+would have to open shards, so keep its payload until finalize.
 
 Optional but recommended: fetch the hub's own LFS digests once and pass them as
 `--source-digests`, so the skeleton pass never re-hashes source payloads to
@@ -387,8 +511,8 @@ curl -s "https://huggingface.co/api/models/$REPO_ID/tree/$REV?recursive=1" \
 ### 4.2 Skeleton (once per window)
 
 ```bash
-fq-assemble-lora skeleton --source $SRC --recipe $RECIPE --out $CAMPAIGN \
-  --sign-key $KEY --block-size 32 --source-digests source-tree.json
+fq-assemble-lora skeleton "${COMMON[@]}" "${IDENTITY[@]}" \
+  --sign-key "$KEY" --source-digests source-tree.json
 ```
 
 Copies non-expert tensors out of whatever shards are present and reports how
@@ -403,9 +527,9 @@ in `$CAMPAIGN/source-digests.json` so windows never repeat the work.
 ### 4.3 Encode
 
 ```bash
-fq-assemble-lora encode --source $SRC --recipe $RECIPE --out $CAMPAIGN \
-  --encoder-source $ENC --sign-key $KEY --block-size 32 \
-  --layers 3-10 --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7
+fq-assemble-lora encode "${COMMON[@]}" "${IDENTITY[@]}" \
+  --encoder-source "$ENC" --sign-key "$KEY" --layers 3-10 \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7
 ```
 
 `--devices` runs one single-device worker per GPU over disjoint
@@ -447,39 +571,68 @@ soon as it finishes — but a **base tier is not loadable until `finalize` links
 the skeleton into it**, so per-window uploads are staging only (use a private
 branch or a staging prefix), and the authoritative upload happens after §4.6.
 
+`tools/msrt_campaign.sh` performs the staging, encoding and retirement loop,
+including the last-use retention that keeps the 20 straddling shards (§3) — set
+`UPLOAD_HOOK` to a script taking the window range if you want per-window uploads
+inside it. Publication itself is deliberately manual, because it decides what the
+world sees:
+
 ```bash
-# per window: stage what is final, then delete that window's SOURCE payload
+export DEST=malaiwah/GLM-5.2-MSRT           # the destination repo
+export STAGING=refs/heads/staging           # never publish onto main directly
+
+# per window, while the GPUs work on the next one: stages only. A base is not
+# loadable until finalize links the skeleton into it, so bases wait.
 for path in "$CAMPAIGN"/stages/*; do
-  hf upload <repo> "$path" "stages/$(basename "$path")"   # + digests, attestations
+  hf upload "$DEST" "$path" "stages/$(basename "$path")" \
+    --revision "$STAGING" --commit-message "stages $(basename "$path")"
 done
 
-# reclaim the window's source bytes; NEVER touch config.json or the index
-python - <<'PY' | xargs -r rm -f --
-import json, os
-plan = json.load(open("window.json"))
-src = os.environ["SRC"]
-for shard in sorted({s for L in plan["layers"] for s in L["shards"]}):
-    print(os.path.join(src, shard))
-PY
+# ---- release the GPU fleet here (see below) ----
 
-# after finalize: publish the complete base trees, including the skeleton
+# after finalize, from the CPU VM: the complete base trees, with the skeleton
 # hardlinks, metadata, digests and attestations that make them loadable
 for label in k2 k3; do
-  hf upload <repo> "$CAMPAIGN/base/$label" "base/$label"
+  hf upload "$DEST" "$CAMPAIGN/base/$label" "base/$label" --revision "$STAGING"
 done
-hf upload <repo> "$CAMPAIGN/assemblies" assemblies      # signed plans
-hf upload <repo> "$CAMPAIGN/campaign_summary.json" campaign_summary.json
+hf upload "$DEST" "$CAMPAIGN/assemblies" assemblies --revision "$STAGING"
+hf upload "$DEST" "$CAMPAIGN/campaign_summary.json" campaign_summary.json \
+  --revision "$STAGING"
+
+# promote once, when every fragment is up: one ref move, not eleven commits
+hf repo branch merge "$DEST" "$STAGING" main   # or open a PR and merge it
 ```
 
+Publishing onto a staging ref and promoting once is what keeps a consumer from
+fetching a half-published family: until the ref moves, `main` has nothing new.
 Xet deduplication means the second base's identical skeleton content should cost
-almost no extra WAN. Upload from a CPU process while the GPUs work, and pause the
-fleet before the final drain.
+almost no extra WAN. Upload from a CPU process, never from a GPU node.
+
+**Release the GPUs before the final drain — this is a hard gate, not advice.**
+Only the stage trees can be uploaded per window (647.6 GB of the 1.184 TB for
+`lean`). Both bases, including the skeleton copy that makes them loadable, are
+written by `finalize` and can only be uploaded after it: **536.6 GB, 3.4 h at 350
+Mbps**. `finalize` itself needs no GPU (§4.6). Eight GPUs left running through
+finalize and that drain cost **[DERIVED] $27** for nothing, which is 17% of the
+whole campaign budget. The volume must therefore be **persistent and detachable**:
+terminate the GPU instances, then attach the volume to a CPU VM (or keep the
+cheapest single instance) for finalize and the drain. That handoff only works if
+everything finalize needs already lives on the volume, which is why `$KEY`,
+`$REPO` and `$SRC`'s metadata are all under `/data` in "Set once". Check before
+releasing anything:
+
+```bash
+for path in "$KEY" "$REPO/tools/fq_assemble_lora.py" \
+            "$SRC/model.safetensors.index.json" "$SRC/config.json"; do
+  [[ -e $path ]] || { echo "NOT on the volume: $path"; exit 1; }
+done
+findmnt -no TARGET --target "$CAMPAIGN"    # must be the persistent volume
+```
 
 ### 4.6 Finalize once, at the end
 
 ```bash
-fq-assemble-lora finalize --source $SRC --recipe $RECIPE --out $CAMPAIGN \
-  --sign-key $KEY --block-size 32
+fq-assemble-lora finalize "${COMMON[@]}" "${IDENTITY[@]}" --sign-key "$KEY"
 ```
 
 Needs only `config.json` and the source index — deleted source payloads do not

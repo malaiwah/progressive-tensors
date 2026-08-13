@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fcntl
 import hashlib
 import json
 import math
@@ -1488,11 +1489,16 @@ def shard_is_complete(
 def prepare_out_dir(
     out: Path, *, recipe_path: Path, recipe_sha: str, source: SourceCheckpoint,
     base_model: str, base_revision: str, block_size: int, force: bool,
+    signer: str | None = None,
 ) -> Path:
     """Create or re-attach to a campaign output directory.
 
-    The sentinel binds the recipe, the block layout and the *immutable source
-    revision*. It deliberately does not bind which source shards are on this
+    The sentinel binds the recipe, the block layout, the *immutable source
+    revision* and the signer, because `finalize` refuses to publish a campaign
+    whose fragments carry more than one signing identity. Catching a wrong
+    `--sign-key` here costs a second; catching it at finalize costs whatever the
+    fleet encoded in the meantime, which a rehearsal already demonstrated as 82
+    GPU-minutes. It deliberately does not bind which source shards are on this
     disk: the campaign stages bytes in windows and deletes them, so a
     presence-sensitive identity would reject its own next window.
 
@@ -1510,6 +1516,8 @@ def prepare_out_dir(
         "base_revision": base_revision,
         "block_size": block_size,
     }
+    if signer is not None:
+        expected["signer_pubkey"] = signer
     if marker.is_file():
         try:
             found = json.loads(marker.read_text())
@@ -1524,8 +1532,9 @@ def prepare_out_dir(
             # and both would end up in the regenerated index.
             raise CartridgeError(
                 f"{marker} does not match this run: {drift}. This campaign "
-                f"directory belongs to a different recipe, source revision or "
-                f"block layout: encode into a fresh --out.")
+                f"directory belongs to a different recipe, source revision, "
+                f"block layout or signer: encode into a fresh --out, or pass "
+                f"the key this campaign already published under.")
         if not drift:
             # Nothing to record: leave the marker alone so parallel workers
             # never race each other rewriting the same path.
@@ -1538,6 +1547,38 @@ def prepare_out_dir(
     tmp.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, marker)
     return resolved
+
+
+def bind_encoder_identity(out: Path, encoder_sha: str) -> None:
+    """Record, or enforce, the one encoder build this campaign publishes.
+
+    `finalize` refuses a campaign whose fragments name more than one encoder
+    build, because the published determinism scope would be a lie. Enforcing it
+    at the first block of a resumed run turns "rebuilt exllamav3, lost the
+    campaign at finalize" into a message before any GPU work.
+
+    Workers race here harmlessly: they bootstrap the same `--encoder-source`, so
+    they write the same value, and the write is atomic.
+    """
+    marker = out / SENTINEL
+    try:
+        found = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CartridgeError(f"{marker}: unreadable ({exc})") from exc
+    recorded = found.get("encoder_sha256")
+    if recorded == encoder_sha:
+        return
+    if recorded is not None:
+        raise CartridgeError(
+            f"{marker} was encoded by {recorded[:16]} but this build is "
+            f"{encoder_sha[:16]}. One campaign publishes one encoder build: "
+            f"finalize would reject the mixture after the fleet had paid for "
+            f"it. Use the original build, or encode into a fresh --out.")
+    found["encoder_sha256"] = encoder_sha
+    found["updated_utc"] = now_utc()
+    tmp = marker.with_name(f".{SENTINEL}.{os.getpid()}.enc.tmp")
+    tmp.write_text(json.dumps(found, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, marker)
 
 
 # ── Tensor Naming ─────────────────────────────────────────────────────────
@@ -1660,12 +1701,17 @@ def cmd_skeleton(args) -> int:
     require_quant_dependencies()
     recipe = load_recipe(args.recipe)
     recipe_sha = sha256_file(args.recipe)
-    with SourceCheckpoint(args.source) as source:
+    with SourceCheckpoint(args.source) as source, \
+            campaign_lock(Path(args.out).expanduser().resolve(),
+                          what="skeleton"):
         base_model, base_revision = resolve_identity(args, source)
+        signer = load_signer(args.sign_key, create=True,
+                             outside=(Path(args.out).expanduser().resolve(),
+                                      source.root))
         out = prepare_out_dir(
             args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
             source=source, base_model=base_model,
-            base_revision=base_revision,
+            base_revision=base_revision, signer=signer.pub_hex,
             block_size=args.block_size, force=args.force)
         signer = load_signer(args.sign_key, create=True,
                              outside=(out, source.root))
@@ -1779,6 +1825,46 @@ def block_claim(out: Path, layer: int, block: int):
         yield True
     finally:
         path.unlink(missing_ok=True)
+
+
+CAMPAIGN_LOCK = ".fq-campaign.lock"
+CAMPAIGN_LOCK_ENV = "FQ_CAMPAIGN_LOCK_HELD"
+
+
+@contextmanager
+def campaign_lock(out: Path, *, what: str):
+    """Exclusive campaign-wide claim, for the lifetime of this process.
+
+    Per-block claims coordinate workers *inside* one launcher. They cannot
+    coordinate two launchers, because a launcher clears leftover claims before
+    forking -- which, if another launcher's workers were alive, would delete
+    live claims and let both encode the same block. This lock is what makes that
+    clearing safe: it is an `flock`, so the kernel releases it when the holder
+    dies and a crashed campaign never needs manual cleanup.
+
+    Workers spawned by a holder inherit `FQ_CAMPAIGN_LOCK_HELD` and skip it.
+    """
+    if os.environ.get(CAMPAIGN_LOCK_ENV):
+        yield False
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / CAMPAIGN_LOCK
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            held = os.read(handle, 256).decode("utf-8", "replace").strip()
+            raise CartridgeError(
+                f"{path} is held by {held or 'another process'}: one campaign "
+                f"directory takes one {what} at a time. Two would spend rented "
+                f"GPU hours on the same blocks and publish fragments under "
+                f"different identities.") from None
+        os.truncate(handle, 0)
+        os.write(handle, f"{what}, pid {os.getpid()}\n".encode())
+        yield True
+    finally:
+        os.close(handle)
 
 
 def encode_block(
@@ -1956,16 +2042,18 @@ def cmd_encode(args) -> int:
     else:
         name = device.type
 
-    with SourceCheckpoint(args.source) as source:
+    target = Path(args.out).expanduser().resolve()
+    with SourceCheckpoint(args.source) as source, \
+            campaign_lock(target, what="encode"):
         base_model, base_revision = resolve_identity(args, source)
+        signer = load_signer(args.sign_key,
+                             create=args.shard_count == 1,
+                             outside=(target, source.root))
         out = prepare_out_dir(
             args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
             source=source, base_model=base_model,
-            base_revision=base_revision,
+            base_revision=base_revision, signer=signer.pub_hex,
             block_size=args.block_size, force=args.force)
-        signer = load_signer(args.sign_key,
-                             create=args.shard_count == 1,
-                             outside=(out, source.root))
         work = build_work_list(source, recipe, layers, args.block_size)
         mine = work[args.shard_index::args.shard_count]
         print(f"worker {args.shard_index}/{args.shard_count} on {device} "
@@ -1978,6 +2066,7 @@ def cmd_encode(args) -> int:
         with bootstrap_encoder(args.encoder_source, args.tile_batch) as enc:
             print(f"codebook_scale = {enc.cbs}, tile_batch = {enc.tile_batch}",
                   flush=True)
+            bind_encoder_identity(out, enc.identity["encoder_sha256"])
             provenance = build_provenance(
                 predicate="encode-of", recipe_sha=recipe_sha, source=source,
                 base_model=base_model, base_revision=base_revision,
@@ -2035,25 +2124,21 @@ def _spawn_device_workers(args) -> int:
     recipe = load_recipe(args.recipe)
     recipe_sha = sha256_file(args.recipe)
     selected_layers(recipe, args.layers)
+    target = Path(args.out).expanduser().resolve()
+    # Create the signing key before the sentinel binds it: eight workers racing
+    # to generate one would each write a different seed and sign with a
+    # different identity, which finalize would reject after the fleet had paid.
+    signer = load_signer(args.sign_key, create=True,
+                         outside=(target, Path(args.source)))
     with SourceCheckpoint(args.source) as source:
         base_model, base_revision = resolve_identity(args, source)
         out = prepare_out_dir(
             args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
             source=source, base_model=base_model,
-            base_revision=base_revision,
+            base_revision=base_revision, signer=signer.pub_hex,
             block_size=args.block_size, force=args.force)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    # No worker can be running yet, so any claim left here is from a crash.
-    stale = sorted((out / "locks").glob("*.lock"))
-    for path in stale:
-        path.unlink()
-    if stale:
-        print(f"cleared {len(stale)} stale block claims", flush=True)
-    # Create the signing key once here: eight workers racing to generate it
-    # would each write a different seed and sign with a different identity.
-    signer = load_signer(args.sign_key, create=True,
-                         outside=(out, Path(args.source)))
     print(f"signing key {signer.pub_hex[:16]} at {args.sign_key}", flush=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     base = [sys.executable, str(Path(__file__).resolve()), "encode",
@@ -2071,22 +2156,32 @@ def _spawn_device_workers(args) -> int:
     if args.force:
         base += ["--force"]
     children = []
-    for index, device in enumerate(devices):
-        log = logs / f"encode-{stamp}-w{index}.log"
-        handle = log.open("w")
-        cmd = base + ["--device", device, "--shard-index", str(index)]
-        children.append((
-            index, device, log, handle,
-            subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT)))
-        print(f"worker {index} -> {device}, log {log}", flush=True)
-    failures = []
-    for index, device, log, handle, process in children:
-        code = process.wait()
-        handle.close()
-        tail = log.read_text().strip().splitlines()[-1:] or ["(no output)"]
-        print(f"worker {index} ({device}) exit {code}: {tail[-1]}", flush=True)
-        if code != 0:
-            failures.append(index)
+    with campaign_lock(out, what="encode launcher"):
+        # Holding the campaign lock is what makes this safe: no other launcher
+        # can own this directory, so every claim still here is from a crash.
+        stale = sorted((out / "locks").glob("*.lock"))
+        for path in stale:
+            path.unlink()
+        if stale:
+            print(f"cleared {len(stale)} stale block claims", flush=True)
+        environment = {**os.environ, CAMPAIGN_LOCK_ENV: "1"}
+        for index, device in enumerate(devices):
+            log = logs / f"encode-{stamp}-w{index}.log"
+            handle = log.open("w")
+            cmd = base + ["--device", device, "--shard-index", str(index)]
+            children.append((
+                index, device, log, handle,
+                subprocess.Popen(cmd, stdout=handle, env=environment,
+                                 stderr=subprocess.STDOUT)))
+            print(f"worker {index} -> {device}, log {log}", flush=True)
+        failures = []
+        for index, device, log, handle, process in children:
+            code = process.wait()
+            handle.close()
+            tail = log.read_text().strip().splitlines()[-1:] or ["(no output)"]
+            print(f"worker {index} ({device}) exit {code}: {tail[-1]}", flush=True)
+            if code != 0:
+                failures.append(index)
     if failures:
         raise CartridgeError(
             f"workers {failures} failed; see {logs}. Blocks already written "
@@ -2221,13 +2316,19 @@ def cmd_finalize(args) -> int:
     recipe = load_recipe(args.recipe)
     recipe_sha = sha256_file(args.recipe)
     layers = recipe["moe_layers"]
-    with SourceCheckpoint(args.source) as source:
+    with SourceCheckpoint(args.source) as source, \
+            campaign_lock(Path(args.out).expanduser().resolve(),
+                          what="finalize"):
         base_model, base_revision = resolve_identity(args, source)
         out = prepare_out_dir(
             args.out, recipe_path=args.recipe, recipe_sha=recipe_sha,
             source=source, base_model=base_model,
-            base_revision=base_revision,
-            block_size=args.block_size, force=False)
+            base_revision=base_revision, force=False,
+            signer=load_signer(
+                args.sign_key, create=False,
+                outside=(Path(args.out).expanduser().resolve(),
+                         source.root)).pub_hex,
+            block_size=args.block_size)
         experts_per_layer: dict[int, int] = {}
         expected: dict[str, list[tuple[Path, str, dict[str, str], str]]] = {}
         for layer in layers:
@@ -2555,6 +2656,18 @@ def cmd_plan(args) -> int:
             })
         expert_count = max(expert_counts)
         nodes = node_index(recipe)
+        # The skeleton spans the whole model, so its shards are not a function
+        # of the window. Some shards hold *only* non-expert tensors — for
+        # GLM-5.2, the two carrying embeddings, lm_head and the dense layers —
+        # and they appear in no layer's shard list. An operator staging strictly
+        # from `layers` would discover them when finalize refuses to publish, a
+        # whole campaign later, so every plan names them.
+        routed = {
+            shard
+            for layer in recipe["moe_layers"]
+            for shard in source.layer_keys(layer).values()
+        }
+        skeleton_only = set(skeleton_keys(source, recipe["moe_layers"])) - routed
         plan = {
             "schema": PLAN_SCHEMA,
             "tool": TOOL_VERSION,
@@ -2578,6 +2691,7 @@ def cmd_plan(args) -> int:
                  "bits_per_weight": assembly_bpw(recipe, assembly, expert_count)}
                 for assembly in recipe["assemblies"]
             ],
+            "skeleton_only_shards": source.shard_bytes(skeleton_only),
             "layers": per_layer,
         }
     print(json.dumps(plan, indent=2))
