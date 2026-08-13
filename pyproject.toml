@@ -53,6 +53,7 @@ fq-eps = "fq_eps:main"
 fq-assemble-lora = "fq_assemble_lora:main"
 fq-combine-cartridges = "fq_combine_cartridges:main"
 fq-measure-mse-fruit = "fq_measure_mse_fruit:main"
+fq-promote-campaign = "promote_campaign:main"
 
 # The tools are flat, mutually-importing single-file modules (they add their
 # own directory to sys.path when run as scripts).  Ship them as top-level
